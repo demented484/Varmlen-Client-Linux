@@ -19,14 +19,16 @@ export interface SiteEntry {
 }
 
 interface Persisted {
-  mode: Mode;
+  appsMode: Mode;
+  sitesMode: Mode;
   apps: AppEntry[];
   sites: SiteEntry[];
 }
 
 const KEY = "aegisvpn.split";
 const DEFAULTS: Persisted = {
-  mode: "selective",
+  appsMode: "selective",
+  sitesMode: "selective",
   apps: [],
   sites: [],
 };
@@ -36,9 +38,14 @@ function load(): Persisted {
   try {
     const raw = localStorage.getItem(KEY);
     if (!raw) return DEFAULTS;
-    const parsed = JSON.parse(raw) as Partial<Persisted>;
+    const parsed = JSON.parse(raw) as Partial<Persisted> & { mode?: Mode };
+    // Migrate legacy single `mode` field if present.
+    const legacy = parsed.mode === "general" ? "general" : "selective";
     return {
-      mode: parsed.mode === "general" ? "general" : "selective",
+      appsMode: parsed.appsMode === "general" ? "general"
+              : parsed.appsMode === "selective" ? "selective" : legacy,
+      sitesMode: parsed.sitesMode === "general" ? "general"
+               : parsed.sitesMode === "selective" ? "selective" : legacy,
       apps: Array.isArray(parsed.apps) ? parsed.apps : [],
       sites: Array.isArray(parsed.sites) ? parsed.sites : [],
     };
@@ -48,13 +55,15 @@ function load(): Persisted {
 }
 
 class SplitStore {
-  mode = $state<Mode>(DEFAULTS.mode);
+  appsMode = $state<Mode>(DEFAULTS.appsMode);
+  sitesMode = $state<Mode>(DEFAULTS.sitesMode);
   apps = $state<AppEntry[]>([]);
   sites = $state<SiteEntry[]>([]);
 
   init(): void {
     const p = load();
-    this.mode = p.mode;
+    this.appsMode = p.appsMode;
+    this.sitesMode = p.sitesMode;
     this.apps = p.apps;
     this.sites = p.sites;
   }
@@ -62,15 +71,21 @@ class SplitStore {
   private persist(): void {
     if (!browser) return;
     const payload: Persisted = {
-      mode: this.mode,
+      appsMode: this.appsMode,
+      sitesMode: this.sitesMode,
       apps: this.apps,
       sites: this.sites,
     };
     localStorage.setItem(KEY, JSON.stringify(payload));
   }
 
-  setMode(m: Mode): void {
-    this.mode = m;
+  setAppsMode(m: Mode): void {
+    this.appsMode = m;
+    this.persist();
+  }
+
+  setSitesMode(m: Mode): void {
+    this.sitesMode = m;
     this.persist();
   }
 

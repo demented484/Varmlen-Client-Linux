@@ -54,6 +54,7 @@
     <button
       class="power"
       data-status={conn.status}
+      data-traffic={conn.outgoing ? "on" : "off"}
       onclick={() => conn.toggle()}
       aria-label={conn.status === "connected" ? "Disconnect" : "Connect"}
     >
@@ -261,7 +262,9 @@
     flex-direction: column;
     align-items: center;
     gap: 8px;
-    padding: 20px 0 14px;
+    /* extra top padding so the halo ripple (-28px) doesn't clip
+       against the scroll container's top edge */
+    padding: 38px 0 14px;
     position: relative;
   }
   .power {
@@ -301,13 +304,14 @@
     opacity: 0;
     transition: opacity var(--transition);
   }
-  .power[data-status="connected"] .halo-1 {
+  /* halos are visible only while traffic is actually flowing */
+  .power[data-status="connected"][data-traffic="on"] .halo-1 {
     inset: -14px;
     border-color: var(--accent);
     opacity: 0.35;
     animation: ripple 2s ease-out infinite;
   }
-  .power[data-status="connected"] .halo-2 {
+  .power[data-status="connected"][data-traffic="on"] .halo-2 {
     inset: -28px;
     border-color: var(--accent);
     opacity: 0.18;
@@ -358,6 +362,11 @@
   }
   .text-link:hover:not(:disabled) {
     color: var(--text);
+  }
+  .text-link:disabled {
+    color: var(--text-dim);
+    opacity: 0.55;
+    cursor: not-allowed;
   }
 
   /* ---------- subscription card ---------- */

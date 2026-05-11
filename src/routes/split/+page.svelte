@@ -19,6 +19,8 @@
     ),
   );
 
+  const currentMode = $derived(tab === "apps" ? split.appsMode : split.sitesMode);
+
   const enabledCount = $derived(
     tab === "apps"
       ? split.apps.filter((a) => a.enabled).length
@@ -26,7 +28,7 @@
   );
 
   const modeDescription = $derived(
-    split.mode === "selective"
+    currentMode === "selective"
       ? tab === "apps"
         ? "VPN works only for the selected apps. Everything else stays direct."
         : "VPN works only on the selected websites. Everything else stays direct."
@@ -36,7 +38,8 @@
   );
 
   function setMode(m: Mode) {
-    split.setMode(m);
+    if (tab === "apps") split.setAppsMode(m);
+    else split.setSitesMode(m);
   }
 
   function submitAddApp() {
@@ -67,14 +70,14 @@
       <span class="muted small">{enabledCount} active</span>
     </div>
     <label class="mode-row">
-      <input type="radio" name="mode" checked={split.mode === "selective"} onchange={() => setMode("selective")} />
+      <input type="radio" name="mode-{tab}" checked={currentMode === "selective"} onchange={() => setMode("selective")} />
       <div>
         <div class="mode-title">Selective tunneling</div>
         <div class="mode-sub muted">VPN protects only the entries you pick.</div>
       </div>
     </label>
     <label class="mode-row">
-      <input type="radio" name="mode" checked={split.mode === "general"} onchange={() => setMode("general")} />
+      <input type="radio" name="mode-{tab}" checked={currentMode === "general"} onchange={() => setMode("general")} />
       <div>
         <div class="mode-title">General tunneling</div>
         <div class="mode-sub muted">VPN protects everything except the entries you pick.</div>
