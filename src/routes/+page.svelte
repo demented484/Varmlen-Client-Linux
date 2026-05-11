@@ -1,5 +1,4 @@
 <script lang="ts">
-  import { onMount } from "svelte";
   import { conn, fmtElapsed } from "$lib/conn.svelte";
   import { subs } from "$lib/subs.svelte";
 
@@ -7,8 +6,6 @@
   let subUrl = $state("");
   let importError = $state<string | null>(null);
   let openMenuFor = $state<string | null>(null);
-
-  onMount(() => subs.init());
 
   const statusLabel = $derived(
     {

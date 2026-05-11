@@ -55,18 +55,11 @@ function load(): Persisted {
 }
 
 class SplitStore {
-  appsMode = $state<Mode>(DEFAULTS.appsMode);
-  sitesMode = $state<Mode>(DEFAULTS.sitesMode);
-  apps = $state<AppEntry[]>([]);
-  sites = $state<SiteEntry[]>([]);
-
-  init(): void {
-    const p = load();
-    this.appsMode = p.appsMode;
-    this.sitesMode = p.sitesMode;
-    this.apps = p.apps;
-    this.sites = p.sites;
-  }
+  private readonly _initial = load();
+  appsMode = $state<Mode>(this._initial.appsMode);
+  sitesMode = $state<Mode>(this._initial.sitesMode);
+  apps = $state<AppEntry[]>(this._initial.apps);
+  sites = $state<SiteEntry[]>(this._initial.sites);
 
   private persist(): void {
     if (!browser) return;

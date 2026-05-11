@@ -1,13 +1,10 @@
 <script lang="ts">
   import "../app.css";
-  import { onMount } from "svelte";
   import { page } from "$app/state";
   import { NAV } from "$lib/nav";
-  import { theme } from "$lib/theme.svelte";
+  import "$lib/theme.svelte"; // module-level init applies persisted theme
 
   let { children } = $props();
-
-  onMount(() => theme.init());
 
   function isActive(path: string): boolean {
     if (path === "/") return page.url.pathname === "/";

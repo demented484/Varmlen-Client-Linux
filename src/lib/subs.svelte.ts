@@ -94,15 +94,12 @@ function deriveSubName(result: ImportResult, url: string): string {
 }
 
 class SubsStore {
-  list = $state<Subscription[]>([]);
-  selectedServerId = $state<string | null>(null);
+  // Initialised at construction time from localStorage so consumers can
+  // read state synchronously on first import; no onMount() round-trip.
+  private readonly _initial = load();
+  list = $state<Subscription[]>(this._initial.subs);
+  selectedServerId = $state<string | null>(this._initial.selectedServerId);
   importing = $state(false);
-
-  init(): void {
-    const p = load();
-    this.list = p.subs;
-    this.selectedServerId = p.selectedServerId;
-  }
 
   private persist(): void {
     if (!browser) return;

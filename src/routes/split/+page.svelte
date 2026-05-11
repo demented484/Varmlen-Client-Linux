@@ -1,5 +1,4 @@
 <script lang="ts">
-  import { onMount } from "svelte";
   import { split, type Mode } from "$lib/split.svelte";
 
   type Tab = "apps" | "websites";
@@ -10,8 +9,6 @@
   let appDraftName = $state("");
   let appDraftId = $state("");
   let showAddApp = $state(false);
-
-  onMount(() => split.init());
 
   const filteredApps = $derived(
     split.apps.filter((a) =>

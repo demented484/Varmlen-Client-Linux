@@ -1,10 +1,7 @@
 <script lang="ts">
-  import { onMount } from "svelte";
-  import { theme, type Theme } from "$lib/theme.svelte";
+  import { theme } from "$lib/theme.svelte";
   import { settings, type LogLevel } from "$lib/settings.svelte";
   import Dropdown from "$lib/components/Dropdown.svelte";
-
-  onMount(() => settings.init());
 
   const logOptions = [
     { value: "warn",  label: "Warn"  },

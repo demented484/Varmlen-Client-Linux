@@ -18,10 +18,6 @@ function apply(t: Theme): void {
 class ThemeStore {
   current = $state<Theme>(read());
 
-  init(): void {
-    apply(this.current);
-  }
-
   set(t: Theme): void {
     this.current = t;
     if (browser) localStorage.setItem(KEY, t);
@@ -34,3 +30,6 @@ class ThemeStore {
 }
 
 export const theme = new ThemeStore();
+// Apply once at module load (app.html's inline script already does this
+// before paint; this keeps colorScheme in sync after HMR reloads.)
+if (browser) apply(theme.current);

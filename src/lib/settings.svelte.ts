@@ -37,18 +37,11 @@ function load(): Persisted {
 }
 
 class SettingsStore {
-  autostart = $state(DEFAULTS.autostart);
-  killswitch = $state(DEFAULTS.killswitch);
-  allowLan = $state(DEFAULTS.allowLan);
-  logLevel = $state<LogLevel>(DEFAULTS.logLevel);
-
-  init(): void {
-    const p = load();
-    this.autostart = p.autostart;
-    this.killswitch = p.killswitch;
-    this.allowLan = p.allowLan;
-    this.logLevel = p.logLevel;
-  }
+  private readonly _initial = load();
+  autostart = $state(this._initial.autostart);
+  killswitch = $state(this._initial.killswitch);
+  allowLan = $state(this._initial.allowLan);
+  logLevel = $state<LogLevel>(this._initial.logLevel);
 
   private persist(): void {
     if (!browser) return;
