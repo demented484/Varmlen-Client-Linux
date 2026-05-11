@@ -34,13 +34,16 @@
 
 <style>
   .app {
-    display: grid;
-    grid-template-rows: 1fr auto;
-    height: 100vh;
+    position: fixed;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
     background: var(--bg);
   }
 
   .content {
+    flex: 1;
+    min-height: 0;
     overflow-y: auto;
     overflow-x: hidden;
     padding: 16px 16px 8px;

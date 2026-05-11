@@ -5,6 +5,19 @@
     <link rel="icon" href="%sveltekit.assets%/favicon.png" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>AegisVPN</title>
+    <script>
+      // Apply persisted theme before paint to avoid FOUC.
+      (function () {
+        try {
+          var t = localStorage.getItem("aegisvpn.theme");
+          if (t !== "light") t = "dark";
+          document.documentElement.setAttribute("data-theme", t);
+          document.documentElement.style.colorScheme = t;
+        } catch (e) {
+          document.documentElement.setAttribute("data-theme", "dark");
+        }
+      })();
+    </script>
     %sveltekit.head%
   </head>
   <body data-sveltekit-preload-data="hover">
