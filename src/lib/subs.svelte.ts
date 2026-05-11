@@ -44,18 +44,45 @@ interface Persisted {
 
 const KEY = "aegisvpn.subs";
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Earlier versions used a deterministic `host:port#uuid8` for ServerEntry.id.
+ *  When two subscriptions advertised the same endpoint, those IDs collided
+ *  and broke `{#each}`'s keyed reconciliation. New entries use random UUIDs,
+ *  so we transparently regenerate any old-format IDs the first time we load.
+ */
+function migrateIds(subs: Subscription[]): { subs: Subscription[]; remapped: Record<string, string> } {
+  const remapped: Record<string, string> = {};
+  for (const sub of subs) {
+    for (const srv of sub.servers) {
+      if (!srv.id || !UUID_RE.test(srv.id)) {
+        const fresh = crypto.randomUUID();
+        remapped[srv.id ?? ""] = fresh;
+        srv.id = fresh;
+      }
+      // Older versions did not have the `pinging` field.
+      if (typeof srv.pinging !== "boolean") srv.pinging = false;
+    }
+  }
+  return { subs, remapped };
+}
+
 function load(): Persisted {
   if (!browser) return { subs: [], selectedServerId: null };
   try {
     const raw = localStorage.getItem(KEY);
     if (!raw) return { subs: [], selectedServerId: null };
     const parsed = JSON.parse(raw) as Partial<Persisted>;
-    return {
-      subs: Array.isArray(parsed.subs) ? parsed.subs : [],
-      selectedServerId: typeof parsed.selectedServerId === "string"
-        ? parsed.selectedServerId
-        : null,
-    };
+    const rawSubs = Array.isArray(parsed.subs) ? parsed.subs : [];
+    const { subs, remapped } = migrateIds(rawSubs);
+    let selected: string | null =
+      typeof parsed.selectedServerId === "string" ? parsed.selectedServerId : null;
+    if (selected && remapped[selected]) selected = remapped[selected];
+    // If the persisted selection points at an id we no longer have, drop it.
+    if (selected && !subs.some((s) => s.servers.some((sv) => sv.id === selected))) {
+      selected = null;
+    }
+    return { subs, selectedServerId: selected };
   } catch {
     return { subs: [], selectedServerId: null };
   }

@@ -30,6 +30,6 @@ class ThemeStore {
 }
 
 export const theme = new ThemeStore();
-// Apply once at module load (app.html's inline script already does this
-// before paint; this keeps colorScheme in sync after HMR reloads.)
-if (browser) apply(theme.current);
+// app.html's inline pre-paint script already wrote data-theme to
+// <html>; reading theme.current at module scope would be a $state read
+// outside a component/effect, which Svelte 5 forbids.
