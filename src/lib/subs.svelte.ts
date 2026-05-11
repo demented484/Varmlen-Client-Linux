@@ -24,7 +24,8 @@ export interface Subscription {
   name: string;
   url: string;
   importedAt: string; // ISO
-  updateIntervalHours: number;
+  /** Server-advertised refresh interval (hours). null when not sent. */
+  updateIntervalHours: number | null;
   /** Bytes used (upload + download). */
   usedBytes: number;
   /** Total quota in bytes; 0 = unlimited. */
@@ -66,7 +67,10 @@ function transportSummary(s: VlessServer): string {
 
 function toServerEntry(s: VlessServer): ServerEntry {
   return {
-    id: `${s.host}:${s.port}#${s.uuid.slice(0, 8)}`,
+    // Random id avoids collisions when two subscriptions advertise the same
+    // host:port endpoint (otherwise Svelte's keyed {#each} blows up the
+    // second render).
+    id: crypto.randomUUID(),
     flag: guessFlag(s.label),
     name: s.label,
     transport: transportSummary(s),
@@ -174,7 +178,7 @@ class SubsStore {
         name: deriveSubName(result, trimmed),
         url: trimmed,
         importedAt: new Date().toISOString(),
-        updateIntervalHours: result.meta.update_interval_hours ?? 12,
+        updateIntervalHours: result.meta.update_interval_hours ?? null,
         usedBytes,
         totalBytes,
         expiresAtUnix: result.meta.expires_at_unix,
