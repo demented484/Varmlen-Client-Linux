@@ -3,6 +3,7 @@ import {
   fetchSubscription,
   pingTcp,
   guessFlag,
+  stripLeadingFlag,
   formatBytes,
   formatExpires,
   type ImportResult,
@@ -22,6 +23,9 @@ export interface ServerEntry {
 export interface Subscription {
   id: string;
   name: string;
+  /** Free-text description sourced from a leading `# …` comment in the
+   *  subscription body. null when the server doesn't include one. */
+  description: string | null;
   url: string;
   importedAt: string; // ISO
   /** Server-advertised refresh interval (hours). null when not sent. */
@@ -35,6 +39,8 @@ export interface Subscription {
   supportUrl: string | null;
   servers: ServerEntry[];
   collapsed: boolean;
+  /** True while refresh() is in flight. Not persisted. */
+  refreshing?: boolean;
 }
 
 interface Persisted {
@@ -60,9 +66,13 @@ function migrateIds(subs: Subscription[]): { subs: Subscription[]; remapped: Rec
         remapped[srv.id ?? ""] = fresh;
         srv.id = fresh;
       }
-      // Older versions did not have the `pinging` field.
       if (typeof srv.pinging !== "boolean") srv.pinging = false;
+      // Drop the leading flag emoji from older labels stored before the
+      // flag was rendered separately.
+      srv.name = stripLeadingFlag(srv.name);
     }
+    if (sub.description === undefined) sub.description = null;
+    if (sub.refreshing) sub.refreshing = false;
   }
   return { subs, remapped };
 }
@@ -99,7 +109,7 @@ function toServerEntry(s: VlessServer): ServerEntry {
     // second render).
     id: crypto.randomUUID(),
     flag: guessFlag(s.label),
-    name: s.label,
+    name: stripLeadingFlag(s.label),
     transport: transportSummary(s),
     pingMs: null,
     pinging: false,
@@ -202,6 +212,7 @@ class SubsStore {
       const sub: Subscription = {
         id: crypto.randomUUID(),
         name: deriveSubName(result, trimmed),
+        description: result.description,
         url: trimmed,
         importedAt: new Date().toISOString(),
         updateIntervalHours: result.meta.update_interval_hours ?? null,
@@ -228,9 +239,18 @@ class SubsStore {
     const idx = this.list.findIndex((s) => s.id === subId);
     if (idx < 0) return;
     const sub = this.list[idx];
+    // mark this sub as refreshing for the UI spinner
+    this.list = this.list.map((s) =>
+      s.id === subId ? { ...s, refreshing: true } : s,
+    );
     try {
       const result = await fetchSubscription(sub.url);
-      if (result.servers.length === 0) return;
+      if (result.servers.length === 0) {
+        this.list = this.list.map((s) =>
+          s.id === subId ? { ...s, refreshing: false } : s,
+        );
+        return;
+      }
       const totalBytes = result.meta.total_bytes ?? sub.totalBytes;
       const usedBytes =
         (result.meta.upload_bytes ?? 0) + (result.meta.download_bytes ?? 0);
@@ -239,6 +259,7 @@ class SubsStore {
           ? {
               ...s,
               name: result.meta.title ?? s.name,
+              description: result.description ?? s.description,
               servers: result.servers.map(toServerEntry),
               updateIntervalHours:
                 result.meta.update_interval_hours ?? s.updateIntervalHours,
@@ -247,6 +268,7 @@ class SubsStore {
               expiresAtUnix: result.meta.expires_at_unix ?? s.expiresAtUnix,
               supportUrl: result.meta.support_url ?? s.supportUrl,
               importedAt: new Date().toISOString(),
+              refreshing: false,
             }
           : s,
       );
@@ -254,7 +276,19 @@ class SubsStore {
       void this.pingAll(subId);
     } catch (e) {
       console.error("refresh failed:", e);
+      this.list = this.list.map((s) =>
+        s.id === subId ? { ...s, refreshing: false } : s,
+      );
     }
+  }
+
+  rename(subId: string, newName: string): void {
+    const trimmed = newName.trim();
+    if (!trimmed) return;
+    this.list = this.list.map((s) =>
+      s.id === subId ? { ...s, name: trimmed } : s,
+    );
+    this.persist();
   }
 
   /** Re-ping every server in a subscription. Updates `pingMs` in place. */

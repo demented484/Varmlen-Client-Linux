@@ -2,10 +2,29 @@
   import { conn, fmtElapsed } from "$lib/conn.svelte";
   import { subs } from "$lib/subs.svelte";
 
+  import type { Subscription } from "$lib/subs.svelte";
+
   let showImport = $state(false);
   let subUrl = $state("");
   let importError = $state<string | null>(null);
   let openMenuFor = $state<string | null>(null);
+  let infoFor = $state<Subscription | null>(null);
+  let renameFor = $state<Subscription | null>(null);
+  let renameDraft = $state("");
+
+  function openInfo(sub: Subscription) {
+    infoFor = sub;
+    openMenuFor = null;
+  }
+  function openRename(sub: Subscription) {
+    renameFor = sub;
+    renameDraft = sub.name;
+    openMenuFor = null;
+  }
+  function commitRename() {
+    if (renameFor) subs.rename(renameFor.id, renameDraft);
+    renameFor = null;
+  }
 
   const statusLabel = $derived(
     {
@@ -115,9 +134,15 @@
           </div>
         </div>
 
-        <button class="head-btn" onclick={() => subs.refresh(sub.id)} aria-label="Refresh">
+        <button
+          class="head-btn"
+          class:spinning={sub.refreshing}
+          onclick={() => subs.refresh(sub.id)}
+          aria-label="Refresh"
+          disabled={sub.refreshing}
+        >
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
-            <path d="M3 12a9 9 0 0 1 15.5-6.36M21 12a9 9 0 0 1-15.5 6.36M16 5h5V0M8 19H3v5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
+            <path d="M21 12a9 9 0 1 1-3.13-6.84M21 4v5h-5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
           </svg>
         </button>
         <button class="head-btn" onclick={() => subs.pingAll(sub.id)} aria-label="Test latency">
@@ -138,18 +163,27 @@
           </button>
           {#if openMenuFor === sub.id}
             <div class="menu" role="menu">
+              <button role="menuitem" class="menu-item" onclick={() => openRename(sub)}>
+                Rename
+              </button>
               <button
                 role="menuitem"
-                onclick={() => { subs.remove(sub.id); openMenuFor = null; }}
                 class="menu-item danger"
-              >Remove subscription</button>
+                onclick={() => { subs.remove(sub.id); openMenuFor = null; }}
+              >
+                Remove subscription
+              </button>
             </div>
           {/if}
         </div>
       </header>
 
       <div class="sub-traffic">
-        <button class="info-dot" aria-label="Subscription info">i</button>
+        <button
+          class="info-dot"
+          aria-label="Subscription info"
+          onclick={() => openInfo(sub)}
+        >i</button>
         <div class="traffic-bar">
           <span class="traffic-text">{subs.trafficText(sub)}</span>
         </div>
@@ -167,6 +201,10 @@
           </a>
         {/if}
       </div>
+
+      {#if sub.description}
+        <div class="description">{sub.description}</div>
+      {/if}
 
       {#if subs.expiresText(sub)}
         <div class="expires muted small">Expires: {subs.expiresText(sub)}</div>
@@ -210,6 +248,83 @@
     </div>
   {/if}
 </main>
+
+{#if infoFor}
+  <div class="modal-backdrop" onclick={() => (infoFor = null)} role="presentation">
+    <div
+      class="modal card"
+      onclick={(e) => e.stopPropagation()}
+      onkeydown={(e) => e.key === "Escape" && (infoFor = null)}
+      role="dialog"
+      tabindex="-1"
+      aria-modal="true"
+      aria-label="Subscription info"
+    >
+      <h2>{infoFor.name}</h2>
+      <dl class="info-grid">
+        <dt>URL</dt>
+        <dd class="mono small">{infoFor.url}</dd>
+
+        <dt>Imported</dt>
+        <dd>{fmtImported(infoFor.importedAt)}</dd>
+
+        {#if infoFor.updateIntervalHours}
+          <dt>Auto-update</dt>
+          <dd>every {infoFor.updateIntervalHours} h</dd>
+        {/if}
+
+        <dt>Traffic</dt>
+        <dd>{subs.trafficText(infoFor)}</dd>
+
+        {#if subs.expiresText(infoFor)}
+          <dt>Expires</dt>
+          <dd>{subs.expiresText(infoFor)}</dd>
+        {/if}
+
+        <dt>Servers</dt>
+        <dd>{infoFor.servers.length}</dd>
+
+        {#if infoFor.supportUrl}
+          <dt>Support</dt>
+          <dd><a href={infoFor.supportUrl} target="_blank" rel="noopener">{infoFor.supportUrl}</a></dd>
+        {/if}
+      </dl>
+      {#if infoFor.description}
+        <p class="info-desc">{infoFor.description}</p>
+      {/if}
+      <div class="modal-actions">
+        <button class="btn" onclick={() => (infoFor = null)}>Close</button>
+      </div>
+    </div>
+  </div>
+{/if}
+
+{#if renameFor}
+  <div class="modal-backdrop" onclick={() => (renameFor = null)} role="presentation">
+    <div
+      class="modal card"
+      onclick={(e) => e.stopPropagation()}
+      onkeydown={(e) => e.key === "Escape" && (renameFor = null)}
+      role="dialog"
+      tabindex="-1"
+      aria-modal="true"
+      aria-label="Rename subscription"
+    >
+      <h2>Rename subscription</h2>
+      <input
+        type="text"
+        bind:value={renameDraft}
+        onkeydown={(e) => e.key === "Enter" && commitRename()}
+      />
+      <div class="modal-actions">
+        <button class="btn btn-ghost" onclick={() => (renameFor = null)}>Cancel</button>
+        <button class="btn btn-primary" onclick={commitRename} disabled={!renameDraft.trim()}>
+          Save
+        </button>
+      </div>
+    </div>
+  </div>
+{/if}
 
 {#if showImport}
   <div class="modal-backdrop" onclick={() => (showImport = false)} role="presentation">
@@ -454,6 +569,13 @@
     background: var(--bg-elev-2);
     color: var(--text);
   }
+  .head-btn.spinning svg {
+    animation: spin 900ms linear infinite;
+    color: var(--accent);
+  }
+  @keyframes spin {
+    to { transform: rotate(360deg); }
+  }
 
   .menu-wrap {
     position: relative;
@@ -538,9 +660,50 @@
     transform: scale(1.06);
   }
 
+  .description {
+    padding: 0 14px 8px;
+    font-size: 12px;
+    color: var(--text-muted);
+    white-space: pre-line;
+    line-height: 1.4;
+  }
   .expires {
     padding: 0 14px 8px;
     font-size: 11px;
+  }
+  .info-grid {
+    display: grid;
+    grid-template-columns: max-content 1fr;
+    gap: 6px 14px;
+    margin: 0;
+  }
+  .info-grid dt {
+    color: var(--text-muted);
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  .info-grid dd {
+    margin: 0;
+    word-break: break-all;
+    font-size: 13px;
+  }
+  .info-grid a {
+    color: var(--accent);
+    text-decoration: underline;
+  }
+  .mono {
+    font-family: ui-monospace, "JetBrains Mono", monospace;
+  }
+  .info-desc {
+    background: var(--bg-elev-2);
+    padding: 10px 12px;
+    border-radius: var(--radius-sm);
+    margin: 0;
+    font-size: 12px;
+    white-space: pre-line;
+    line-height: 1.45;
+    color: var(--text-muted);
   }
   .small {
     font-size: 11px;

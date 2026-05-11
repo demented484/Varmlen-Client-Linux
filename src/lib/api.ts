@@ -32,6 +32,7 @@ export interface SubscriptionMeta {
 export interface ImportResult {
   meta: SubscriptionMeta;
   servers: VlessServer[];
+  description: string | null;
 }
 
 export function parseVlessUri(uri: string): Promise<VlessServer> {
@@ -70,6 +71,15 @@ export function guessFlag(label: string): string {
     if (re.test(label)) return flag;
   }
   return "🏳️";
+}
+
+/** Regional-indicator flag = two code points in the U+1F1E6–U+1F1FF range. */
+const FLAG_RE = /^(?:\uD83C[\uDDE6-\uDDFF]){2}\s*/u;
+
+/** Remove a leading flag emoji from a server label so it isn't rendered twice
+ *  (once as the standalone glyph next to the row, once inside the text). */
+export function stripLeadingFlag(label: string): string {
+  return label.replace(FLAG_RE, "").trim();
 }
 
 /** Pretty bytes like 742.3GB / 1.5TB / 0B. */

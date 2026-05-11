@@ -64,11 +64,40 @@ pub struct SubscriptionMeta {
     pub support_url: Option<String>,
 }
 
-/// Bundled result of an import: headers + parsed servers.
+/// Bundled result of an import: headers + parsed servers + free-text
+/// description extracted from leading `# …` comments in the body.
 #[derive(Debug, Clone, Serialize)]
 pub struct ImportResult {
     pub meta: SubscriptionMeta,
     pub servers: Vec<VlessServer>,
+    pub description: Option<String>,
+}
+
+/// Collect the leading `# …` comment block (until the first non-comment
+/// non-blank line). Returned as a single string with newlines, or None.
+pub fn extract_description(body: &str) -> Option<String> {
+    let text = decode_body(body);
+    let mut lines = Vec::<String>::new();
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() {
+            if lines.is_empty() {
+                continue;
+            } else {
+                break;
+            }
+        }
+        if let Some(rest) = line.strip_prefix('#') {
+            lines.push(rest.trim().to_string());
+        } else {
+            break;
+        }
+    }
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join("\n"))
+    }
 }
 
 /// Parse a single `vless://` URI.

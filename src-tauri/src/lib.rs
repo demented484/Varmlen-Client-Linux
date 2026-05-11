@@ -2,7 +2,10 @@ mod subscription;
 
 use std::time::{Duration, Instant};
 
-use subscription::{parse_headers, parse_subscription, parse_vless, ImportResult, VlessServer};
+use subscription::{
+    extract_description, parse_headers, parse_subscription, parse_vless, ImportResult,
+    VlessServer,
+};
 
 #[tauri::command]
 fn parse_vless_uri(uri: String) -> Result<VlessServer, String> {
@@ -27,7 +30,11 @@ async fn fetch_subscription(url: String) -> Result<ImportResult, String> {
     }
     if trimmed.starts_with("vless://") {
         return parse_vless(trimmed)
-            .map(|s| ImportResult { meta: Default::default(), servers: vec![s] })
+            .map(|s| ImportResult {
+                meta: Default::default(),
+                servers: vec![s],
+                description: None,
+            })
             .map_err(|e| e.to_string());
     }
 
@@ -57,7 +64,8 @@ async fn fetch_subscription(url: String) -> Result<ImportResult, String> {
 
     let body = resp.text().await.map_err(|e| format!("read body: {e}"))?;
     let servers = parse_subscription(&body);
-    Ok(ImportResult { meta, servers })
+    let description = extract_description(&body);
+    Ok(ImportResult { meta, servers, description })
 }
 
 /// TCP RTT to host:port in milliseconds. We open a connection and measure the
