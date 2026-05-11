@@ -77,14 +77,19 @@ button {
   border-radius: var(--radius-sm);
   padding: 8px 14px;
   transition: background var(--transition), border-color var(--transition),
-    color var(--transition), transform var(--transition);
-}
-button:active:not(:disabled) {
-  transform: scale(0.97);
+    color var(--transition), box-shadow var(--transition);
 }
 button:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+@keyframes click-pulse {
+  0%   { box-shadow: 0 0 0 0 var(--accent-faint); }
+  60%  { box-shadow: 0 0 0 10px transparent; }
+  100% { box-shadow: 0 0 0 0 transparent; }
+}
+button:active:not(:disabled) {
+  animation: click-pulse 360ms ease-out;
 }
 
 input,

@@ -14,7 +14,9 @@ export const NAV: NavItem[] = [
   {
     path: "/split",
     label: "Split",
-    icon: "M6 3a1 1 0 0 1 1 1v6a3 3 0 0 0 3 3h7.59l-1.3-1.3a1 1 0 1 1 1.42-1.4l3 3a1 1 0 0 1 0 1.4l-3 3a1 1 0 1 1-1.42-1.4l1.3-1.3H10a5 5 0 0 1-5-5V4a1 1 0 0 1 1-1zm12 14a1 1 0 1 1 0-2 1 1 0 0 1 0 2zM3 19a1 1 0 1 1 0-2 1 1 0 0 1 0 2zm3 0a1 1 0 1 1 0-2 1 1 0 0 1 0 2z",
+    // Material Symbols "call_split" — two diverging arrows, instantly readable
+    // as a routing split.
+    icon: "M14 4l2.29 2.29-2.88 2.88 1.42 1.42 2.88-2.88L20 10V4h-6zM10 4H4v6l2.29-2.29 4.71 4.71V20h2v-8.41l-5.29-5.3L10 4z",
   },
   {
     path: "/settings",

@@ -112,7 +112,9 @@
         <div class="sub-info">
           <div class="sub-title">{sub.name}</div>
           <div class="sub-meta muted">
-            {fmtImported(sub.importedAt)} · auto-update {sub.updateIntervalHours}h
+            {fmtImported(sub.importedAt)}{sub.updateIntervalHours
+              ? ` · auto-update ${sub.updateIntervalHours}h`
+              : ""}
           </div>
         </div>
 
