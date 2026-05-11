@@ -76,20 +76,30 @@ button {
   cursor: pointer;
   border-radius: var(--radius-sm);
   padding: 8px 14px;
+  position: relative;
   transition: background var(--transition), border-color var(--transition),
-    color var(--transition), box-shadow var(--transition);
+    color var(--transition);
 }
 button:disabled {
   opacity: 0.5;
   cursor: not-allowed;
 }
-@keyframes click-pulse {
-  0%   { box-shadow: 0 0 0 0 var(--accent-faint); }
-  60%  { box-shadow: 0 0 0 10px transparent; }
-  100% { box-shadow: 0 0 0 0 transparent; }
+/* Click ripple. ::after is a no-pointer overlay that briefly flashes the
+   accent tint; never blocks subsequent clicks because pointer-events is off
+   and the animation finishes deterministically. */
+button:not(:disabled)::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: var(--accent-faint);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 200ms ease-out;
 }
-button:active:not(:disabled) {
-  animation: click-pulse 360ms ease-out;
+button:not(:disabled):active::after {
+  opacity: 1;
+  transition: none;
 }
 
 input,

@@ -328,6 +328,7 @@
     inset: 0;
     border-radius: 50%;
     border: 1px solid transparent;
+    /* never hijack clicks even when the ring extends past the button edge */
     pointer-events: none;
     opacity: 0;
     transition: opacity var(--transition);
