@@ -91,9 +91,16 @@ pub fn run() {
             fetch_subscription,
             ping_tcp
         ])
-        // DevTools is reachable in debug builds via F12 / Ctrl+Shift+I.
-        // Auto-opening it stole half the window on small portrait layouts
-        // and caused phantom click intercepts.
+        .setup(|app| {
+            #[cfg(debug_assertions)]
+            {
+                use tauri::Manager;
+                if let Some(window) = app.get_webview_window("main") {
+                    window.open_devtools();
+                }
+            }
+            Ok(())
+        })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
