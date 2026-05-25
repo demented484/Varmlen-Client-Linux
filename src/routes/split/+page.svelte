@@ -1,17 +1,72 @@
 <script lang="ts">
+  import { open as openDialog } from "@tauri-apps/plugin-dialog";
   import { split, type Mode } from "$lib/split.svelte";
+  import { listInstalledApps, appFromFile, type InstalledApp } from "$lib/api";
+  import { t } from "$lib/i18n.svelte";
+  import Dropdown from "$lib/components/Dropdown.svelte";
 
   type Tab = "apps" | "websites";
   let tab = $state<Tab>("apps");
 
+  const modeOptions = $derived([
+    { value: "general", label: t("split.modeGeneral") },
+    { value: "selective", label: t("split.modeSelective") },
+  ]);
+
   let appQuery = $state("");
   let siteDraft = $state("");
-  let appDraftName = $state("");
-  let appDraftId = $state("");
   let showAddApp = $state(false);
+  let pickerQuery = $state("");
+  let installed = $state<InstalledApp[]>([]);
+  let installedLoading = $state(false);
+
+  const addedIds = $derived(new Set(split.currentApps.map((a) => a.id)));
+  const pickerResults = $derived.by(() => {
+    const q = pickerQuery.trim().toLowerCase();
+    if (!q) return installed;
+    return installed.filter(
+      (a) => a.name.toLowerCase().includes(q) || a.id.toLowerCase().includes(q),
+    );
+  });
+
+  async function openAddApp() {
+    showAddApp = true;
+    pickerQuery = "";
+    if (installed.length === 0) {
+      installedLoading = true;
+      try {
+        installed = await listInstalledApps();
+      } catch {
+        installed = [];
+      } finally {
+        installedLoading = false;
+      }
+    }
+  }
+
+  function addInstalled(app: InstalledApp) {
+    split.addApp({ id: app.id, name: app.name, icon: app.icon ?? "📦" });
+  }
+
+  async function pickFromFile() {
+    const picked = await openDialog({
+      multiple: false,
+      directory: false,
+      filters: [
+        { name: "Apps", extensions: ["desktop"] },
+        { name: "All files", extensions: ["*"] },
+      ],
+    });
+    if (typeof picked !== "string") return;
+    const app = await appFromFile(picked);
+    if (app) {
+      split.addApp({ id: app.id, name: app.name, icon: app.icon ?? "📦" });
+    }
+    showAddApp = false;
+  }
 
   const filteredApps = $derived(
-    split.apps.filter((a) =>
+    split.currentApps.filter((a) =>
       a.name.toLowerCase().includes(appQuery.trim().toLowerCase()),
     ),
   );
@@ -20,87 +75,73 @@
 
   const enabledCount = $derived(
     tab === "apps"
-      ? split.apps.filter((a) => a.enabled).length
-      : split.sites.filter((s) => s.enabled).length,
+      ? split.currentApps.filter((a) => a.enabled).length
+      : split.currentSites.filter((s) => s.enabled).length,
   );
 
   const modeDescription = $derived(
-    currentMode === "selective"
-      ? tab === "apps"
-        ? "VPN works only for the selected apps. Everything else stays direct."
-        : "VPN works only on the selected websites. Everything else stays direct."
-      : tab === "apps"
-        ? "VPN works for all apps except those selected (which stay direct)."
-        : "VPN works on all websites except those selected (which stay direct).",
+    t(`split.mode.${tab === "apps" ? "apps" : "sites"}${currentMode === "selective" ? "Selective" : "General"}`),
   );
 
   function setMode(m: Mode) {
     if (tab === "apps") split.setAppsMode(m);
     else split.setSitesMode(m);
   }
-
-  function submitAddApp() {
-    const id = appDraftId.trim();
-    const name = appDraftName.trim() || id;
-    if (!id) return;
-    split.addApp({ id, name, icon: "📦" });
-    appDraftId = "";
-    appDraftName = "";
-    showAddApp = false;
-  }
 </script>
 
+{#snippet appIcon(icon: string | null | undefined)}
+  {#if icon && icon.startsWith("data:")}
+    <img class="app-icon" src={icon} alt="" />
+  {:else}
+    <span class="app-icon">{icon || "📦"}</span>
+  {/if}
+{/snippet}
+
 <header class="topbar">
-  <h1>Split tunneling</h1>
+  <h1>{t("split.title")}</h1>
 </header>
 
 <div class="page">
 
   <div class="segmented" role="tablist">
-    <button class:active={tab === "apps"} onclick={() => (tab = "apps")} role="tab" aria-selected={tab === "apps"}>Apps</button>
-    <button class:active={tab === "websites"} onclick={() => (tab = "websites")} role="tab" aria-selected={tab === "websites"}>Websites</button>
+    <button class:active={tab === "apps"} onclick={() => (tab = "apps")} role="tab" aria-selected={tab === "apps"}>{t("split.apps")}</button>
+    <button class:active={tab === "websites"} onclick={() => (tab = "websites")} role="tab" aria-selected={tab === "websites"}>{t("split.websites")}</button>
   </div>
 
   <div class="card mode">
-    <div class="mode-header">
-      <span class="muted small">Mode</span>
-      <span class="muted small">{enabledCount} active</span>
+    <div class="mode-top">
+      <div class="mode-label">
+        <div class="mode-title">{t("split.mode")}</div>
+        <div class="muted small">{t("split.active", { n: enabledCount })}</div>
+      </div>
+      <Dropdown
+        value={currentMode}
+        options={modeOptions}
+        onChange={(v) => setMode(v as Mode)}
+        ariaLabel={t("split.mode")}
+      />
     </div>
-    <label class="mode-row">
-      <input type="radio" name="mode-{tab}" checked={currentMode === "selective"} onchange={() => setMode("selective")} />
-      <div>
-        <div class="mode-title">Selective tunneling</div>
-        <div class="mode-sub muted">VPN protects only the entries you pick.</div>
-      </div>
-    </label>
-    <label class="mode-row">
-      <input type="radio" name="mode-{tab}" checked={currentMode === "general"} onchange={() => setMode("general")} />
-      <div>
-        <div class="mode-title">General tunneling</div>
-        <div class="mode-sub muted">VPN protects everything except the entries you pick.</div>
-      </div>
-    </label>
     <p class="mode-note dim">{modeDescription}</p>
   </div>
 
   {#if tab === "apps"}
     <div class="apps-controls">
-      <input class="search" type="search" placeholder="Search apps" bind:value={appQuery} />
-      <button class="btn btn-primary add-app" onclick={() => (showAddApp = true)} aria-label="Add app">
+      <input class="search" type="search" placeholder={t("split.searchApps")} bind:value={appQuery} />
+      <button class="btn btn-primary add-app" onclick={openAddApp} aria-label={t("split.addApp")}>
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none"><path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" /></svg>
       </button>
     </div>
 
-    {#if split.apps.length === 0}
+    {#if split.currentApps.length === 0}
       <div class="empty-state">
-        <div class="empty-title">No apps yet</div>
-        <div class="muted">Tap <strong>+</strong> to add a process by its name (e.g. <code>telegram-desktop</code>, <code>firefox</code>).</div>
+        <div class="empty-title">{t("split.noAppsTitle")}</div>
+        <div class="muted">{t("split.noAppsHint")}</div>
       </div>
     {:else}
       <div class="list">
         {#each filteredApps as a (a.id)}
           <div class="list-row">
-            <span class="app-icon">{a.icon}</span>
+            {@render appIcon(a.icon)}
             <div class="app-text">
               <div class="app-name">{a.name}</div>
               <div class="app-id dim">{a.id}</div>
@@ -115,28 +156,24 @@
           </div>
         {/each}
         {#if filteredApps.length === 0}
-          <div class="list-row empty muted">No apps match the query.</div>
+          <div class="list-row empty muted">{t("split.noAppsMatch")}</div>
         {/if}
       </div>
-      <p class="hint dim">
-        Once the agent ships, AegisVPN will read installed apps from
-        <code>/usr/share/applications/*.desktop</code> automatically.
-      </p>
     {/if}
   {:else}
     <form class="site-add" onsubmit={(e) => { e.preventDefault(); split.addSite(siteDraft); siteDraft = ""; }}>
-      <input type="text" placeholder="example.com or *.example.com" bind:value={siteDraft} />
-      <button class="btn btn-primary" type="submit" disabled={!siteDraft.trim()}>Add</button>
+      <input type="text" placeholder={t("split.sitePlaceholder")} bind:value={siteDraft} />
+      <button class="btn btn-primary" type="submit" disabled={!siteDraft.trim()}>{t("import.add")}</button>
     </form>
 
-    {#if split.sites.length === 0}
+    {#if split.currentSites.length === 0}
       <div class="empty-state">
-        <div class="empty-title">No websites yet</div>
-        <div class="muted">Add a hostname (<code>example.com</code>) or a wildcard pattern (<code>*.example.com</code>).</div>
+        <div class="empty-title">{t("split.noSitesTitle")}</div>
+        <div class="muted">{t("split.noSitesHint")}</div>
       </div>
     {:else}
       <div class="list">
-        {#each split.sites as s (s.id)}
+        {#each split.currentSites as s (s.id)}
           <div class="list-row">
             <span class="pattern">{s.pattern}</span>
             <button class="btn-ghost trash" onclick={() => split.removeSite(s.id)} aria-label="Remove">
@@ -162,15 +199,44 @@
       role="dialog"
       tabindex="-1"
       aria-modal="true"
-      aria-label="Add app"
+      aria-label={t("split.addApp")}
     >
-      <h2>Add app</h2>
-      <p class="muted">Process / package name. The display name is optional.</p>
-      <input type="text" placeholder="Process name (e.g. telegram-desktop)" bind:value={appDraftId} />
-      <input type="text" placeholder="Display name (optional)" bind:value={appDraftName} />
+      <h2>{t("split.addApp")}</h2>
+      <input type="search" placeholder={t("split.searchInstalled")} bind:value={pickerQuery} />
+
+      <div class="picker">
+        {#if installedLoading}
+          <div class="picker-msg muted">{t("split.loadingApps")}</div>
+        {:else if pickerResults.length === 0}
+          <div class="picker-msg muted">
+            {installed.length === 0 ? t("split.noInstalled") : t("split.noInstalledMatch")}
+          </div>
+        {:else}
+          {#each pickerResults as app (app.id)}
+            <button
+              class="picker-row"
+              onclick={() => addInstalled(app)}
+              disabled={addedIds.has(app.id)}
+            >
+              {@render appIcon(app.icon)}
+              <div class="app-text">
+                <div class="app-name">{app.name}</div>
+                <div class="app-id dim">{app.id}</div>
+              </div>
+              {#if addedIds.has(app.id)}
+                <svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M5 12.5L10 17.5L19.5 8" stroke="var(--accent)" stroke-width="2.5" fill="none" stroke-linecap="round" stroke-linejoin="round" />
+                </svg>
+              {/if}
+            </button>
+          {/each}
+        {/if}
+      </div>
+
+      <p class="muted small-note">{t("split.pickFileHint")}</p>
       <div class="modal-actions">
-        <button class="btn btn-ghost" onclick={() => (showAddApp = false)}>Cancel</button>
-        <button class="btn btn-primary" onclick={submitAddApp} disabled={!appDraftId.trim()}>Add</button>
+        <button class="btn" onclick={() => (showAddApp = false)}>{t("common.close")}</button>
+        <button class="btn btn-primary" onclick={pickFromFile}>{t("split.chooseFile")}</button>
       </div>
     </div>
   </div>
@@ -199,8 +265,13 @@
     gap: 12px;
   }
 
+  /* Tabs span the full width like every other panel. */
   .segmented {
-    align-self: flex-start;
+    align-self: stretch;
+    display: flex;
+  }
+  .segmented :global(button) {
+    flex: 1;
   }
   .small {
     font-size: 11px;
@@ -214,33 +285,21 @@
     flex-direction: column;
     gap: 8px;
   }
-  .mode-header {
+  .mode-top {
     display: flex;
+    align-items: center;
     justify-content: space-between;
-    margin-bottom: 4px;
+    gap: 12px;
   }
-  .mode-row {
-    display: flex;
-    align-items: flex-start;
-    gap: 10px;
-    cursor: pointer;
-    padding: 4px 0;
-  }
-  .mode-row input {
-    margin-top: 3px;
-    width: auto;
-    accent-color: var(--accent);
+  .mode-label {
+    min-width: 0;
   }
   .mode-title {
     font-size: 14px;
-    font-weight: 500;
-  }
-  .mode-sub {
-    font-size: 12px;
-    margin-top: 2px;
+    font-weight: 600;
   }
   .mode-note {
-    margin: 6px 0 0;
+    margin: 2px 0 0;
     font-size: 12px;
     padding: 8px 10px;
     background: var(--bg-elev-2);
@@ -286,6 +345,10 @@
     font-size: 16px;
     flex-shrink: 0;
   }
+  img.app-icon {
+    object-fit: contain;
+    padding: 3px;
+  }
   .app-text {
     flex: 1;
     min-width: 0;
@@ -325,17 +388,6 @@
   }
   .trash:hover { color: var(--danger); }
 
-  .hint {
-    font-size: 12px;
-    padding: 0 4px;
-  }
-  code {
-    font-family: ui-monospace, "JetBrains Mono", monospace;
-    background: var(--bg-elev);
-    padding: 1px 5px;
-    border-radius: 3px;
-    font-size: 0.9em;
-  }
 
   /* modal */
   .modal-backdrop {
@@ -359,6 +411,44 @@
   }
   .modal h2 { margin: 0; font-size: 17px; font-weight: 600; }
   .modal p { margin: 0; font-size: 13px; }
+
+  .picker {
+    max-height: 320px;
+    overflow-y: auto;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg-elev-2);
+  }
+  .picker-row {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 10px;
+    background: transparent;
+    border: none;
+    border-radius: 0;
+    text-align: left;
+    color: var(--text);
+  }
+  .picker-row + .picker-row {
+    border-top: 1px solid var(--border);
+  }
+  .picker-row:hover:not(:disabled) {
+    background: var(--bg-elev-3);
+  }
+  .picker-row:disabled {
+    opacity: 0.55;
+    cursor: default;
+  }
+  .picker-msg {
+    padding: 18px 12px;
+    text-align: center;
+    font-size: 13px;
+  }
+  .small-note {
+    font-size: 12px;
+  }
   .modal-actions {
     display: flex;
     justify-content: flex-end;

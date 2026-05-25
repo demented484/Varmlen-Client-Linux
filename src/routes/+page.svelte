@@ -1,8 +1,10 @@
 <script lang="ts">
+  import { openUrl } from "@tauri-apps/plugin-opener";
   import { conn, fmtElapsed } from "$lib/conn.svelte";
   import { subs } from "$lib/subs.svelte";
+  import { t } from "$lib/i18n.svelte";
 
-  import type { Subscription } from "$lib/subs.svelte";
+  import type { Subscription, ServerEntry } from "$lib/subs.svelte";
 
   let showImport = $state(false);
   let subUrl = $state("");
@@ -11,6 +13,40 @@
   let infoFor = $state<Subscription | null>(null);
   let renameFor = $state<Subscription | null>(null);
   let renameDraft = $state("");
+  let detailFor = $state<ServerEntry | null>(null);
+  // Fixed-position coords for the "…" menu so it escapes the card's overflow:hidden.
+  let menuPos = $state({ top: 0, right: 0 });
+
+  function toggleMenu(subId: string, e: MouseEvent) {
+    if (openMenuFor === subId) {
+      openMenuFor = null;
+      return;
+    }
+    const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    menuPos = { top: r.bottom + 4, right: window.innerWidth - r.right };
+    openMenuFor = subId;
+  }
+
+  /** The parsed vless:// fields, as label/value rows for the detail modal. */
+  const detailRows = $derived.by(() => {
+    const s = detailFor?.raw;
+    if (!s) return [] as Array<[string, string]>;
+    const rows: Array<[string, string | null]> = [
+      ["Address", `${s.host}:${s.port}`],
+      ["UUID", s.uuid],
+      ["Transport", s.transport],
+      ["Security", s.security],
+      ["SNI", s.sni],
+      ["Fingerprint", s.fingerprint],
+      ["Public key (pbk)", s.public_key],
+      ["Short ID (sid)", s.short_id],
+      ["Flow", s.flow],
+      ["Path", s.path],
+      ["Mode", s.mode],
+      ["Packet encoding", s.packet_encoding],
+    ];
+    return rows.filter(([, v]) => v != null && v !== "") as Array<[string, string]>;
+  });
 
   function openInfo(sub: Subscription) {
     infoFor = sub;
@@ -26,13 +62,21 @@
     renameFor = null;
   }
 
-  const statusLabel = $derived(
-    {
-      disconnected: "Not connected",
-      connecting: "Connecting…",
-      connected: "Connected",
-    }[conn.status],
-  );
+  // Subscription headers (support / web-page URLs) are attacker-controlled, so
+  // only hand the OS opener a vetted web/Telegram scheme — never file:, etc.
+  const SAFE_SCHEMES = new Set(["http:", "https:", "tg:"]);
+  async function open(url: string | null) {
+    if (!url) return;
+    let scheme: string;
+    try {
+      scheme = new URL(url).protocol;
+    } catch {
+      return;
+    }
+    if (SAFE_SCHEMES.has(scheme)) await openUrl(url);
+  }
+
+  const statusLabel = $derived(t(`status.${conn.status}`));
 
   const allCollapsed = $derived(
     subs.list.length > 0 && subs.list.every((s) => s.collapsed),
@@ -71,13 +115,10 @@
     <button
       class="power"
       data-status={conn.status}
-      data-traffic={conn.outgoing ? "on" : "off"}
       onclick={() => conn.toggle()}
       aria-label={conn.status === "connected" ? "Disconnect" : "Connect"}
     >
-      <span class="halo halo-1"></span>
-      <span class="halo halo-2"></span>
-      <svg viewBox="0 0 64 64" width="62" height="62" aria-hidden="true">
+      <svg viewBox="0 0 64 64" width="54" height="54" class="power-icon" aria-hidden="true">
         <path
           d="M22 18a16 16 0 1 0 20 0"
           stroke="currentColor"
@@ -87,22 +128,22 @@
         />
         <line x1="32" y1="11" x2="32" y2="30" stroke="currentColor" stroke-width="3.5" stroke-linecap="round" />
       </svg>
+      {#if conn.status === "connected"}
+        <span class="power-timer">{fmtElapsed(conn.elapsedSec)}</span>
+      {/if}
     </button>
     <div class="status-text" data-status={conn.status}>{statusLabel}</div>
-    {#if conn.status === "connected"}
-      <div class="timer">{fmtElapsed(conn.elapsedSec)}</div>
-    {/if}
   </section>
 
   <div class="actions-row">
     <button class="text-link" disabled={conn.status !== "connected"}>
-      Check current connection
+      {t("home.checkConnection")}
     </button>
     <button
       class="text-link"
       onclick={() => (allCollapsed ? subs.expandAll() : subs.collapseAll())}
     >
-      {allCollapsed ? "Show all" : "Hide all"}
+      {allCollapsed ? t("home.showAll") : t("home.hideAll")}
     </button>
   </div>
 
@@ -129,7 +170,7 @@
           <div class="sub-title">{sub.name}</div>
           <div class="sub-meta muted">
             {fmtImported(sub.importedAt)}{sub.updateIntervalHours
-              ? ` · auto-update ${sub.updateIntervalHours}h`
+              ? ` · ${t("home.autoUpdate", { h: sub.updateIntervalHours })}`
               : ""}
           </div>
         </div>
@@ -155,23 +196,27 @@
           <button
             class="head-btn"
             aria-label="Subscription menu"
-            onclick={() => (openMenuFor = openMenuFor === sub.id ? null : sub.id)}
+            onclick={(e) => toggleMenu(sub.id, e)}
           >
             <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
               <circle cx="5" cy="12" r="1.6" /><circle cx="12" cy="12" r="1.6" /><circle cx="19" cy="12" r="1.6" />
             </svg>
           </button>
           {#if openMenuFor === sub.id}
-            <div class="menu" role="menu">
+            <div class="menu-backdrop" role="presentation" onclick={() => (openMenuFor = null)}></div>
+            <div class="menu" role="menu" style="top: {menuPos.top}px; right: {menuPos.right}px;">
+              <button role="menuitem" class="menu-item" onclick={() => openInfo(sub)}>
+                {t("menu.info")}
+              </button>
               <button role="menuitem" class="menu-item" onclick={() => openRename(sub)}>
-                Rename
+                {t("menu.rename")}
               </button>
               <button
                 role="menuitem"
                 class="menu-item danger"
                 onclick={() => { subs.remove(sub.id); openMenuFor = null; }}
               >
-                Remove subscription
+                {t("menu.remove")}
               </button>
             </div>
           {/if}
@@ -179,26 +224,24 @@
       </header>
 
       <div class="sub-traffic">
-        <button
-          class="info-dot"
-          aria-label="Subscription info"
-          onclick={() => openInfo(sub)}
-        >i</button>
+        {#if sub.webPageUrl}
+          <button class="round-btn" aria-label="Website" onclick={() => open(sub.webPageUrl)}>
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="12" cy="12" r="9" />
+              <path d="M12 16v-4" />
+              <path d="M12 8h.01" />
+            </svg>
+          </button>
+        {/if}
         <div class="traffic-bar">
           <span class="traffic-text">{subs.trafficText(sub)}</span>
         </div>
         {#if sub.supportUrl}
-          <a
-            class="tg-btn"
-            href={sub.supportUrl}
-            target="_blank"
-            rel="noopener"
-            aria-label="Open support"
-          >
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
-              <path d="M9.04 15.78L8.7 19.2c.41 0 .59-.18.81-.39l1.95-1.86 4.04 2.96c.74.41 1.27.19 1.46-.69l2.65-12.4c.23-1.05-.38-1.46-1.1-1.2L3.5 9.84c-1.02.4-1.01.97-.17 1.23l4.04 1.26 9.4-5.92c.44-.27.85-.12.52.18z" />
+          <button class="round-btn" aria-label="Telegram" onclick={() => open(sub.supportUrl)}>
+            <svg width="23" height="23" viewBox="0 0 128 128" fill="currentColor" aria-hidden="true">
+              <path d="M28.9700376,63.3244248 C47.6273373,55.1957357 60.0684594,49.8368063 66.2934036,47.2476366 C84.0668845,39.855031 87.7600616,38.5708563 90.1672227,38.528 C90.6966555,38.5191258 91.8804274,38.6503351 92.6472251,39.2725385 C93.294694,39.7979149 93.4728387,40.5076237 93.5580865,41.0057381 C93.6433345,41.5038525 93.7494885,42.63857 93.6651041,43.5252052 C92.7019529,53.6451182 88.5344133,78.2034783 86.4142057,89.5379542 C85.5170662,94.3339958 83.750571,95.9420841 82.0403991,96.0994568 C78.3237996,96.4414641 75.5015827,93.6432685 71.9018743,91.2836143 C66.2690414,87.5912212 63.0868492,85.2926952 57.6192095,81.6896017 C51.3004058,77.5256038 55.3966232,75.2369981 58.9976911,71.4967761 C59.9401076,70.5179421 76.3155302,55.6232293 76.6324771,54.2720454 C76.6721165,54.1030573 76.7089039,53.4731496 76.3346867,53.1405352 C75.9604695,52.8079208 75.4081573,52.921662 75.0095933,53.0121213 C74.444641,53.1403447 65.4461175,59.0880351 48.0140228,70.8551922 C45.4598218,72.6091037 43.1463059,73.4636682 41.0734751,73.4188859 C38.7883453,73.3695169 34.3926725,72.1268388 31.1249416,71.0646282 C27.1169366,69.7617838 23.931454,69.0729605 24.208838,66.8603276 C24.3533167,65.7078514 25.9403832,64.5292172 28.9700376,63.3244248 Z" />
             </svg>
-          </a>
+          </button>
         {/if}
       </div>
 
@@ -207,7 +250,7 @@
       {/if}
 
       {#if subs.expiresText(sub)}
-        <div class="expires muted small">Expires: {subs.expiresText(sub)}</div>
+        <div class="expires muted small">{t("home.expires", { date: subs.expiresText(sub) ?? "" })}</div>
       {/if}
 
       {#if !sub.collapsed}
@@ -217,9 +260,9 @@
               class="srv-row"
               class:active={subs.selectedServerId === srv.id}
             >
+              <span class="srv-stripe"></span>
               <button class="srv-btn" onclick={() => subs.selectServer(srv.id)}>
-                <span class="srv-stripe"></span>
-                <span class="flag">{srv.flag}</span>
+                <span class="flag">{srv.flag ?? ""}</span>
                 <div class="srv-info">
                   <div class="srv-name">{srv.name}</div>
                   <div class="srv-tr dim">{srv.transport}</div>
@@ -231,9 +274,17 @@
                       ? `${srv.pingMs} ms`
                       : "n/d"}
                 </span>
-                <svg width="16" height="16" viewBox="0 0 24 24" class="chev" aria-hidden="true">
-                  <path d="M9 6l6 6-6 6" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round" />
-                </svg>
+              </button>
+              <button
+                class="srv-detail"
+                aria-label="Location details"
+                onclick={() => (detailFor = srv)}
+              >
+                <span class="chev-hit">
+                  <svg width="16" height="16" viewBox="0 0 24 24" class="chev" aria-hidden="true">
+                    <path d="M9 6l6 6-6 6" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round" />
+                  </svg>
+                </span>
               </button>
             </li>
           {/each}
@@ -243,9 +294,7 @@
   {/each}
 
   {#if subs.list.length === 0}
-    <div class="empty muted">
-      No subscriptions yet. Tap <strong>+</strong> in the top-right corner.
-    </div>
+    <div class="empty muted">{t("home.empty")}</div>
   {/if}
 </main>
 
@@ -262,30 +311,30 @@
     >
       <h2>{infoFor.name}</h2>
       <dl class="info-grid">
-        <dt>URL</dt>
+        <dt>{t("info.url")}</dt>
         <dd class="mono small">{infoFor.url}</dd>
 
-        <dt>Imported</dt>
+        <dt>{t("info.imported")}</dt>
         <dd>{fmtImported(infoFor.importedAt)}</dd>
 
         {#if infoFor.updateIntervalHours}
-          <dt>Auto-update</dt>
-          <dd>every {infoFor.updateIntervalHours} h</dd>
+          <dt>{t("info.autoUpdate")}</dt>
+          <dd>{t("info.everyH", { h: infoFor.updateIntervalHours })}</dd>
         {/if}
 
-        <dt>Traffic</dt>
+        <dt>{t("info.traffic")}</dt>
         <dd>{subs.trafficText(infoFor)}</dd>
 
         {#if subs.expiresText(infoFor)}
-          <dt>Expires</dt>
+          <dt>{t("info.expires")}</dt>
           <dd>{subs.expiresText(infoFor)}</dd>
         {/if}
 
-        <dt>Servers</dt>
+        <dt>{t("info.servers")}</dt>
         <dd>{infoFor.servers.length}</dd>
 
         {#if infoFor.supportUrl}
-          <dt>Support</dt>
+          <dt>{t("info.support")}</dt>
           <dd><a href={infoFor.supportUrl} target="_blank" rel="noopener">{infoFor.supportUrl}</a></dd>
         {/if}
       </dl>
@@ -293,7 +342,32 @@
         <p class="info-desc">{infoFor.description}</p>
       {/if}
       <div class="modal-actions">
-        <button class="btn" onclick={() => (infoFor = null)}>Close</button>
+        <button class="btn" onclick={() => (infoFor = null)}>{t("common.close")}</button>
+      </div>
+    </div>
+  </div>
+{/if}
+
+{#if detailFor}
+  <div class="modal-backdrop" onclick={() => (detailFor = null)} role="presentation">
+    <div
+      class="modal card"
+      onclick={(e) => e.stopPropagation()}
+      onkeydown={(e) => e.key === "Escape" && (detailFor = null)}
+      role="dialog"
+      tabindex="-1"
+      aria-modal="true"
+      aria-label="Location details"
+    >
+      <h2>{detailFor.flag ? detailFor.flag + " " : ""}{detailFor.name}</h2>
+      <dl class="info-grid">
+        {#each detailRows as [label, value] (label)}
+          <dt>{label}</dt>
+          <dd class="mono small">{value}</dd>
+        {/each}
+      </dl>
+      <div class="modal-actions">
+        <button class="btn" onclick={() => (detailFor = null)}>{t("common.close")}</button>
       </div>
     </div>
   </div>
@@ -310,16 +384,16 @@
       aria-modal="true"
       aria-label="Rename subscription"
     >
-      <h2>Rename subscription</h2>
+      <h2>{t("rename.title")}</h2>
       <input
         type="text"
         bind:value={renameDraft}
         onkeydown={(e) => e.key === "Enter" && commitRename()}
       />
       <div class="modal-actions">
-        <button class="btn btn-ghost" onclick={() => (renameFor = null)}>Cancel</button>
+        <button class="btn btn-ghost" onclick={() => (renameFor = null)}>{t("common.cancel")}</button>
         <button class="btn btn-primary" onclick={commitRename} disabled={!renameDraft.trim()}>
-          Save
+          {t("common.save")}
         </button>
       </div>
     </div>
@@ -337,8 +411,8 @@
       aria-modal="true"
       aria-label="Add subscription"
     >
-      <h2>Add subscription</h2>
-      <p class="muted">Paste a subscription URL or a single <code>vless://</code> link.</p>
+      <h2>{t("import.title")}</h2>
+      <p class="muted">{t("import.hint")}</p>
       <input
         type="url"
         placeholder="https://… or vless://…"
@@ -349,9 +423,9 @@
         <div class="error">{importError}</div>
       {/if}
       <div class="modal-actions">
-        <button class="btn btn-ghost" onclick={() => (showImport = false)}>Cancel</button>
+        <button class="btn btn-ghost" onclick={() => (showImport = false)}>{t("common.cancel")}</button>
         <button class="btn btn-primary" onclick={importSubscription} disabled={subs.importing || !subUrl.trim()}>
-          {subs.importing ? "Importing…" : "Add"}
+          {subs.importing ? t("import.importing") : t("import.add")}
         </button>
       </div>
     </div>
@@ -402,8 +476,6 @@
     flex-direction: column;
     align-items: center;
     gap: 8px;
-    /* extra top padding so the halo ripple (-28px) doesn't clip
-       against the scroll container's top edge */
     padding: 38px 0 14px;
     position: relative;
   }
@@ -414,12 +486,15 @@
     background: var(--bg-elev);
     border: 1px solid var(--border);
     color: var(--text-muted);
+    /* The icon is always centred; the timer is absolutely positioned below it
+       so connecting/connected never shifts the icon up. */
     display: flex;
     align-items: center;
     justify-content: center;
     padding: 0;
     position: relative;
-    transition: all var(--transition);
+    transition: background var(--transition), border-color var(--transition),
+      color var(--transition);
     z-index: 1;
   }
   .power:hover {
@@ -427,46 +502,24 @@
     color: var(--text);
   }
   .power[data-status="connecting"] {
-    color: var(--warn);
+    color: var(--accent);
   }
   .power[data-status="connected"] {
     background: var(--accent);
     border-color: var(--accent);
     color: var(--accent-on);
   }
-
-  .halo {
+  .power-timer {
     position: absolute;
-    inset: 0;
-    border-radius: 50%;
-    border: 1px solid transparent;
-    /* never hijack clicks even when the ring extends past the button edge */
-    pointer-events: none;
-    opacity: 0;
-    transition: opacity var(--transition);
-  }
-  /* halos are visible only while traffic is actually flowing */
-  .power[data-status="connected"][data-traffic="on"] .halo-1 {
-    inset: -14px;
-    border-color: var(--accent);
-    opacity: 0.35;
-    animation: ripple 2s ease-out infinite;
-  }
-  .power[data-status="connected"][data-traffic="on"] .halo-2 {
-    inset: -28px;
-    border-color: var(--accent);
-    opacity: 0.18;
-    animation: ripple 2s ease-out infinite 1s;
-  }
-  .power[data-status="connecting"] .halo-1 {
-    inset: -10px;
-    border-color: var(--warn);
-    opacity: 0.45;
-    animation: ripple 1.2s ease-out infinite;
-  }
-  @keyframes ripple {
-    0% { transform: scale(0.92); opacity: 0.5; }
-    100% { transform: scale(1.08); opacity: 0; }
+    left: 0;
+    right: 0;
+    bottom: 30px;
+    text-align: center;
+    font-variant-numeric: tabular-nums;
+    font-size: 19px;
+    font-weight: 700;
+    letter-spacing: 0.02em;
+    line-height: 1;
   }
 
   .status-text {
@@ -478,14 +531,7 @@
     margin-top: 6px;
   }
   .status-text[data-status="connected"] { color: var(--accent); }
-  .status-text[data-status="connecting"] { color: var(--warn); }
-
-  .timer {
-    font-variant-numeric: tabular-nums;
-    font-size: 20px;
-    font-weight: 600;
-    margin-top: -4px;
-  }
+  .status-text[data-status="connecting"] { color: var(--accent); }
 
   /* ---------- actions row ---------- */
   .actions-row {
@@ -581,16 +627,20 @@
     position: relative;
   }
   .menu {
-    position: absolute;
-    top: 34px;
-    right: 0;
+    position: fixed;
     min-width: 200px;
     background: var(--bg-elev-2);
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
     box-shadow: var(--shadow);
     padding: 4px;
-    z-index: 50;
+    z-index: 200;
+  }
+  .menu-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 199;
+    background: transparent;
   }
   .menu-item {
     width: 100%;
@@ -615,21 +665,21 @@
     gap: 8px;
     padding: 2px 12px 10px;
   }
-  .info-dot {
-    width: 22px;
-    height: 22px;
+  .round-btn {
+    width: 30px;
+    height: 30px;
     padding: 0;
     border-radius: 50%;
-    border: 1.5px solid var(--accent);
+    border: none;
     color: var(--accent);
-    font-size: 12px;
-    font-style: italic;
-    font-weight: 700;
     background: transparent;
     display: flex;
     align-items: center;
     justify-content: center;
     flex-shrink: 0;
+  }
+  .round-btn:hover {
+    background: var(--accent-faint);
   }
   .traffic-bar {
     flex: 1;
@@ -644,22 +694,6 @@
     font-size: 13px;
     font-weight: 500;
   }
-  .tg-btn {
-    width: 28px;
-    height: 28px;
-    padding: 0;
-    color: var(--accent);
-    background: transparent;
-    border: none;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    flex-shrink: 0;
-  }
-  .tg-btn:hover {
-    transform: scale(1.06);
-  }
-
   .description {
     padding: 0 14px 8px;
     font-size: 12px;
@@ -713,25 +747,54 @@
   .server-list {
     list-style: none;
     margin: 0;
-    padding: 4px 0 4px;
+    /* no bottom padding: the last row reaches the card's rounded bottom edge,
+       which clips it (sub-card has overflow:hidden) so its highlight fills the
+       corner instead of leaving a dark gap */
+    padding: 4px 0 0;
   }
   .srv-row {
     position: relative;
+    display: flex;
+    align-items: stretch;
+    background: transparent;
+    transition: background var(--transition);
+  }
+  /* Hovering anywhere on the row highlights the whole row. */
+  .srv-row:hover {
+    background: var(--bg-elev-2);
   }
   .srv-btn {
-    width: 100%;
+    flex: 1;
+    min-width: 0;
     display: flex;
     align-items: center;
     gap: 12px;
-    padding: 10px 12px 10px 14px;
+    padding: 10px 4px 10px 14px;
     background: transparent;
     border: none;
     color: inherit;
     text-align: left;
     border-radius: 0;
   }
-  .srv-btn:hover {
-    background: var(--bg-elev-2);
+  .srv-detail {
+    flex-shrink: 0;
+    width: 40px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: transparent;
+    border: none;
+    border-radius: 0;
+    color: var(--text-dim);
+  }
+  .chev-hit {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  /* Hovering the arrow itself just makes it brighter — no separate backdrop. */
+  .srv-detail:hover {
+    color: var(--text);
   }
   .srv-stripe {
     position: absolute;
@@ -746,13 +809,16 @@
   .srv-row.active .srv-stripe {
     background: var(--accent);
   }
-  .srv-row.active .srv-btn {
+  .srv-row.active {
     background: var(--accent-faint);
   }
   .flag {
     font-size: 22px;
     line-height: 1;
     flex-shrink: 0;
+    /* fixed slot so rows without a flag emoji keep the same text indent */
+    width: 26px;
+    text-align: center;
   }
   .srv-info {
     flex: 1;
@@ -784,7 +850,7 @@
     50% { opacity: 1; }
   }
   .chev {
-    color: var(--text-muted);
+    color: inherit;
     flex-shrink: 0;
   }
 
@@ -825,13 +891,6 @@
     justify-content: flex-end;
     gap: 8px;
     margin-top: 4px;
-  }
-  code {
-    font-family: ui-monospace, "JetBrains Mono", monospace;
-    background: var(--bg-elev-2);
-    padding: 1px 5px;
-    border-radius: 3px;
-    font-size: 0.9em;
   }
   .error {
     color: var(--danger);

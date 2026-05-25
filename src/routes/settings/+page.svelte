@@ -1,6 +1,7 @@
 <script lang="ts">
   import { theme } from "$lib/theme.svelte";
   import { settings, type LogLevel } from "$lib/settings.svelte";
+  import { i18n, t, LANGUAGES, type Lang } from "$lib/i18n.svelte";
   import Dropdown from "$lib/components/Dropdown.svelte";
 
   const logOptions = [
@@ -11,12 +12,12 @@
 </script>
 
 <header class="topbar">
-  <h1>Settings</h1>
+  <h1>{t("settings.title")}</h1>
 </header>
 
 <main class="scroll">
   <section>
-    <h2>Appearance</h2>
+    <h2>{t("settings.appearance")}</h2>
     <div class="card theme-card">
       <div class="theme-row">
         <button
@@ -26,7 +27,7 @@
           aria-pressed={theme.current === "dark"}
         >
           <div class="swatch swatch-dark"></div>
-          <span>Dark</span>
+          <span>{t("settings.dark")}</span>
         </button>
         <button
           class="theme-tile"
@@ -35,19 +36,30 @@
           aria-pressed={theme.current === "light"}
         >
           <div class="swatch swatch-light"></div>
-          <span>Light</span>
+          <span>{t("settings.light")}</span>
         </button>
       </div>
     </div>
   </section>
 
   <section>
-    <h2>General</h2>
+    <h2>{t("settings.general")}</h2>
     <div class="list">
+      <div class="row">
+        <div class="row-text">
+          <div class="row-title">{t("settings.language")}</div>
+        </div>
+        <Dropdown
+          value={i18n.lang}
+          options={LANGUAGES}
+          onChange={(v) => i18n.set(v as Lang)}
+          ariaLabel={t("settings.language")}
+        />
+      </div>
       <label class="row">
         <div class="row-text">
-          <div class="row-title">Launch on system startup</div>
-          <div class="row-sub muted">Open AegisVPN automatically after login.</div>
+          <div class="row-title">{t("settings.autostart")}</div>
+          <div class="row-sub muted">{t("settings.autostartSub")}</div>
         </div>
         <span class="switch">
           <input
@@ -60,8 +72,8 @@
       </label>
       <label class="row">
         <div class="row-text">
-          <div class="row-title">Killswitch</div>
-          <div class="row-sub muted">Block all traffic if the VPN connection drops.</div>
+          <div class="row-title">{t("settings.killswitch")}</div>
+          <div class="row-sub muted">{t("settings.killswitchSub")}</div>
         </div>
         <span class="switch">
           <input
@@ -74,8 +86,8 @@
       </label>
       <label class="row">
         <div class="row-text">
-          <div class="row-title">Allow LAN traffic</div>
-          <div class="row-sub muted">Keep printers, NAS, and local devices reachable.</div>
+          <div class="row-title">{t("settings.allowLan")}</div>
+          <div class="row-sub muted">{t("settings.allowLanSub")}</div>
         </div>
         <span class="switch">
           <input
@@ -90,35 +102,31 @@
   </section>
 
   <section>
-    <h2>Diagnostics</h2>
+    <h2>{t("settings.diagnostics")}</h2>
     <div class="list">
       <div class="row">
         <div class="row-text">
-          <div class="row-title">Log level</div>
-          <div class="row-sub muted">
-            Use <code>debug</code> only when reporting bugs.
-          </div>
+          <div class="row-title">{t("settings.logLevel")}</div>
+          <div class="row-sub muted">{t("settings.logLevelSub")}</div>
         </div>
         <Dropdown
           value={settings.logLevel}
           options={logOptions}
           onChange={(v) => settings.setLogLevel(v as LogLevel)}
-          ariaLabel="Log level"
+          ariaLabel={t("settings.logLevel")}
         />
       </div>
     </div>
   </section>
 
   <section>
-    <h2>About</h2>
+    <h2>{t("settings.about")}</h2>
     <div class="card about">
       <div class="about-row">
         <div class="about-name">AegisVPN</div>
         <div class="about-version muted">v0.1.0</div>
       </div>
-      <div class="about-desc muted">
-        Open-source sing-box client. Licensed under AGPL-3.0.
-      </div>
+      <div class="about-desc muted">{t("settings.aboutDesc")}</div>
     </div>
   </section>
 </main>
@@ -238,11 +246,4 @@
   }
   .about-desc { font-size: 12px; }
 
-  code {
-    font-family: ui-monospace, "JetBrains Mono", monospace;
-    background: var(--bg-elev-2);
-    padding: 1px 5px;
-    border-radius: 3px;
-    font-size: 0.9em;
-  }
 </style>

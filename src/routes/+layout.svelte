@@ -2,6 +2,7 @@
   import "../app.css";
   import { page } from "$app/state";
   import { NAV } from "$lib/nav";
+  import { t } from "$lib/i18n.svelte";
   import "$lib/theme.svelte"; // module-level init applies persisted theme
 
   let { children } = $props();
@@ -23,7 +24,7 @@
         <svg width="22" height="22" viewBox="0 0 24 24" aria-hidden="true">
           <path d={item.icon} fill="currentColor" />
         </svg>
-        <span>{item.label}</span>
+        <span>{t(item.labelKey)}</span>
       </a>
     {/each}
   </nav>

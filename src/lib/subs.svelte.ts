@@ -2,7 +2,7 @@ import { browser } from "$app/environment";
 import {
   fetchSubscription,
   pingTcp,
-  guessFlag,
+  flagFor,
   stripLeadingFlag,
   formatBytes,
   formatExpires,
@@ -36,7 +36,11 @@ export interface Subscription {
   totalBytes: number;
   /** Unix seconds, or null when no expiry was sent. */
   expiresAtUnix: number | null;
+  /** Telegram/support contact (Support-Url) — paper-plane icon when it's a
+   *  t.me link, which for our own service is the bot. */
   supportUrl: string | null;
+  /** Provider website (Profile-Web-Page-Url) — shown as an info icon. */
+  webPageUrl: string | null;
   servers: ServerEntry[];
   collapsed: boolean;
   /** True while refresh() is in flight. Not persisted. */
@@ -70,8 +74,12 @@ function migrateIds(subs: Subscription[]): { subs: Subscription[]; remapped: Rec
       // Drop the leading flag emoji from older labels stored before the
       // flag was rendered separately.
       srv.name = stripLeadingFlag(srv.name);
+      // Re-derive the flag from the original label so entries imported before
+      // we preferred the label's own flag emoji pick up the correct one.
+      if (srv.raw?.label) srv.flag = flagFor(srv.raw.label);
     }
     if (sub.description === undefined) sub.description = null;
+    if (sub.webPageUrl === undefined) sub.webPageUrl = null;
     if (sub.refreshing) sub.refreshing = false;
   }
   return { subs, remapped };
@@ -98,8 +106,18 @@ function load(): Persisted {
   }
 }
 
+const PROTOCOL_LABELS: Record<string, string> = {
+  vless: "VLESS",
+  trojan: "Trojan",
+  shadowsocks: "Shadowsocks",
+  vmess: "VMess",
+};
+
 function transportSummary(s: VlessServer): string {
-  return `VLESS / ${s.transport.toUpperCase()} / ${s.security.toUpperCase()}`;
+  const proto = PROTOCOL_LABELS[s.protocol] ?? s.protocol.toUpperCase();
+  const parts = [proto, s.transport.toUpperCase()];
+  if (s.security && s.security !== "none") parts.push(s.security.toUpperCase());
+  return parts.join(" / ");
 }
 
 function toServerEntry(s: VlessServer): ServerEntry {
@@ -108,7 +126,7 @@ function toServerEntry(s: VlessServer): ServerEntry {
     // host:port endpoint (otherwise Svelte's keyed {#each} blows up the
     // second render).
     id: crypto.randomUUID(),
-    flag: guessFlag(s.label),
+    flag: flagFor(s.label),
     name: stripLeadingFlag(s.label),
     transport: transportSummary(s),
     pingMs: null,
@@ -220,6 +238,7 @@ class SubsStore {
         totalBytes,
         expiresAtUnix: result.meta.expires_at_unix,
         supportUrl: result.meta.support_url,
+        webPageUrl: result.meta.web_page_url,
         servers,
         collapsed: false,
       };
@@ -266,7 +285,8 @@ class SubsStore {
               usedBytes,
               totalBytes,
               expiresAtUnix: result.meta.expires_at_unix ?? s.expiresAtUnix,
-              supportUrl: result.meta.support_url ?? s.supportUrl,
+              supportUrl: result.meta.support_url,
+              webPageUrl: result.meta.web_page_url,
               importedAt: new Date().toISOString(),
               refreshing: false,
             }

@@ -16,10 +16,21 @@
   let open = $state(false);
   let trigger: HTMLButtonElement | undefined = $state();
   let panel: HTMLDivElement | undefined = $state();
+  // Fixed-position coordinates for the panel, computed from the trigger rect so
+  // the menu escapes any `overflow: hidden` ancestor (cards, lists).
+  let pos = $state({ top: 0, right: 0 });
 
   const current = $derived(
     options.find((o) => o.value === value)?.label ?? value,
   );
+
+  function toggle() {
+    if (!open && trigger) {
+      const r = trigger.getBoundingClientRect();
+      pos = { top: r.bottom + 4, right: window.innerWidth - r.right };
+    }
+    open = !open;
+  }
 
   function handleDocClick(e: MouseEvent) {
     if (!open) return;
@@ -31,7 +42,15 @@
   $effect(() => {
     if (open) {
       document.addEventListener("click", handleDocClick, true);
-      return () => document.removeEventListener("click", handleDocClick, true);
+      // A scroll or resize moves the trigger; close to avoid a detached menu.
+      const close = () => (open = false);
+      window.addEventListener("scroll", close, true);
+      window.addEventListener("resize", close);
+      return () => {
+        document.removeEventListener("click", handleDocClick, true);
+        window.removeEventListener("scroll", close, true);
+        window.removeEventListener("resize", close);
+      };
     }
   });
 
@@ -49,7 +68,7 @@
     aria-haspopup="listbox"
     aria-expanded={open}
     aria-label={ariaLabel}
-    onclick={() => (open = !open)}
+    onclick={toggle}
   >
     <span class="trigger-text">{current}</span>
     <svg
@@ -64,7 +83,12 @@
     </svg>
   </button>
   {#if open}
-    <div bind:this={panel} class="panel" role="listbox">
+    <div
+      bind:this={panel}
+      class="panel"
+      role="listbox"
+      style="top: {pos.top}px; right: {pos.right}px;"
+    >
       {#each options as opt (opt.value)}
         <button
           type="button"
@@ -117,16 +141,14 @@
   }
 
   .panel {
-    position: absolute;
-    top: calc(100% + 4px);
-    right: 0;
-    min-width: 120px;
+    position: fixed;
+    min-width: 160px;
     background: var(--bg-elev-2);
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
     box-shadow: var(--shadow);
     padding: 4px;
-    z-index: 30;
+    z-index: 200;
   }
   .opt {
     width: 100%;

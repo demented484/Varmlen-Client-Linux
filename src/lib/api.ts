@@ -2,7 +2,11 @@ import { invoke } from "@tauri-apps/api/core";
 
 export interface VlessServer {
   id: string;
+  /** "vless" | "trojan" | "shadowsocks" | "vmess" */
+  protocol: string;
   uuid: string;
+  password: string | null;
+  method: string | null;
   host: string;
   port: number;
   label: string;
@@ -27,6 +31,7 @@ export interface SubscriptionMeta {
   total_bytes: number | null;
   expires_at_unix: number | null;
   support_url: string | null;
+  web_page_url: string | null;
 }
 
 export interface ImportResult {
@@ -52,34 +57,50 @@ export function pingTcp(host: string, port: number): Promise<number> {
   return invoke<number>("ping_tcp", { host, port });
 }
 
-const FLAG_HINTS: Array<[RegExp, string]> = [
-  [/finland|finl|\bfi\b|🇫🇮/i,    "🇫🇮"],
-  [/sweden|stockholm|\bse\b|🇸🇪/i, "🇸🇪"],
-  [/\busa?\b|united states|new york|🇺🇸/i, "🇺🇸"],
-  [/germany|deutsch|\bde\b|🇩🇪/i,  "🇩🇪"],
-  [/poland|\bpl\b|🇵🇱/i,           "🇵🇱"],
-  [/netherland|amsterdam|\bnl\b|🇳🇱/i, "🇳🇱"],
-  [/france|paris|\bfr\b|🇫🇷/i,     "🇫🇷"],
-  [/japan|tokyo|\bjp\b|🇯🇵/i,       "🇯🇵"],
-  [/singapore|\bsg\b|🇸🇬/i,         "🇸🇬"],
-  [/uk\b|britain|london|\bgb\b|🇬🇧/i, "🇬🇧"],
-  [/turkey|istanbul|\btr\b|🇹🇷/i,   "🇹🇷"],
-];
-
-export function guessFlag(label: string): string {
-  for (const [re, flag] of FLAG_HINTS) {
-    if (re.test(label)) return flag;
-  }
-  return "🏳️";
+export interface InstalledApp {
+  /** Binary / process name used to match the running app. */
+  id: string;
+  /** Display name from the desktop entry. */
+  name: string;
+  /** Icon as a `data:image/...` URI, or null when none was resolved. */
+  icon: string | null;
 }
 
-/** Regional-indicator flag = two code points in the U+1F1E6–U+1F1FF range. */
-const FLAG_RE = /^(?:\uD83C[\uDDE6-\uDDFF]){2}\s*/u;
+/** Installed desktop apps, parsed from the system's `.desktop` entries. */
+export function listInstalledApps(): Promise<InstalledApp[]> {
+  return invoke<InstalledApp[]>("list_installed_apps");
+}
 
-/** Remove a leading flag emoji from a server label so it isn't rendered twice
- *  (once as the standalone glyph next to the row, once inside the text). */
+/** Build an app entry from a user-picked file: a `.desktop` file is parsed
+ *  (name / exec / icon), any other file is treated as the binary. */
+export function appFromFile(path: string): Promise<InstalledApp | null> {
+  return invoke<InstalledApp | null>("app_from_file", { path });
+}
+
+/** The single leading emoji cluster at the start of a label: a country flag
+ *  (two regional indicators) or one pictographic emoji (📶 …) with its
+ *  modifiers / ZWJ sequence / variation selector. Only the FIRST one. */
+const LEADING_EMOJI =
+  /^(?:\p{Regional_Indicator}\p{Regional_Indicator}|\p{Extended_Pictographic})(?:️|\p{Emoji_Modifier}|‍\p{Extended_Pictographic}️?)*/u;
+
+/** Split a server label into its leading emoji icon (just the first one) and
+ *  the remaining text, so the icon renders in its own slot and isn't duplicated
+ *  in the name. Panels prefix a country flag (or a 📶-style marker); we use
+ *  whatever they send rather than guessing from the text. */
+export function splitLabelEmoji(label: string): { icon: string; name: string } {
+  const m = label.match(LEADING_EMOJI);
+  if (!m) return { icon: "", name: label.trim() };
+  return { icon: m[0], name: label.slice(m[0].length).trim() };
+}
+
+/** Server name with the leading emoji icon removed. */
 export function stripLeadingFlag(label: string): string {
-  return label.replace(FLAG_RE, "").trim();
+  return splitLabelEmoji(label).name;
+}
+
+/** The icon (flag or other leading emoji) for a server, or "" when none. */
+export function flagFor(label: string): string {
+  return splitLabelEmoji(label).icon;
 }
 
 /** Pretty bytes like 742.3GB / 1.5TB / 0B. */
