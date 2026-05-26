@@ -17,19 +17,25 @@
     void core.check();
   });
 
-  let helperOk = $state(false);
+  /** Tri-state so we don't flash "Not installed" while the very first check
+   *  is still in flight (the helper check is async but the section paints
+   *  instantly). "checking" renders the neutral yellow dot + a soft label
+   *  until we actually know. */
+  type HelperState = "checking" | "ok" | "missing";
+  let helperState = $state<HelperState>("checking");
   let helperBusy = $state(false);
   let helperErr = $state<string | null>(null);
 
-  async function refreshHelper() {
+  async function refreshHelper(allowChecking = false) {
+    if (allowChecking) helperState = "checking";
     try {
-      helperOk = await helperInstalled();
+      helperState = (await helperInstalled()) ? "ok" : "missing";
     } catch {
-      helperOk = false;
+      helperState = "missing";
     }
   }
   $effect(() => {
-    void refreshHelper();
+    void refreshHelper(true);
   });
 
   async function setupHelper() {
@@ -37,7 +43,14 @@
     helperErr = null;
     try {
       await installHelper();
-      await refreshHelper();
+      // systemctl restart returns before the socket is necessarily ready;
+      // retry a few times so we don't briefly show "missing" right after a
+      // successful install.
+      for (let i = 0; i < 10; i++) {
+        await refreshHelper();
+        if (helperState === "ok") break;
+        await new Promise((r) => setTimeout(r, 250));
+      }
     } catch (e) {
       helperErr = e instanceof Error ? e.message : String(e);
     } finally {
@@ -45,9 +58,11 @@
     }
   }
 
-  const helperStatus = $derived(
-    helperOk ? t("helper.ready") : helperErr ?? t("helper.notInstalled"),
-  );
+  const helperStatus = $derived.by(() => {
+    if (helperState === "checking") return t("helper.checking");
+    if (helperState === "ok") return t("helper.ready");
+    return helperErr ?? t("helper.notInstalled");
+  });
 
   let showVersions = $state(false);
 
@@ -284,19 +299,9 @@
                       </svg>
                       {t("core.active")}
                     </span>
-                    <button
-                      class="btn btn-sm"
-                      onclick={() => core.install(r.tag)}
-                      disabled={isDownloading}
-                      title={t("core.reinstall")}
-                    >
-                      <svg class="btn-ico" width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-                        <path d="M21 12a9 9 0 1 1-3.13-6.84M21 4v5h-5"
-                          stroke="currentColor" stroke-width="1.9"
-                          stroke-linecap="round" stroke-linejoin="round" />
-                      </svg>
-                      <span>{t("core.reinstall")}</span>
-                    </button>
+                    <!-- Active row spells "Delete" out so it's unmistakable
+                         that this action drops the version the user is
+                         currently running (we also disconnect first). -->
                     <button
                       class="btn btn-sm btn-danger"
                       onclick={() => core.uninstall(r.tag)}
@@ -318,18 +323,20 @@
                     >
                       {isSwitching ? "…" : t("core.use")}
                     </button>
+                    <!-- Non-active row uses icon-only delete to keep the row
+                         compact; the action is the same, just less shouty. -->
                     <button
-                      class="btn btn-sm btn-danger"
+                      class="ico-del"
                       onclick={() => core.uninstall(r.tag)}
                       disabled={isSwitching}
+                      aria-label={t("core.delete")}
                       title={t("core.delete")}
                     >
-                      <svg class="btn-ico" width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
                         <path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 11v6M14 11v6"
                           stroke="currentColor" stroke-width="1.9"
                           stroke-linecap="round" stroke-linejoin="round" />
                       </svg>
-                      <span>{t("core.delete")}</span>
                     </button>
                   {:else}
                     <button
@@ -361,29 +368,31 @@
       <div class="row">
         <span
           class="status-dot"
-          class:on={helperOk && !helperBusy}
-          class:off={!helperOk && !helperBusy}
-          class:busy={helperBusy}
+          class:on={helperState === "ok" && !helperBusy}
+          class:off={helperState === "missing" && !helperBusy}
+          class:busy={helperState === "checking" || helperBusy}
         ></span>
         <div class="row-text">
           <div class="row-title">{t("helper.title")}</div>
           <div class="row-sub muted">{helperStatus}</div>
         </div>
-        <button
-          class="btn {helperOk ? '' : 'btn-primary'}"
-          onclick={setupHelper}
-          disabled={helperBusy}
-        >
-          {helperBusy
-            ? t("helper.installing")
-            : helperOk
-              ? t("helper.reinstall")
-              : t("helper.install")}
-        </button>
-        {#if helperErr}
-          <div class="row-sub" style="color: var(--danger)">{helperErr}</div>
+        {#if helperState !== "checking"}
+          <button
+            class="btn {helperState === "ok" ? '' : 'btn-primary'}"
+            onclick={setupHelper}
+            disabled={helperBusy}
+          >
+            {helperBusy
+              ? t("helper.installing")
+              : helperState === "ok"
+                ? t("helper.reinstall")
+                : t("helper.install")}
+          </button>
         {/if}
       </div>
+      {#if helperErr}
+        <div class="row-sub" style="color: var(--danger); padding: 6px 14px;">{helperErr}</div>
+      {/if}
     </div>
   </section>
 
@@ -648,6 +657,28 @@
     background: var(--danger-faint);
     border-color: var(--danger);
   }
+
+  /* Compact icon-only delete used on non-active downloaded versions. Same
+     red palette as .btn-danger so the meaning is consistent across rows. */
+  .ico-del {
+    background: transparent;
+    border: 1px solid var(--danger-faint);
+    color: var(--danger);
+    width: 30px;
+    height: 30px;
+    border-radius: 8px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    transition: background var(--transition), border-color var(--transition);
+    flex-shrink: 0;
+  }
+  .ico-del:hover:not(:disabled) {
+    background: var(--danger-faint);
+    border-color: var(--danger);
+  }
+  .ico-del:disabled { opacity: 0.45; cursor: default; }
 
   /* Download progress: filled bar + bytes/speed line. */
   .progress {

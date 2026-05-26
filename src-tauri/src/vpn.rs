@@ -213,7 +213,10 @@ pub fn helper_install_core(path: std::path::PathBuf) -> Result<(), String> {
 
 /// ICMP RTT to host via the privileged helper (raw ICMP needs root). Returns
 /// the time in ms, or an error string when unreachable / helper is absent.
-#[tauri::command]
+///
+/// Not currently wired to the frontend — kept available for when the ping UI
+/// returns. Suppress dead-code so cargo check stays clean.
+#[allow(dead_code)]
 pub fn vpn_icmp_ping(host: String, timeout_ms: Option<u32>) -> Result<u32, String> {
     let resp = send(json!({
         "cmd": "ping_host",
