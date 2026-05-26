@@ -409,10 +409,14 @@
   .scroll {
     position: absolute;
     inset: 56px 0 0 0;
-    overflow-y: auto;
-    /* Symmetric gutter — see +page.svelte for the rationale. */
-    scrollbar-gutter: stable both-edges;
-    padding: 0 14px 24px;
+    /* Always reserve the scrollbar (no `auto`/`stable both-edges` — older
+       WebKitGTK doesn't honour `both-edges` and falls back to right-only,
+       which is exactly the asymmetric look we're trying to avoid). The
+       scrollbar is 6px (see app.css). We add 6px to padding-left so the
+       visible gap from the app edge to the panel edge is identical on
+       both sides. */
+    overflow-y: scroll;
+    padding: 0 14px 24px 20px;
     display: flex;
     flex-direction: column;
     gap: 16px;

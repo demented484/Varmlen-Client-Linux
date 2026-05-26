@@ -242,10 +242,10 @@
   .page {
     position: absolute;
     inset: 56px 0 0 0;
-    overflow-y: auto;
-    /* Symmetric gutter — see +page.svelte for the rationale. */
-    scrollbar-gutter: stable both-edges;
-    padding: 0 14px 24px;
+    /* See +page.svelte for the rationale on always-on scrollbar + mirrored
+       padding instead of `scrollbar-gutter: stable both-edges`. */
+    overflow-y: scroll;
+    padding: 0 14px 24px 20px;
     display: flex;
     flex-direction: column;
     gap: 12px;

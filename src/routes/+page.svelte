@@ -435,14 +435,14 @@
   .scroll {
     position: absolute;
     inset: 56px 0 0 0;
-    overflow-y: auto;
+    /* Always show the scrollbar (6px, see app.css) and mirror its width on
+       the left via padding, so the panels sit centred regardless of scroll
+       state. `scrollbar-gutter: stable both-edges` would do this, but it's
+       not in older WebKitGTK and the rule silently falls back to right-only,
+       which is the asymmetric look we want to avoid. */
+    overflow-y: scroll;
     overflow-x: hidden;
-    /* Reserve a gutter on BOTH sides so the visible gap from app-edge to
-       panel-edge is identical on the left and on the right, regardless of
-       whether the scrollbar is currently showing. With plain `stable`
-       only the right side gets the gutter, and panels look pushed left. */
-    scrollbar-gutter: stable both-edges;
-    padding: 0 14px 24px;
+    padding: 0 14px 24px 20px;
   }
 
   /* ---------- power hero ---------- */
