@@ -9,6 +9,13 @@ Type=simple
 # The installer substitutes __UID__ with the invoking user's id.
 Environment=AEGIS_ALLOW_UID=__UID__
 ExecStart=/usr/local/lib/aegisvpn/aegisvpn-helper
+# Safety net: if the helper dies (crash, OOM, manual `systemctl stop`,
+# upgrade restart), the killswitch nftables table and any leftover sing-box
+# would otherwise keep the user offline with no UI to fix it. Scrub them on
+# every stop, regardless of exit status.
+ExecStopPost=-/usr/sbin/nft delete table inet aegis_ks
+ExecStopPost=-/usr/bin/pkill -KILL -f /usr/local/lib/aegisvpn/sing-box
+ExecStopPost=-/usr/sbin/ip link delete dev aegis0
 # Creates /run/aegisvpn (root:root, 0755) for the control socket + config.
 RuntimeDirectory=aegisvpn
 RuntimeDirectoryMode=0755

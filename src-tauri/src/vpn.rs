@@ -40,13 +40,15 @@ impl HelperResponse {
 
 // --- helper (TUN, root) socket -------------------------------------------------
 
-fn send(req: serde_json::Value) -> Result<HelperResponse, String> {
+fn send_with_timeout(
+    req: serde_json::Value,
+    read_timeout: Duration,
+) -> Result<HelperResponse, String> {
     let stream = UnixStream::connect(SOCKET).map_err(|_| {
         "helper not reachable — set up the helper in Settings (TUN mode needs it)".to_string()
     })?;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(25)))
-        .map_err(|e| e.to_string())?;
+    stream.set_read_timeout(Some(read_timeout)).map_err(|e| e.to_string())?;
+    stream.set_write_timeout(Some(Duration::from_secs(2))).map_err(|e| e.to_string())?;
 
     let mut line = serde_json::to_string(&req).map_err(|e| e.to_string())?;
     line.push('\n');
@@ -59,6 +61,10 @@ fn send(req: serde_json::Value) -> Result<HelperResponse, String> {
     let mut resp = String::new();
     reader.read_line(&mut resp).map_err(|e| format!("helper read: {e}"))?;
     serde_json::from_str(resp.trim()).map_err(|e| format!("helper response: {e}"))
+}
+
+fn send(req: serde_json::Value) -> Result<HelperResponse, String> {
+    send_with_timeout(req, Duration::from_secs(25))
 }
 
 // --- local proxy (SOCKS/HTTP, no root) ----------------------------------------
@@ -178,7 +184,12 @@ pub fn vpn_connect(
 #[tauri::command]
 pub fn vpn_disconnect() -> Result<HelperResponse, String> {
     stop_local();
-    let _ = send(json!({ "cmd": "disconnect" })); // ignore if helper absent
+    // Tight timeout: this is called on window close, and we don't want the GUI
+    // to hang for 25s if the helper socket is wedged. The helper teardown
+    // budget (terminate sing-box + kill_stray_core + remove_killswitch) is
+    // bounded to ~6s in the worst case; 8s leaves headroom without making the
+    // user wait.
+    let _ = send_with_timeout(json!({ "cmd": "disconnect" }), Duration::from_secs(8));
     Ok(HelperResponse::disconnected())
 }
 

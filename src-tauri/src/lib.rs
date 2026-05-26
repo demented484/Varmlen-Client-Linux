@@ -111,12 +111,29 @@ pub fn run() {
             vpn::install_helper,
             storage::read_legacy_storage
         ])
-        .on_window_event(|_window, event| {
-            // Closing the window tears the VPN down too — kill the local proxy
-            // (if any) and tell the helper to disconnect sing-box. Otherwise
-            // the tunnel keeps running after the app is gone.
-            if matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
-                let _ = vpn::vpn_disconnect();
+        .on_window_event(|window, event| {
+            // Closing the window must tear the VPN down too — otherwise the
+            // helper's sing-box keeps running long after the GUI is gone, and
+            // the user is stuck on the tunnel with no UI to disconnect.
+            //
+            // Tauri exits the process as soon as this handler returns, racing
+            // the Unix-socket round-trip to the helper. We block the default
+            // close, run the disconnect on a worker thread (sockets can
+            // block), then ask the app to exit via AppHandle::exit which is
+            // thread-safe and routes back through the event loop. Calling
+            // `window.destroy()` from a worker thread is NOT safe in Tauri 2
+            // — UI ops must happen on the main thread.
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                use tauri::Manager;
+                api.prevent_close();
+                let app = window.app_handle().clone();
+                std::thread::spawn(move || {
+                    let _ = vpn::vpn_disconnect();
+                    // Give the helper a beat so the tunnel really is down by
+                    // the time the user re-opens, not mid-teardown.
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    app.exit(0);
+                });
             }
         })
         .setup(|_app| {

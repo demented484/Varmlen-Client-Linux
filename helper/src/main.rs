@@ -110,6 +110,11 @@ impl Daemon {
         if let Some(mut c) = self.child.take() {
             terminate_gracefully(&mut c);
         }
+        // Defense in depth: if the daemon was restarted while sing-box was
+        // running (so self.child is None but a sing-box owned by us is still
+        // alive in /usr/local/lib/aegisvpn/sing-box), sweep it up too.
+        // Otherwise disconnect would silently leave the tunnel up.
+        kill_stray_core();
         // Explicit disconnect → drop the killswitch so the user has network.
         remove_killswitch();
     }
@@ -137,6 +142,21 @@ impl Daemon {
         // the user out of the network.
         if killswitch {
             let ips = resolve_ips(server);
+            if ips.is_empty() {
+                // No IPs == no allow-list entry for the proxy server. Applying
+                // anyway would let sing-box only reach DNS — every proxy
+                // attempt would be dropped, the tunnel never comes up, and the
+                // user is locked out. Fail loudly instead. This is the common
+                // failure when the system resolver was just torn down (e.g.
+                // AdGuard / dnsmasq disabled with /etc/resolv.conf still
+                // pointing at 127.0.0.1).
+                return Err(format!(
+                    "cannot resolve proxy host '{server}' — DNS is unavailable. \
+                     Restart your system resolver (e.g. systemctl restart \
+                     systemd-resolved) or disable the killswitch in Settings, \
+                     then retry."
+                ));
+            }
             if let Err(e) = apply_killswitch(&ips, allow_lan) {
                 eprintln!("killswitch: {e}");
             }
@@ -208,10 +228,19 @@ impl Daemon {
 
 /// Resolve a proxy server host to its IP addresses (for the killswitch
 /// allow-list). Uses normal resolution before the killswitch is applied.
+/// Resolve the proxy host to one or more IPs for the killswitch allow-list.
+///
+/// Tries an IP-literal parse first (no DNS, deterministic), then falls back to
+/// the system resolver. Returning empty is a real failure — apply_killswitch
+/// would lock the user out — so the caller checks for that explicitly.
 fn resolve_ips(host: &str) -> Vec<std::net::IpAddr> {
     use std::net::ToSocketAddrs;
+    use std::str::FromStr;
     if host.is_empty() {
         return Vec::new();
+    }
+    if let Ok(ip) = std::net::IpAddr::from_str(host) {
+        return vec![ip];
     }
     (host, 443u16)
         .to_socket_addrs()
@@ -233,10 +262,14 @@ fn apply_killswitch(server_ips: &[std::net::IpAddr], allow_lan: bool) -> Result<
     r.push_str("    oifname \"lo\" accept\n");
     r.push_str("    oifname \"aegis0\" accept\n");
     r.push_str("    ct state established,related accept\n");
-    // DNS bootstrap to the resolver the config uses, so sing-box can resolve
-    // the server host while the tunnel is down.
+    // DNS bootstrap to the resolver sing-box uses. Our config has two DNS
+    // servers: `https://1.1.1.1` (DNS-over-HTTPS, port 443) and `udp://1.1.1.1`
+    // (plain, port 53). Both must be reachable BEFORE the tunnel is up so the
+    // initial server-name lookup can complete; otherwise the tunnel can never
+    // come up because resolution itself is killswitched.
     r.push_str("    ip daddr 1.1.1.1 udp dport 53 accept\n");
     r.push_str("    ip daddr 1.1.1.1 tcp dport 53 accept\n");
+    r.push_str("    ip daddr 1.1.1.1 tcp dport 443 accept\n");
     for ip in server_ips {
         match ip {
             std::net::IpAddr::V4(v4) => r.push_str(&format!("    ip daddr {v4} accept\n")),
@@ -244,7 +277,12 @@ fn apply_killswitch(server_ips: &[std::net::IpAddr], allow_lan: bool) -> Result<
         }
     }
     if allow_lan {
-        r.push_str("    ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16 } accept\n");
+        // Standard RFC1918 + link-local. 100.64.0.0/10 is CGNAT, which some
+        // ISPs (mobile, satellite, T-Mobile home) put their customers on; without
+        // it the user's own router/AP becomes unreachable.
+        r.push_str(
+            "    ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 100.64.0.0/10 } accept\n",
+        );
         r.push_str("    ip6 daddr { fe80::/10, fc00::/7 } accept\n");
     }
     r.push_str("  }\n}\n");
@@ -264,6 +302,42 @@ fn apply_killswitch(server_ips: &[std::net::IpAddr], allow_lan: bool) -> Result<
     } else {
         Err("nft apply failed".to_string())
     }
+}
+
+/// Kill any sing-box process running from the helper's CORE path that isn't
+/// being tracked as our current child. Used to clean up orphans left behind
+/// by a previous daemon instance (e.g. after a `systemctl restart`).
+fn kill_stray_core() {
+    // pkill -f matches the full command line; -SIGTERM is the default. We
+    // could parse pidof / /proc ourselves, but pkill is universally available
+    // and the exec path is rooted at /usr/local/lib/aegisvpn so we won't hit
+    // unrelated sing-box installs.
+    let _ = Command::new("pkill")
+        .arg("-TERM")
+        .arg("-f")
+        .arg(CORE)
+        .stderr(Stdio::null())
+        .stdout(Stdio::null())
+        .status();
+    // Give SIGTERM a moment to land + take effect, then escalate any
+    // survivors. Short total budget — we don't want disconnect to hang.
+    std::thread::sleep(Duration::from_millis(400));
+    let _ = Command::new("pkill")
+        .arg("-KILL")
+        .arg("-f")
+        .arg(CORE)
+        .stderr(Stdio::null())
+        .stdout(Stdio::null())
+        .status();
+    // sing-box's TUN device sometimes outlives the process by a beat
+    // (especially after SIGKILL — graceful shutdown unhooks routes, SIGKILL
+    // doesn't). Force-remove it so the kernel routing table is clean. `ip
+    // link delete` is a no-op if the device is already gone.
+    let _ = Command::new("ip")
+        .args(["link", "delete", "dev", "aegis0"])
+        .stderr(Stdio::null())
+        .stdout(Stdio::null())
+        .status();
 }
 
 /// Remove the killswitch table (no-op if absent).
@@ -479,6 +553,11 @@ fn main() {
     // Clear any killswitch left over from a previous run / crash so we never
     // start up blocking the user's network.
     remove_killswitch();
+    // Same logic for sing-box: if the previous helper instance was killed
+    // (systemctl restart) and the cgroup teardown didn't catch its sing-box
+    // child, we'd start up with a stale tunnel still active and no way to
+    // stop it (since the new instance has child: None). Sweep on boot.
+    kill_stray_core();
 
     let _ = std::fs::create_dir_all(RUN_DIR);
     let _ = std::fs::remove_file(SOCKET);

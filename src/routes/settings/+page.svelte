@@ -292,16 +292,11 @@
                       </div>
                     </div>
                   {:else if isActive}
-                    <span class="badge badge-active">
-                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-                        <path d="M5 12l4 4 10-10" stroke="currentColor" stroke-width="2.6"
-                          stroke-linecap="round" stroke-linejoin="round" />
-                      </svg>
-                      {t("core.active")}
-                    </span>
-                    <!-- Active row spells "Delete" out so it's unmistakable
-                         that this action drops the version the user is
-                         currently running (we also disconnect first). -->
+                    <!-- No badge: the active row is already tinted accent so
+                         "this one is current" is obvious without a label.
+                         Delete still spells out "Delete" because removing the
+                         version the user is running is destructive enough to
+                         deserve text confirmation. -->
                     <button
                       class="btn btn-sm btn-danger"
                       onclick={() => core.uninstall(r.tag)}
@@ -323,8 +318,9 @@
                     >
                       {isSwitching ? "…" : t("core.use")}
                     </button>
-                    <!-- Non-active row uses icon-only delete to keep the row
-                         compact; the action is the same, just less shouty. -->
+                    <!-- Non-active row uses an icon-only delete to keep the
+                         row compact; same destructive palette as the "Delete"
+                         text button on the active row. -->
                     <button
                       class="ico-del"
                       onclick={() => core.uninstall(r.tag)}
@@ -332,9 +328,9 @@
                       aria-label={t("core.delete")}
                       title={t("core.delete")}
                     >
-                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-                        <path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 11v6M14 11v6"
-                          stroke="currentColor" stroke-width="1.9"
+                      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                        <path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"
+                          stroke="currentColor" stroke-width="2"
                           stroke-linecap="round" stroke-linejoin="round" />
                       </svg>
                     </button>
@@ -617,18 +613,6 @@
     text-transform: uppercase;
     letter-spacing: 0.04em;
   }
-  .badge-active {
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    background: var(--accent-faint);
-    border-color: transparent;
-    color: var(--accent);
-    text-transform: none;
-    letter-spacing: 0;
-    font-weight: 600;
-    padding: 4px 8px;
-  }
 
   .ver-actions {
     display: flex;
@@ -659,13 +643,15 @@
   }
 
   /* Compact icon-only delete used on non-active downloaded versions. Same
-     red palette as .btn-danger so the meaning is consistent across rows. */
+     red palette as .btn-danger; bumped contrast so the trash icon actually
+     reads at a glance (the muted-border + thin-stroke version was nearly
+     invisible against the modal background). */
   .ico-del {
-    background: transparent;
-    border: 1px solid var(--danger-faint);
+    background: var(--danger-faint);
+    border: 1px solid var(--danger);
     color: var(--danger);
-    width: 30px;
-    height: 30px;
+    width: 32px;
+    height: 32px;
     border-radius: 8px;
     display: inline-flex;
     align-items: center;
@@ -675,8 +661,8 @@
     flex-shrink: 0;
   }
   .ico-del:hover:not(:disabled) {
-    background: var(--danger-faint);
-    border-color: var(--danger);
+    background: var(--danger);
+    color: #fff;
   }
   .ico-del:disabled { opacity: 0.45; cursor: default; }
 
