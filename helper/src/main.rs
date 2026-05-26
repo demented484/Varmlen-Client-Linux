@@ -126,8 +126,7 @@ impl Daemon {
         allow_lan: bool,
         server: &str,
     ) -> Result<u32, String> {
-        // Stop the old core gracefully (so it removes its routes) but keep the
-        // killswitch up across the gap.
+        // Stop the old core gracefully (so it removes its routes).
         if let Some(mut c) = self.child.take() {
             terminate_gracefully(&mut c);
         }
@@ -137,19 +136,18 @@ impl Daemon {
             return Err(format!("sing-box core not installed at {CORE}"));
         }
 
-        // Apply (or refresh) the killswitch before launching, so there's no
-        // leak window. On any failure below we tear it down to avoid locking
-        // the user out of the network.
+        // Tear down any pre-existing killswitch BEFORE we resolve, otherwise
+        // a stale ruleset from a previous session (different server IP, or
+        // sing-box died leaving it in place) would block the DNS query and
+        // resolve_ips would come back empty. A brief leak window between
+        // teardown and re-apply is the trade-off for being able to reconnect
+        // at all — the previous "always-on" guarantee was illusory anyway
+        // since the rules might have been pinned to an old IP.
+        remove_killswitch();
+
         if killswitch {
             let ips = resolve_ips(server);
             if ips.is_empty() {
-                // No IPs == no allow-list entry for the proxy server. Applying
-                // anyway would let sing-box only reach DNS — every proxy
-                // attempt would be dropped, the tunnel never comes up, and the
-                // user is locked out. Fail loudly instead. This is the common
-                // failure when the system resolver was just torn down (e.g.
-                // AdGuard / dnsmasq disabled with /etc/resolv.conf still
-                // pointing at 127.0.0.1).
                 return Err(format!(
                     "cannot resolve proxy host '{server}' — DNS is unavailable. \
                      Restart your system resolver (e.g. systemctl restart \
@@ -259,21 +257,38 @@ fn apply_killswitch(server_ips: &[std::net::IpAddr], allow_lan: bool) -> Result<
     r.push_str(&format!("table inet {KS_TABLE} {{\n"));
     r.push_str("  chain out {\n");
     r.push_str("    type filter hook output priority 0; policy drop;\n");
-    r.push_str("    oifname \"lo\" accept\n");
-    r.push_str("    oifname \"aegis0\" accept\n");
-    r.push_str("    ct state established,related accept\n");
+    // `counter` on every rule so `nft list table inet aegis_ks` shows which
+    // rule each packet hit. The final `counter drop` catches everything that
+    // matched none of the allow-rules — its counter tells us exactly how
+    // many bytes the killswitch is silently eating.
+    r.push_str("    oifname \"lo\" counter accept\n");
+    r.push_str("    oifname \"aegis0\" counter accept\n");
+    r.push_str("    ct state established,related counter accept\n");
+    // sing-box marks every packet it originates itself (its own DNS lookups,
+    // direct-outbound connections, etc.) with its routing mark — 0x2023/0x2024
+    // are the standard values used by its auto_redirect + tproxy setup.
+    // Without this, sing-box's own DNS/handshake traffic can hit the final
+    // drop rule (it doesn't fit the lo/tun/established/explicit-allow buckets)
+    // and the tunnel can never come up. Allow anything sing-box marked itself
+    // — the trust boundary is "sing-box is allowed to talk to the network it
+    // needs to". User-app traffic that somehow bypasses the TUN is still
+    // dropped at the end.
+    r.push_str("    meta mark & 0x0000ffff == 0x2023 counter accept\n");
+    r.push_str("    meta mark & 0x0000ffff == 0x2024 counter accept\n");
+    r.push_str("    ct mark & 0x0000ffff == 0x2023 counter accept\n");
+    r.push_str("    ct mark & 0x0000ffff == 0x2024 counter accept\n");
     // DNS bootstrap to the resolver sing-box uses. Our config has two DNS
     // servers: `https://1.1.1.1` (DNS-over-HTTPS, port 443) and `udp://1.1.1.1`
     // (plain, port 53). Both must be reachable BEFORE the tunnel is up so the
     // initial server-name lookup can complete; otherwise the tunnel can never
     // come up because resolution itself is killswitched.
-    r.push_str("    ip daddr 1.1.1.1 udp dport 53 accept\n");
-    r.push_str("    ip daddr 1.1.1.1 tcp dport 53 accept\n");
-    r.push_str("    ip daddr 1.1.1.1 tcp dport 443 accept\n");
+    r.push_str("    ip daddr 1.1.1.1 udp dport 53 counter accept\n");
+    r.push_str("    ip daddr 1.1.1.1 tcp dport 53 counter accept\n");
+    r.push_str("    ip daddr 1.1.1.1 tcp dport 443 counter accept\n");
     for ip in server_ips {
         match ip {
-            std::net::IpAddr::V4(v4) => r.push_str(&format!("    ip daddr {v4} accept\n")),
-            std::net::IpAddr::V6(v6) => r.push_str(&format!("    ip6 daddr {v6} accept\n")),
+            std::net::IpAddr::V4(v4) => r.push_str(&format!("    ip daddr {v4} counter accept\n")),
+            std::net::IpAddr::V6(v6) => r.push_str(&format!("    ip6 daddr {v6} counter accept\n")),
         }
     }
     if allow_lan {
@@ -281,10 +296,13 @@ fn apply_killswitch(server_ips: &[std::net::IpAddr], allow_lan: bool) -> Result<
         // ISPs (mobile, satellite, T-Mobile home) put their customers on; without
         // it the user's own router/AP becomes unreachable.
         r.push_str(
-            "    ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 100.64.0.0/10 } accept\n",
+            "    ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 100.64.0.0/10 } counter accept\n",
         );
-        r.push_str("    ip6 daddr { fe80::/10, fc00::/7 } accept\n");
+        r.push_str("    ip6 daddr { fe80::/10, fc00::/7 } counter accept\n");
     }
+    // Explicit terminal drop with a counter — what arrives here is what the
+    // killswitch is killing. Diagnostic gold.
+    r.push_str("    counter drop\n");
     r.push_str("  }\n}\n");
 
     let mut child = Command::new("nft")
