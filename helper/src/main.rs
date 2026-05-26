@@ -27,7 +27,7 @@ const CONFIG: &str = "/run/aegisvpn/config.json";
 const CORE: &str = "/usr/local/lib/aegisvpn/sing-box";
 
 #[derive(Deserialize)]
-#[serde(tag = "cmd", rename_all = "lowercase")]
+#[serde(tag = "cmd", rename_all = "snake_case")]
 enum Request {
     /// Start sing-box with the given config (the core binary is fixed).
     Connect {
@@ -42,8 +42,24 @@ enum Request {
     },
     Disconnect,
     Status,
+    /// Liveness check.
     Ping,
+    /// Copy a user-supplied sing-box binary into the helper's fixed CORE path
+    /// so TUN mode runs the version the user picked. The client owns the
+    /// source path (in its app-data dir); since the trust model already grants
+    /// the user control over the helper, this is just a privileged file copy
+    /// the user couldn't otherwise do.
+    InstallCore { path: String },
+    /// ICMP round-trip to `host` (so the GUI can ping locations even when the
+    /// user's ISP blocks raw TCP to those IPs but lets ICMP through).
+    PingHost {
+        host: String,
+        #[serde(default = "default_ping_timeout")]
+        timeout_ms: u32,
+    },
 }
+
+fn default_ping_timeout() -> u32 { 2000 }
 
 const KS_TABLE: &str = "aegis_ks";
 
@@ -53,14 +69,20 @@ struct Response {
     state: String,
     pid: Option<u32>,
     error: Option<String>,
+    /// Result for PingHost / generic numeric returns. None for other requests.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rtt_ms: Option<u32>,
 }
 
 impl Response {
     fn ok(state: &str, pid: Option<u32>) -> Self {
-        Response { ok: true, state: state.into(), pid, error: None }
+        Response { ok: true, state: state.into(), pid, error: None, rtt_ms: None }
     }
     fn err(state: &str, msg: String) -> Self {
-        Response { ok: false, state: state.into(), pid: None, error: Some(msg) }
+        Response { ok: false, state: state.into(), pid: None, error: Some(msg), rtt_ms: None }
+    }
+    fn rtt(ms: u32) -> Self {
+        Response { ok: true, state: "ok".into(), pid: None, error: None, rtt_ms: Some(ms) }
     }
 }
 
@@ -303,6 +325,86 @@ fn terminate_gracefully(child: &mut Child) {
     let _ = child.wait();
 }
 
+/// Copy a client-supplied sing-box binary to the helper's CORE path. We do
+/// minimal validation (must exist, must be an ELF, sane size) — the rest of
+/// the trust comes from the model: the helper accepts requests only from the
+/// allowed UID, so the user is already authorised to drive what we run.
+fn install_core(src: &str) -> Result<(), String> {
+    let src_path = std::path::Path::new(src);
+    let meta = std::fs::metadata(src_path).map_err(|e| format!("stat source: {e}"))?;
+    if !meta.is_file() {
+        return Err("source is not a regular file".into());
+    }
+    let size = meta.len();
+    if !(1_000_000..=300_000_000).contains(&size) {
+        return Err(format!("source size {size} bytes is out of range"));
+    }
+    let bytes = std::fs::read(src_path).map_err(|e| format!("read source: {e}"))?;
+    // ELF magic on Linux. (Mach-O / PE binaries would fail here — fine, we
+    // only ship sing-box for Linux through this path.)
+    if bytes.len() < 4 || &bytes[..4] != b"\x7fELF" {
+        return Err("source is not an ELF binary".into());
+    }
+
+    let dest = std::path::Path::new(CORE);
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create CORE dir: {e}"))?;
+    }
+    // Write to a sibling temp then rename — atomic swap so a partial write
+    // can never leave CORE in a half-state.
+    let tmp = dest.with_extension("new");
+    std::fs::write(&tmp, &bytes).map_err(|e| format!("write temp: {e}"))?;
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))
+        .map_err(|e| format!("chmod temp: {e}"))?;
+    std::fs::rename(&tmp, dest).map_err(|e| format!("rename to CORE: {e}"))?;
+    Ok(())
+}
+
+/// ICMP RTT via the system `ping` tool. Linux's ping doesn't need root when
+/// `net.ipv4.ping_group_range` includes the user, but we're already in the
+/// helper which runs as root, so it just works. Returns RTT in ms.
+fn icmp_ping(host: &str, timeout_ms: u32) -> Result<u32, String> {
+    if host.trim().is_empty() {
+        return Err("empty host".into());
+    }
+    // Validate the host string before handing it to a subprocess — only
+    // letters/digits/dots/colons/hyphens are valid for hostnames and IPs.
+    if !host
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | ':' | '-' | '_'))
+    {
+        return Err("invalid host".into());
+    }
+    let timeout_s = ((timeout_ms + 999) / 1000).max(1).min(10);
+    let out = Command::new("ping")
+        .arg("-n") // numeric, no rDNS
+        .arg("-c").arg("1")
+        .arg("-W").arg(timeout_s.to_string())
+        .arg(host)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|e| format!("spawn ping: {e}"))?;
+    if !out.status.success() {
+        return Err("ping failed".into());
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    // Parse "time=12.3 ms" out of the reply line.
+    for line in text.lines() {
+        if let Some(idx) = line.find("time=") {
+            let rest = &line[idx + 5..];
+            let num: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == '.')
+                .collect();
+            if let Ok(ms) = num.parse::<f64>() {
+                return Ok(ms.round().max(1.0).min(u32::MAX as f64) as u32);
+            }
+        }
+    }
+    Err("no RTT in ping output".into())
+}
+
 fn peer_uid(stream: &UnixStream) -> Option<u32> {
     let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
     let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
@@ -349,6 +451,14 @@ fn handle(stream: UnixStream, daemon: Arc<Mutex<Daemon>>) {
                             Err(e) => Response::err(d.state(), e),
                         }
                     }
+                    Request::InstallCore { path } => match install_core(&path) {
+                        Ok(()) => Response::ok("installed", None),
+                        Err(e) => Response::err("unknown", e),
+                    },
+                    Request::PingHost { host, timeout_ms } => match icmp_ping(&host, timeout_ms) {
+                        Ok(ms) => Response::rtt(ms),
+                        Err(e) => Response::err("unreachable", e),
+                    },
                 }
             }
             Err(e) => Response::err("unknown", format!("bad request: {e}")),

@@ -84,22 +84,45 @@ export function appFromFile(path: string): Promise<InstalledApp | null> {
   return invoke<InstalledApp | null>("app_from_file", { path });
 }
 
+export interface InstalledVersion {
+  /** Version tag like "1.13.0" (no leading "v"). */
+  tag: string;
+  /** True iff this is the currently active version. */
+  active: boolean;
+}
+
 export interface CoreInfo {
-  /** Installed sing-box version, or null when not installed. */
-  installed: string | null;
-  /** Latest available version, or null when the check failed. */
+  /** Locally cached versions, newest first. */
+  installed: InstalledVersion[];
+  /** Active tag, or null when no version is installed. */
+  active: string | null;
+  /** Latest version on GitHub, or null when the check failed. */
   latest: string | null;
+  /** True iff `latest` is newer than `active` (or no version is active). */
   has_update: boolean;
 }
 
-/** Installed vs latest sing-box core version (queries GitHub releases). */
+/** Installed/active vs latest sing-box core version (queries GitHub releases). */
 export function coreInfo(): Promise<CoreInfo> {
   return invoke<CoreInfo>("core_info");
 }
 
-/** Install a specific sing-box version (or latest when `version` is null). */
+/** Download a specific sing-box version (or latest when `version` is null)
+ *  into the local cache. Emits `core://progress` events while running.
+ *  First-install case auto-activates the new version. */
 export function coreInstall(version: string | null = null): Promise<string> {
   return invoke<string>("core_install", { version });
+}
+
+/** Switch the active version to one that's already downloaded; pushes the
+ *  binary to the privileged helper so TUN mode picks it up too. */
+export function coreActivate(tag: string): Promise<void> {
+  return invoke<void>("core_activate", { tag });
+}
+
+/** Delete a cached version from disk. Refuses to delete the active one. */
+export function coreUninstall(tag: string): Promise<void> {
+  return invoke<void>("core_uninstall", { tag });
 }
 
 export interface CoreRelease {
@@ -112,6 +135,24 @@ export interface CoreRelease {
 /** Recent sing-box releases (newest first) for the version picker. */
 export function listCoreReleases(): Promise<CoreRelease[]> {
   return invoke<CoreRelease[]>("list_core_releases");
+}
+
+export interface CoreProgress {
+  /** Tag the progress refers to. */
+  tag: string;
+  /** Bytes downloaded so far. */
+  downloaded: number;
+  /** Total expected bytes (0 when the server didn't send Content-Length). */
+  total: number;
+  /** Bytes per second over the last sample window. */
+  speed_bps: number;
+}
+
+/** ICMP RTT via the privileged helper. Helper must be installed; throws
+ *  otherwise. Useful when the user's ISP blocks raw TCP to certain server
+ *  IPs but lets ICMP through, so the UI can still show a real ping. */
+export function vpnIcmpPing(host: string, timeoutMs = 2000): Promise<number> {
+  return invoke<number>("vpn_icmp_ping", { host, timeoutMs });
 }
 
 /** Enabled split-tunnel selection passed to the connect command. */

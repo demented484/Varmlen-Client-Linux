@@ -25,14 +25,16 @@ pub struct HelperResponse {
     pub state: String,
     pub pid: Option<u32>,
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rtt_ms: Option<u32>,
 }
 
 impl HelperResponse {
     fn connected(pid: u32) -> Self {
-        HelperResponse { ok: true, state: "connected".into(), pid: Some(pid), error: None }
+        HelperResponse { ok: true, state: "connected".into(), pid: Some(pid), error: None, rtt_ms: None }
     }
     fn disconnected() -> Self {
-        HelperResponse { ok: true, state: "disconnected".into(), pid: None, error: None }
+        HelperResponse { ok: true, state: "disconnected".into(), pid: None, error: None, rtt_ms: None }
     }
 }
 
@@ -195,6 +197,34 @@ pub fn vpn_status() -> Result<HelperResponse, String> {
 #[tauri::command]
 pub fn helper_installed() -> bool {
     UnixStream::connect(SOCKET).is_ok()
+}
+
+/// Synchronise the helper's CORE binary to a user-side path (called by the
+/// core manager when the user activates / re-installs a version). The helper
+/// reads + copies it to its fixed root-owned location.
+pub fn helper_install_core(path: std::path::PathBuf) -> Result<(), String> {
+    let resp = send(json!({ "cmd": "install_core", "path": path.to_string_lossy() }))?;
+    if resp.ok {
+        Ok(())
+    } else {
+        Err(resp.error.unwrap_or_else(|| "helper rejected core install".into()))
+    }
+}
+
+/// ICMP RTT to host via the privileged helper (raw ICMP needs root). Returns
+/// the time in ms, or an error string when unreachable / helper is absent.
+#[tauri::command]
+pub fn vpn_icmp_ping(host: String, timeout_ms: Option<u32>) -> Result<u32, String> {
+    let resp = send(json!({
+        "cmd": "ping_host",
+        "host": host,
+        "timeout_ms": timeout_ms.unwrap_or(2000),
+    }))?;
+    if resp.ok {
+        resp.rtt_ms.ok_or_else(|| "helper returned no rtt".into())
+    } else {
+        Err(resp.error.unwrap_or_else(|| "ping failed".into()))
+    }
 }
 
 /// Install the privileged helper via a one-time polkit (pkexec) prompt. The

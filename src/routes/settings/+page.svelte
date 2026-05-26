@@ -56,11 +56,6 @@
     await core.loadReleases();
   }
 
-  async function installSpecific(tag: string) {
-    showVersions = false;
-    await core.install(tag);
-  }
-
   function formatReleaseDate(d: string | null): string {
     if (!d) return "";
     const dt = new Date(d);
@@ -69,16 +64,32 @@
     return `${pad(dt.getDate())}.${pad(dt.getMonth() + 1)}.${dt.getFullYear()}`;
   }
 
+  /** Compact byte formatter for the download speed indicator. */
+  function formatBps(n: number): string {
+    if (!Number.isFinite(n) || n <= 0) return "—";
+    const units = ["B", "KB", "MB", "GB"];
+    let v = n;
+    let i = 0;
+    while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+    return `${v.toFixed(v >= 100 || i === 0 ? 0 : 1)} ${units[i]}/s`;
+  }
+  function formatBytes(n: number): string {
+    if (!Number.isFinite(n) || n <= 0) return "0 B";
+    const units = ["B", "KB", "MB", "GB"];
+    let v = n;
+    let i = 0;
+    while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+    return `${v.toFixed(v >= 100 || i === 0 ? 0 : 1)} ${units[i]}`;
+  }
+
   const coreStatus = $derived.by(() => {
     if (core.checking && !core.info) return t("core.checking");
     const info = core.info;
     if (!info) return core.error ? t("core.checkFailed") : t("core.checking");
-    if (info.installed) {
-      // Up-to-date case: just show the version. Update available: show the
-      // arrow to the newer one so it's obvious *what* the update is.
+    if (info.active) {
       return info.has_update && info.latest
-        ? `${info.installed} → ${info.latest}`
-        : info.installed;
+        ? `${info.active} → ${info.latest}`
+        : info.active;
     }
     return info.latest
       ? `${t("core.notInstalled")} · ${t("core.latest", { v: info.latest })}`
@@ -189,25 +200,18 @@
           <div class="row-title">sing-box</div>
           <div class="row-sub muted">{coreStatus}</div>
         </div>
-        <button
-          class="btn"
-          onclick={openVersions}
-          disabled={core.busy}
-          title={t("core.versionsTitle")}
-        >
-          {t("core.versions")}
+        <button class="btn" onclick={openVersions} title={t("core.versionsTitle")}>
+          <svg class="btn-ico" width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path d="M4 6h16M4 12h16M4 18h16" stroke="currentColor" stroke-width="1.9"
+              stroke-linecap="round" />
+          </svg>
+          <span>{t("core.versions")}</span>
         </button>
-        {#if !core.info || core.info.has_update}
-          <button class="btn btn-primary" onclick={() => core.install()} disabled={core.busy}>
-            {core.busy
-              ? t("core.updating")
-              : core.info?.installed
-                ? t("core.update")
-                : t("core.install")}
-          </button>
-        {/if}
       </div>
     </div>
+    {#if core.error}
+      <div class="row-sub" style="color: var(--danger); padding: 0 4px;">{core.error}</div>
+    {/if}
   </section>
 
   {#if showVersions}
@@ -219,7 +223,20 @@
         aria-modal="true"
         aria-label={t("core.versionsTitle")}
       >
-        <h2>{t("core.versionsTitle")}</h2>
+        <header class="modal-head">
+          <h2>{t("core.versionsTitle")}</h2>
+          <button
+            class="icon-btn"
+            onclick={() => (showVersions = false)}
+            aria-label={t("common.close")}
+          >
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+              <path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2"
+                stroke-linecap="round" />
+            </svg>
+          </button>
+        </header>
+
         {#if core.releasesLoading && core.releases.length === 0}
           <p class="muted">{t("core.checking")}</p>
         {:else if core.error && core.releases.length === 0}
@@ -228,8 +245,15 @@
           <ul class="ver-list">
             {#each core.releases as r (r.tag)}
               {@const ver = r.tag.replace(/^v/, "")}
-              {@const isInstalled = core.info?.installed === ver}
-              <li class="ver-row" class:current={isInstalled}>
+              {@const isActive = core.isActive(r.tag)}
+              {@const isInstalled = core.isInstalled(r.tag)}
+              {@const prog = core.progress[ver]}
+              {@const isDownloading = core.busyTags.has(ver)}
+              {@const isSwitching = core.switchingTag === ver}
+              {@const pct = prog && prog.total > 0
+                ? Math.min(100, Math.round((prog.downloaded / prog.total) * 100))
+                : prog && prog.downloaded > 0 ? 0 : 0}
+              <li class="ver-row" class:current={isActive}>
                 <div class="ver-info">
                   <span class="ver-tag">{r.tag}</span>
                   <span class="ver-meta muted">
@@ -237,36 +261,83 @@
                     {#if r.prerelease}<span class="badge">{t("core.preview")}</span>{/if}
                   </span>
                 </div>
-                {#if isInstalled}
-                  <span class="ver-current" aria-label={t("core.currentlyInstalled")}>
-                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-                      <path d="M5 12l4 4 10-10" stroke="currentColor" stroke-width="2.4"
-                        stroke-linecap="round" stroke-linejoin="round" />
-                    </svg>
-                  </span>
-                {:else}
-                  <button
-                    type="button"
-                    class="dl-btn"
-                    onclick={() => installSpecific(r.tag)}
-                    disabled={core.busy}
-                    aria-label="{t('core.install')} {r.tag}"
-                    title="{t('core.install')} {r.tag}"
-                  >
-                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-                      <path d="M12 4v12m0 0l-4-4m4 4l4-4M5 20h14"
-                        stroke="currentColor" stroke-width="1.9"
-                        stroke-linecap="round" stroke-linejoin="round" />
-                    </svg>
-                  </button>
-                {/if}
+
+                <div class="ver-actions">
+                  {#if isDownloading && prog}
+                    <div class="progress" aria-label="downloading">
+                      <div class="progress-track">
+                        <div class="progress-fill" style="width: {pct}%"></div>
+                      </div>
+                      <div class="progress-meta muted">
+                        {formatBytes(prog.downloaded)}
+                        {#if prog.total > 0}
+                          / {formatBytes(prog.total)} · {pct}%
+                        {/if}
+                        · {formatBps(prog.speed_bps)}
+                      </div>
+                    </div>
+                  {:else if isActive}
+                    <span class="badge badge-active">
+                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                        <path d="M5 12l4 4 10-10" stroke="currentColor" stroke-width="2.6"
+                          stroke-linecap="round" stroke-linejoin="round" />
+                      </svg>
+                      {t("core.active")}
+                    </span>
+                    <button
+                      class="ico-btn"
+                      onclick={() => core.install(r.tag)}
+                      disabled={isDownloading}
+                      aria-label={t("core.reinstall")}
+                      title={t("core.reinstall")}
+                    >
+                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                        <path d="M21 12a9 9 0 1 1-3.13-6.84M21 4v5h-5"
+                          stroke="currentColor" stroke-width="1.9"
+                          stroke-linecap="round" stroke-linejoin="round" />
+                      </svg>
+                    </button>
+                  {:else if isInstalled}
+                    <button
+                      class="btn btn-primary btn-sm"
+                      onclick={() => core.activate(r.tag)}
+                      disabled={isSwitching}
+                    >
+                      {isSwitching ? "…" : t("core.use")}
+                    </button>
+                    <button
+                      class="ico-btn"
+                      onclick={() => core.uninstall(r.tag)}
+                      disabled={isSwitching}
+                      aria-label={t("core.delete")}
+                      title={t("core.delete")}
+                    >
+                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                        <path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 11v6M14 11v6"
+                          stroke="currentColor" stroke-width="1.8"
+                          stroke-linecap="round" stroke-linejoin="round" />
+                      </svg>
+                    </button>
+                  {:else}
+                    <button
+                      class="btn btn-sm"
+                      onclick={() => core.install(r.tag)}
+                      disabled={isDownloading}
+                    >
+                      <svg class="btn-ico" width="14" height="14" viewBox="0 0 24 24" fill="none"
+                        aria-hidden="true">
+                        <path d="M12 4v12m0 0l-4-4m4 4l4-4M5 20h14"
+                          stroke="currentColor" stroke-width="1.9"
+                          stroke-linecap="round" stroke-linejoin="round" />
+                      </svg>
+                      <span>{t("core.download")}</span>
+                    </button>
+                  {/if}
+                </div>
               </li>
             {/each}
           </ul>
         {/if}
-        <div class="modal-actions">
-          <button class="btn" onclick={() => (showVersions = false)}>{t("common.close")}</button>
-        </div>
       </div>
     </div>
   {/if}
@@ -440,12 +511,18 @@
     padding: 16px;
   }
   .modal {
-    width: min(440px, 100%);
-    max-height: 80vh;
+    width: min(500px, 100%);
+    max-height: 82vh;
     display: flex;
     flex-direction: column;
     gap: 12px;
-    padding: 18px;
+    padding: 16px;
+  }
+  .modal-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
   }
   .modal h2 {
     margin: 0;
@@ -456,12 +533,26 @@
     padding: 0;
   }
   .modal p { margin: 0; font-size: 13px; }
-  .modal-actions {
-    display: flex;
-    justify-content: flex-end;
-    gap: 8px;
-    margin-top: 4px;
+  .icon-btn {
+    background: transparent;
+    border: 0;
+    color: var(--text-muted);
+    padding: 6px;
+    border-radius: 8px;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    transition: background var(--transition), color var(--transition);
   }
+  .icon-btn:hover { background: var(--bg-elev-2); color: var(--text); }
+
+  /* The Versions button on the core row carries its own icon. */
+  .btn-ico {
+    margin-right: 6px;
+    vertical-align: -2px;
+  }
+
   .ver-list {
     list-style: none;
     margin: 0;
@@ -478,21 +569,22 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
-    gap: 10px;
+    gap: 12px;
+    min-height: 52px;
   }
   .ver-info {
     display: flex;
-    align-items: center;
-    gap: 10px;
+    flex-direction: column;
+    gap: 2px;
     min-width: 0;
+    flex: 1;
   }
   .ver-row.current {
     background: var(--accent-faint);
-    color: var(--accent);
   }
   .ver-row.current .ver-tag { color: var(--accent); }
   .ver-tag { font-weight: 600; font-size: 13px; }
-  .ver-meta { font-size: 12px; display: flex; align-items: center; gap: 6px; }
+  .ver-meta { font-size: 11px; display: flex; align-items: center; gap: 6px; }
   .badge {
     font-size: 10px;
     padding: 2px 6px;
@@ -503,12 +595,34 @@
     text-transform: uppercase;
     letter-spacing: 0.04em;
   }
-  .dl-btn {
+  .badge-active {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    background: var(--accent-faint);
+    border-color: transparent;
+    color: var(--accent);
+    text-transform: none;
+    letter-spacing: 0;
+    font-weight: 600;
+    padding: 4px 8px;
+  }
+
+  .ver-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-shrink: 0;
+  }
+
+  /* Small "icon-only" square button — used for refresh / delete next to the
+     primary action so the row stays compact. */
+  .ico-btn {
     background: transparent;
     border: 1px solid var(--border);
     color: var(--text-muted);
-    width: 32px;
-    height: 32px;
+    width: 30px;
+    height: 30px;
     border-radius: 8px;
     display: inline-flex;
     align-items: center;
@@ -518,19 +632,41 @@
       border-color var(--transition);
     flex-shrink: 0;
   }
-  .dl-btn:hover:not(:disabled) {
+  .ico-btn:hover:not(:disabled) {
     background: var(--bg-elev);
     color: var(--text);
     border-color: var(--border-strong);
   }
-  .dl-btn:disabled { opacity: 0.45; cursor: default; }
-  .ver-current {
-    color: var(--accent);
-    width: 32px;
-    height: 32px;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
+  .ico-btn:disabled { opacity: 0.45; cursor: default; }
+
+  /* Compact variant of the standard btn for the row actions. */
+  :global(.btn.btn-sm) {
+    font-size: 12px;
+    padding: 6px 12px;
+    height: 30px;
+  }
+
+  /* Download progress: filled bar + bytes/speed line. */
+  .progress {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    min-width: 160px;
     flex-shrink: 0;
+  }
+  .progress-track {
+    height: 6px;
+    background: var(--bg-elev);
+    border-radius: 999px;
+    overflow: hidden;
+  }
+  .progress-fill {
+    height: 100%;
+    background: var(--accent);
+    transition: width 120ms linear;
+  }
+  .progress-meta {
+    font-size: 11px;
+    text-align: right;
   }
 </style>

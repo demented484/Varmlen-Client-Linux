@@ -1,24 +1,55 @@
-//! sing-box core management: detect, download, and auto-update the sing-box
-//! binary from the SagerNet/sing-box GitHub releases. The binary lives under
-//! the app data dir so it can be updated without touching system files.
+//! sing-box core management.
+//!
+//! Versions are cached side-by-side under `app_data/core/versions/<tag>/sing-box`
+//! and `core/active.txt` records which one the rest of the app should use. The
+//! user downloads + keeps as many versions as they want, then activates one with
+//! a single click — no re-download to switch. Activating also pushes the binary
+//! to the helper so TUN mode uses the same version as proxy mode.
+//!
+//! Downloads stream chunks + emit `core://progress` events so the UI can render
+//! a real progress bar (bytes, total, speed) instead of a spinner.
 
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
+use futures_util::StreamExt;
 use serde::Serialize;
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 
 const REPO: &str = "SagerNet/sing-box";
-const VERSION_FILE: &str = "version.txt";
+const ACTIVE_FILE: &str = "active.txt";
+
+#[derive(Serialize, Clone)]
+pub struct InstalledVersion {
+    pub tag: String,
+    pub active: bool,
+}
 
 #[derive(Serialize)]
 pub struct CoreInfo {
-    /// Installed core version (e.g. "1.11.0"), or null when not installed.
-    pub installed: Option<String>,
-    /// Latest release version, or null when the check failed (offline, etc.).
+    /// All locally-cached versions, newest first; `active` flags which one
+    /// the app (and helper, once synced) is actually running.
+    pub installed: Vec<InstalledVersion>,
+    /// Tag of the active version, or null when none installed.
+    pub active: Option<String>,
+    /// Latest version from GitHub releases, or null when the check failed.
     pub latest: Option<String>,
-    /// True when an install/update should be offered.
+    /// True iff `latest` is set and differs from `active` (or none active).
     pub has_update: bool,
 }
+
+#[derive(Serialize, Clone)]
+pub struct CoreProgress {
+    /// Version tag this progress event is for.
+    pub tag: String,
+    pub downloaded: u64,
+    /// Total size from Content-Length, or 0 if the server didn't send it.
+    pub total: u64,
+    /// Bytes-per-second over the last sample window.
+    pub speed_bps: u64,
+}
+
+// --- paths -----------------------------------------------------------------
 
 fn core_dir(app: &AppHandle) -> Result<PathBuf, String> {
     let dir = app
@@ -30,55 +61,135 @@ fn core_dir(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
+fn versions_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    let d = core_dir(app)?.join("versions");
+    std::fs::create_dir_all(&d).map_err(|e| format!("create versions dir: {e}"))?;
+    Ok(d)
+}
+
 fn binary_name() -> &'static str {
-    if cfg!(windows) {
-        "sing-box.exe"
-    } else {
-        "sing-box"
-    }
+    if cfg!(windows) { "sing-box.exe" } else { "sing-box" }
 }
 
-/// Path to the managed sing-box binary (may not exist yet).
+/// Where the binary for a specific tag lives (may not exist yet).
+fn version_binary(app: &AppHandle, tag: &str) -> Result<PathBuf, String> {
+    Ok(versions_dir(app)?.join(strip_v(tag)).join(binary_name()))
+}
+
+fn strip_v(tag: &str) -> &str {
+    tag.strip_prefix('v').unwrap_or(tag)
+}
+
+/// The currently active version's binary path; errors if no version is active
+/// (caller should prompt the user to install one).
 pub fn binary_path(app: &AppHandle) -> Result<PathBuf, String> {
-    Ok(core_dir(app)?.join(binary_name()))
+    let active = active_tag(app)
+        .ok_or_else(|| "no sing-box core installed (Settings → VPN core)".to_string())?;
+    let bin = version_binary(app, &active)?;
+    if !bin.exists() {
+        return Err(format!(
+            "active core version {active} is missing on disk — pick another in Settings"
+        ));
+    }
+    Ok(bin)
 }
 
-/// The installed version, read from the marker file we write on install.
-pub fn installed_version(app: &AppHandle) -> Option<String> {
+/// Tag currently selected as active (whatever's in `active.txt`).
+pub fn active_tag(app: &AppHandle) -> Option<String> {
     let dir = core_dir(app).ok()?;
-    if !dir.join(binary_name()).exists() {
-        return None;
-    }
-    let v = std::fs::read_to_string(dir.join(VERSION_FILE)).ok()?;
+    let v = std::fs::read_to_string(dir.join(ACTIVE_FILE)).ok()?;
     let v = v.trim().to_string();
-    if v.is_empty() {
-        None
-    } else {
-        Some(v)
-    }
+    if v.is_empty() { None } else { Some(v) }
 }
 
-/// sing-box names release assets `sing-box-<ver>-<os>-<arch>.tar.gz`.
-fn asset_suffix() -> Result<String, String> {
-    let os = match std::env::consts::OS {
-        "linux" => "linux",
-        "macos" => "darwin",
-        "windows" => "windows",
-        other => return Err(format!("unsupported OS: {other}")),
-    };
-    let arch = match std::env::consts::ARCH {
-        "x86_64" => "amd64",
-        "aarch64" => "arm64",
-        other => return Err(format!("unsupported arch: {other}")),
-    };
-    // Windows ships .zip; we currently support the .tar.gz platforms.
-    Ok(format!("-{os}-{arch}.tar.gz"))
+fn write_active(app: &AppHandle, tag: &str) -> Result<(), String> {
+    let dir = core_dir(app)?;
+    std::fs::write(dir.join(ACTIVE_FILE), strip_v(tag))
+        .map_err(|e| format!("write active.txt: {e}"))
 }
+
+fn clear_active(app: &AppHandle) -> Result<(), String> {
+    let dir = core_dir(app)?;
+    let p = dir.join(ACTIVE_FILE);
+    if p.exists() {
+        std::fs::remove_file(p).map_err(|e| format!("remove active.txt: {e}"))?;
+    }
+    Ok(())
+}
+
+/// One-time migration of the old single-binary layout
+/// (`core/sing-box` + `core/version.txt`) into the new per-version cache
+/// (`core/versions/<tag>/sing-box` + `core/active.txt`). Idempotent: a no-op
+/// once the old files are gone.
+fn migrate_legacy_layout(app: &AppHandle) {
+    let Ok(dir) = core_dir(app) else { return };
+    let old_bin = dir.join(binary_name());
+    let old_ver_file = dir.join("version.txt");
+    if !old_bin.exists() {
+        return;
+    }
+    let ver = std::fs::read_to_string(&old_ver_file)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "legacy".to_string());
+
+    if let Ok(target) = version_binary(app, &ver) {
+        if let Some(parent) = target.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if !target.exists() && std::fs::rename(&old_bin, &target).is_err() {
+            // Cross-device move? fall back to copy + remove.
+            if std::fs::copy(&old_bin, &target).is_ok() {
+                let _ = std::fs::remove_file(&old_bin);
+            }
+        }
+        if active_tag(app).is_none() {
+            let _ = write_active(app, &ver);
+        }
+    }
+    let _ = std::fs::remove_file(&old_ver_file);
+}
+
+/// All tags with a binary on disk, newest-first by simple version ordering.
+fn installed_tags(app: &AppHandle) -> Vec<String> {
+    migrate_legacy_layout(app);
+    let Ok(dir) = versions_dir(app) else { return Vec::new() };
+    let Ok(entries) = std::fs::read_dir(&dir) else { return Vec::new() };
+    let mut tags: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            if e.path().join(binary_name()).exists() {
+                Some(name)
+            } else {
+                None
+            }
+        })
+        .collect();
+    tags.sort_by(|a, b| version_cmp(b, a));
+    tags
+}
+
+/// Compare semver-ish tags ("1.13.0" vs "1.12.4"). Falls back to lexical for
+/// anything that doesn't parse.
+fn version_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    let parts = |s: &str| -> Vec<u32> {
+        strip_v(s)
+            .split(|c: char| !c.is_ascii_digit())
+            .filter(|p| !p.is_empty())
+            .filter_map(|p| p.parse::<u32>().ok())
+            .collect()
+    };
+    parts(a).cmp(&parts(b))
+}
+
+// --- GitHub API ------------------------------------------------------------
 
 fn http_client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .user_agent("AegisVPN/0.1 (core-updater)")
-        .timeout(std::time::Duration::from_secs(60))
+        .timeout(Duration::from_secs(60))
         .build()
         .map_err(|e| format!("http client: {e}"))
 }
@@ -98,20 +209,6 @@ async fn fetch_latest_release() -> Result<serde_json::Value, String> {
     serde_json::from_str(&text).map_err(|e| format!("release json: {e}"))
 }
 
-fn version_from_tag(release: &serde_json::Value) -> Option<String> {
-    release
-        .get("tag_name")
-        .and_then(|t| t.as_str())
-        .map(|t| t.trim_start_matches('v').to_string())
-}
-
-/// Latest released version string, or an error when unreachable.
-pub async fn latest_version() -> Result<String, String> {
-    let release = fetch_latest_release().await?;
-    version_from_tag(&release).ok_or_else(|| "no tag_name in release".to_string())
-}
-
-/// Fetch a specific release by tag (e.g. "v1.13.0").
 async fn fetch_release_by_tag(tag: &str) -> Result<serde_json::Value, String> {
     let client = http_client()?;
     let tag = if tag.starts_with('v') { tag.to_string() } else { format!("v{tag}") };
@@ -124,6 +221,15 @@ async fn fetch_release_by_tag(tag: &str) -> Result<serde_json::Value, String> {
     serde_json::from_str(&text).map_err(|e| format!("release json: {e}"))
 }
 
+fn version_from_tag(release: &serde_json::Value) -> Option<String> {
+    release.get("tag_name").and_then(|t| t.as_str()).map(|t| strip_v(t).to_string())
+}
+
+async fn latest_version() -> Result<String, String> {
+    let release = fetch_latest_release().await?;
+    version_from_tag(&release).ok_or_else(|| "no tag_name in release".to_string())
+}
+
 #[derive(Serialize)]
 pub struct CoreRelease {
     pub tag: String,
@@ -132,7 +238,6 @@ pub struct CoreRelease {
     pub prerelease: bool,
 }
 
-/// Recent sing-box releases (newest first), for the version picker.
 #[tauri::command]
 pub async fn list_core_releases() -> Result<Vec<CoreRelease>, String> {
     let client = http_client()?;
@@ -142,37 +247,56 @@ pub async fn list_core_releases() -> Result<Vec<CoreRelease>, String> {
         return Err(format!("GitHub API HTTP {}", resp.status()));
     }
     let text = resp.text().await.map_err(|e| format!("releases body: {e}"))?;
-    let arr: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("releases json: {e}"))?;
-    let releases: Vec<CoreRelease> = arr
+    let arr: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("releases json: {e}"))?;
+    Ok(arr
         .as_array()
         .ok_or("releases not an array")?
         .iter()
         .filter_map(|r| {
             let tag = r.get("tag_name")?.as_str()?.to_string();
-            let name = r.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()).unwrap_or_else(|| tag.clone());
+            let name = r
+                .get("name")
+                .and_then(|n| n.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| tag.clone());
             let date = r.get("published_at").and_then(|d| d.as_str()).map(|s| s.to_string());
             let prerelease = r.get("prerelease").and_then(|p| p.as_bool()).unwrap_or(false);
             Some(CoreRelease { tag, name, date, prerelease })
         })
-        .collect();
-    Ok(releases)
+        .collect())
 }
 
-/// Download + extract the latest sing-box (or a specific tag) for this
-/// platform. Returns the installed version on success.
-pub async fn install_version(app: &AppHandle, tag: Option<String>) -> Result<String, String> {
-    let release = match tag {
-        Some(t) => fetch_release_by_tag(&t).await?,
-        None => fetch_latest_release().await?,
-    };
-    let version = version_from_tag(&release).ok_or("no version in release")?;
-    let suffix = asset_suffix()?;
+// --- download + install ----------------------------------------------------
 
-    let assets = release
+/// sing-box names release assets `sing-box-<ver>-<os>-<arch>.tar.gz`.
+fn asset_suffix() -> Result<String, String> {
+    let os = match std::env::consts::OS {
+        "linux" => "linux",
+        "macos" => "darwin",
+        "windows" => "windows",
+        other => return Err(format!("unsupported OS: {other}")),
+    };
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        other => return Err(format!("unsupported arch: {other}")),
+    };
+    Ok(format!("-{os}-{arch}.tar.gz"))
+}
+
+/// Download the asset with progress events, verify its SHA256 against the
+/// release's per-asset digest, and extract the binary into the per-tag dir.
+async fn download_and_install(
+    app: &AppHandle,
+    tag: &str,
+    release: &serde_json::Value,
+) -> Result<(), String> {
+    let suffix = asset_suffix()?;
+    let asset = release
         .get("assets")
         .and_then(|a| a.as_array())
-        .ok_or("release has no assets")?;
-    let asset = assets
+        .ok_or("release has no assets")?
         .iter()
         .find(|a| {
             a.get("name")
@@ -181,13 +305,13 @@ pub async fn install_version(app: &AppHandle, tag: Option<String>) -> Result<Str
                 .unwrap_or(false)
         })
         .ok_or_else(|| format!("no asset matching '*{suffix}'"))?;
+
     let url = asset
         .get("browser_download_url")
         .and_then(|u| u.as_str())
         .ok_or("asset has no download url")?
         .to_string();
-    // GitHub exposes a per-asset content digest ("sha256:<hex>"). The core is
-    // later run as root by the helper, so verify the download against it.
+    let total: u64 = asset.get("size").and_then(|s| s.as_u64()).unwrap_or(0);
     let digest = asset
         .get("digest")
         .and_then(|d| d.as_str())
@@ -195,17 +319,52 @@ pub async fn install_version(app: &AppHandle, tag: Option<String>) -> Result<Str
         .map(|h| h.to_lowercase());
 
     let client = http_client()?;
-    let bytes = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| format!("download: {e}"))?
-        .bytes()
-        .await
-        .map_err(|e| format!("download body: {e}"))?;
+    let resp = client.get(&url).send().await.map_err(|e| format!("download: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("download HTTP {}", resp.status()));
+    }
+
+    let mut buf: Vec<u8> = Vec::with_capacity(total as usize);
+    let mut stream = resp.bytes_stream();
+    let mut last_emit = Instant::now();
+    let mut window_start = Instant::now();
+    let mut window_bytes: u64 = 0;
+    let mut speed_bps: u64 = 0;
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("download chunk: {e}"))?;
+        buf.extend_from_slice(&chunk);
+        window_bytes += chunk.len() as u64;
+
+        // Sample the speed every ~250 ms so the displayed number is steady.
+        let now = Instant::now();
+        if now.duration_since(window_start) >= Duration::from_millis(250) {
+            let elapsed = now.duration_since(window_start).as_secs_f64();
+            if elapsed > 0.0 {
+                speed_bps = (window_bytes as f64 / elapsed) as u64;
+            }
+            window_start = now;
+            window_bytes = 0;
+        }
+
+        // Throttle progress events to ~10/s — the UI doesn't need more.
+        if now.duration_since(last_emit) >= Duration::from_millis(100) {
+            let _ = app.emit(
+                "core://progress",
+                CoreProgress { tag: tag.to_string(), downloaded: buf.len() as u64, total, speed_bps },
+            );
+            last_emit = now;
+        }
+    }
+
+    // Final 100% event so progress bars don't get stuck at 99%.
+    let _ = app.emit(
+        "core://progress",
+        CoreProgress { tag: tag.to_string(), downloaded: buf.len() as u64, total: buf.len() as u64, speed_bps },
+    );
 
     if let Some(expected) = digest {
-        let actual = sha256_hex(&bytes);
+        let actual = sha256_hex(&buf);
         if actual != expected {
             return Err(format!(
                 "core checksum mismatch (expected {expected}, got {actual}) — refusing to install"
@@ -213,11 +372,11 @@ pub async fn install_version(app: &AppHandle, tag: Option<String>) -> Result<Str
         }
     }
 
-    let bin = binary_path(app)?;
-    extract_binary(&bytes, &bin)?;
-    std::fs::write(core_dir(app)?.join(VERSION_FILE), &version)
-        .map_err(|e| format!("write version: {e}"))?;
-    Ok(version)
+    let dest = version_binary(app, tag)?;
+    std::fs::create_dir_all(dest.parent().unwrap())
+        .map_err(|e| format!("create version dir: {e}"))?;
+    extract_binary(&buf, &dest)?;
+    Ok(())
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -241,9 +400,7 @@ fn extract_binary(tar_gz: &[u8], dest: &PathBuf) -> Result<(), String> {
             .map(|n| n == binary_name())
             .unwrap_or(false);
         if is_bin {
-            entry
-                .unpack(dest)
-                .map_err(|e| format!("unpack: {e}"))?;
+            entry.unpack(dest).map_err(|e| format!("unpack: {e}"))?;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -255,21 +412,94 @@ fn extract_binary(tar_gz: &[u8], dest: &PathBuf) -> Result<(), String> {
     Err("sing-box binary not found in archive".to_string())
 }
 
-// --- Tauri commands ---------------------------------------------------------
+// --- helper sync -----------------------------------------------------------
+
+/// After activating a version, push the binary to the helper so TUN mode
+/// (which runs sing-box as root via the helper) uses the same version. The
+/// helper accepts a path inside the user's app-data dir and copies it to its
+/// fixed root-owned location.
+fn sync_helper(app: &AppHandle) -> Result<(), String> {
+    use crate::vpn::helper_install_core;
+    let bin = binary_path(app)?;
+    helper_install_core(bin)
+}
+
+// --- public API ------------------------------------------------------------
 
 #[tauri::command]
 pub async fn core_info(app: AppHandle) -> CoreInfo {
-    let installed = installed_version(&app);
+    let active = active_tag(&app);
+    let installed: Vec<InstalledVersion> = installed_tags(&app)
+        .into_iter()
+        .map(|tag| InstalledVersion {
+            active: active.as_deref() == Some(tag.as_str()),
+            tag,
+        })
+        .collect();
     let latest = latest_version().await.ok();
-    let has_update = match (&installed, &latest) {
-        (_, None) => false,                       // can't check → don't nag
-        (None, Some(_)) => true,                  // not installed → offer install
-        (Some(i), Some(l)) => i != l,             // differs → offer update
+    let has_update = match (&active, &latest) {
+        (_, None) => false,
+        (None, Some(_)) => true,
+        (Some(a), Some(l)) => version_cmp(l, a) == std::cmp::Ordering::Greater,
     };
-    CoreInfo { installed, latest, has_update }
+    CoreInfo { installed, active, latest, has_update }
 }
 
+/// Download `version` (or the latest release when null) into the per-tag cache.
+/// If nothing is active yet, automatically activate the new version. Emits
+/// `core://progress` while downloading. Returns the installed tag.
 #[tauri::command]
 pub async fn core_install(app: AppHandle, version: Option<String>) -> Result<String, String> {
-    install_version(&app, version).await
+    let release = match version {
+        Some(t) => fetch_release_by_tag(&t).await?,
+        None => fetch_latest_release().await?,
+    };
+    let tag = version_from_tag(&release).ok_or("no version in release")?;
+
+    download_and_install(&app, &tag, &release).await?;
+
+    // First-install convenience: if nothing was active, make this one active
+    // (and sync it to the helper) so the user can immediately connect.
+    if active_tag(&app).is_none() {
+        write_active(&app, &tag)?;
+        let _ = sync_helper(&app);
+    } else if active_tag(&app).as_deref() == Some(tag.as_str()) {
+        // Re-install of the currently active version: refresh the helper copy.
+        let _ = sync_helper(&app);
+    }
+    Ok(tag)
+}
+
+/// Switch the active version to `tag` (must already be downloaded) and push
+/// the binary to the helper so TUN mode picks it up.
+#[tauri::command]
+pub async fn core_activate(app: AppHandle, tag: String) -> Result<(), String> {
+    let bin = version_binary(&app, &tag)?;
+    if !bin.exists() {
+        return Err(format!("version {tag} isn't downloaded"));
+    }
+    write_active(&app, &tag)?;
+    // Best-effort helper sync — when the helper isn't installed yet, proxy
+    // mode still works; activation succeeds either way.
+    let _ = sync_helper(&app);
+    Ok(())
+}
+
+/// Delete a cached version. Refuses to delete the active one — the user must
+/// activate another version first (and a no-active state would break connect).
+#[tauri::command]
+pub async fn core_uninstall(app: AppHandle, tag: String) -> Result<(), String> {
+    if active_tag(&app).as_deref() == Some(tag.as_str()) {
+        return Err("can't delete the active version — pick another first".into());
+    }
+    let dir = versions_dir(&app)?.join(strip_v(&tag));
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir).map_err(|e| format!("remove version dir: {e}"))?;
+    }
+    // If somehow we end up with nothing installed, clear the marker too so
+    // core_info() reports a clean "no core" state.
+    if installed_tags(&app).is_empty() {
+        let _ = clear_active(&app);
+    }
+    Ok(())
 }

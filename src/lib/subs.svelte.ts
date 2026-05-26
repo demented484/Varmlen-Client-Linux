@@ -2,6 +2,7 @@ import { browser } from "$app/environment";
 import {
   fetchSubscription,
   pingTcp,
+  vpnIcmpPing,
   flagFor,
   stripLeadingFlag,
   formatBytes,
@@ -339,14 +340,30 @@ class SubsStore {
         : s,
     );
 
+    // Cache whether the helper is reachable across one round — many ISPs
+    // block raw TCP to common proxy IPs while leaving ICMP open, in which
+    // case the helper's ICMP probe is the only way to get a real ping.
+    let helperAvailable: boolean | null = null;
+    const probe = async (host: string, port: number): Promise<number | null> => {
+      try {
+        return await pingTcp(host, port);
+      } catch {
+        // TCP blocked / filtered — try ICMP via the helper as a fallback.
+        if (helperAvailable === false) return null;
+        try {
+          const ms = await vpnIcmpPing(host, 2000);
+          helperAvailable = true;
+          return ms;
+        } catch {
+          helperAvailable = false;
+          return null;
+        }
+      }
+    };
+
     await Promise.all(
       sub.servers.map(async (sv) => {
-        let pingMs: number | null = null;
-        try {
-          pingMs = await pingTcp(sv.raw.host, sv.raw.port);
-        } catch {
-          pingMs = null;
-        }
+        const pingMs = await probe(sv.raw.host, sv.raw.port);
         this.list = this.list.map((s) =>
           s.id === subId
             ? {
