@@ -127,11 +127,13 @@ pub fn run() {
                 use tauri::Manager;
                 api.prevent_close();
                 let app = window.app_handle().clone();
-                std::thread::spawn(move || {
-                    let _ = vpn::vpn_disconnect();
-                    // Give the helper a beat so the tunnel really is down by
-                    // the time the user re-opens, not mid-teardown.
-                    std::thread::sleep(std::time::Duration::from_millis(200));
+                // Run on Tauri's tokio pool — vpn_disconnect is async now
+                // and we need a runtime context to await it.
+                tauri::async_runtime::spawn(async move {
+                    let _ = vpn::vpn_disconnect().await;
+                    // Beat so the tunnel is fully torn down before the next
+                    // launch, not still mid-teardown.
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                     app.exit(0);
                 });
             }

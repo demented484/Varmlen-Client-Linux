@@ -153,8 +153,16 @@ fn proxy_connect(app: &tauri::AppHandle, config: &str) -> Result<HelperResponse,
 
 // --- commands -----------------------------------------------------------------
 
+/// All Tauri commands here are `async` on purpose. Sync `#[tauri::command]`
+/// runs on the main event-loop thread, which blocks WebKit rendering for the
+/// duration of the call — every `std::thread::sleep` in the connect path
+/// (helper validation, sing-box startup wait, socket round-trips) would
+/// freeze the UI, so users never saw the "Connecting" state. Async commands
+/// run on Tauri's tokio pool and leave the main thread free to repaint.
+/// `spawn_blocking` wraps the helper-socket / process I/O so it doesn't tie
+/// up async workers either.
 #[tauri::command]
-pub fn vpn_connect(
+pub async fn vpn_connect(
     app: tauri::AppHandle,
     server: VlessServer,
     split: SplitInput,
@@ -164,50 +172,61 @@ pub fn vpn_connect(
 ) -> Result<HelperResponse, String> {
     let cfg = build_config(&server, &split, &mode, allow_lan);
     let cfg_str = serde_json::to_string(&cfg).map_err(|e| e.to_string())?;
+    let host = server.host.clone();
 
     if mode == "proxy" {
         // Tear down any TUN session first, then run a local proxy.
-        let _ = send(json!({ "cmd": "disconnect" }));
-        proxy_connect(&app, &cfg_str)
+        let _ = tokio::task::spawn_blocking(|| send(json!({ "cmd": "disconnect" }))).await;
+        tokio::task::spawn_blocking(move || proxy_connect(&app, &cfg_str))
+            .await
+            .map_err(|e| format!("join: {e}"))?
     } else {
-        stop_local();
-        send(json!({
-            "cmd": "connect",
-            "config": cfg_str,
-            "killswitch": killswitch,
-            "allow_lan": allow_lan,
-            "server": server.host,
-        }))
+        tokio::task::spawn_blocking(move || {
+            stop_local();
+            send(json!({
+                "cmd": "connect",
+                "config": cfg_str,
+                "killswitch": killswitch,
+                "allow_lan": allow_lan,
+                "server": host,
+            }))
+        })
+        .await
+        .map_err(|e| format!("join: {e}"))?
     }
 }
 
 #[tauri::command]
-pub fn vpn_disconnect() -> Result<HelperResponse, String> {
-    stop_local();
-    // Tight timeout: this is called on window close, and we don't want the GUI
-    // to hang for 25s if the helper socket is wedged. The helper teardown
-    // budget (terminate sing-box + kill_stray_core + remove_killswitch) is
-    // bounded to ~6s in the worst case; 8s leaves headroom without making the
-    // user wait.
-    let _ = send_with_timeout(json!({ "cmd": "disconnect" }), Duration::from_secs(8));
+pub async fn vpn_disconnect() -> Result<HelperResponse, String> {
+    let _ = tokio::task::spawn_blocking(|| {
+        stop_local();
+        // Tight timeout: this is called on window close — we don't want the
+        // GUI to hang for 25s if the helper socket is wedged. Helper teardown
+        // (terminate sing-box + kill_stray_core + remove_killswitch) is
+        // bounded to ~6s in the worst case; 8s leaves headroom.
+        let _ = send_with_timeout(json!({ "cmd": "disconnect" }), Duration::from_secs(8));
+    })
+    .await;
     Ok(HelperResponse::disconnected())
 }
 
 #[tauri::command]
-pub fn vpn_status() -> Result<HelperResponse, String> {
+pub async fn vpn_status() -> Result<HelperResponse, String> {
     if let Some(pid) = local_alive() {
         return Ok(HelperResponse::connected(pid));
     }
-    match send(json!({ "cmd": "status" })) {
-        Ok(r) => Ok(r),
-        Err(_) => Ok(HelperResponse::disconnected()),
-    }
+    let r = tokio::task::spawn_blocking(|| send(json!({ "cmd": "status" })))
+        .await
+        .map_err(|e| format!("join: {e}"))?;
+    Ok(r.unwrap_or_else(|_| HelperResponse::disconnected()))
 }
 
 /// Whether the privileged helper is installed and its socket is reachable.
 #[tauri::command]
-pub fn helper_installed() -> bool {
-    UnixStream::connect(SOCKET).is_ok()
+pub async fn helper_installed() -> bool {
+    tokio::task::spawn_blocking(|| UnixStream::connect(SOCKET).is_ok())
+        .await
+        .unwrap_or(false)
 }
 
 /// Synchronise the helper's CORE binary to a user-side path (called by the
@@ -244,8 +263,17 @@ pub fn vpn_icmp_ping(host: String, timeout_ms: Option<u32>) -> Result<u32, Strin
 /// Install the privileged helper via a one-time polkit (pkexec) prompt. The
 /// installer copies the prebuilt helper + the downloaded sing-box core to a
 /// root-owned location and enables the systemd service.
+///
+/// Async + spawn_blocking: the pkexec prompt can take 30+ seconds while the
+/// user types their password — blocking the main thread would freeze the UI.
 #[tauri::command]
-pub fn install_helper(app: tauri::AppHandle) -> Result<(), String> {
+pub async fn install_helper(app: tauri::AppHandle) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || install_helper_blocking(app))
+        .await
+        .map_err(|e| format!("join: {e}"))?
+}
+
+fn install_helper_blocking(app: tauri::AppHandle) -> Result<(), String> {
     let core = crate::core::binary_path(&app)?;
     if !core.exists() {
         return Err("install the sing-box core first (Settings → VPN core)".into());
