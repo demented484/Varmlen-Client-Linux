@@ -169,12 +169,6 @@
             <path d="M21 12a9 9 0 1 1-3.13-6.84M21 4v5h-5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
           </svg>
         </button>
-        <button class="head-btn" onclick={() => subs.pingAll(sub.id)} aria-label="Test latency">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
-            <path d="M12 14V8M8 14v-3M16 14v-2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
-            <circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.8" />
-          </svg>
-        </button>
         <div class="menu-wrap">
           <button
             class="head-btn"
@@ -250,13 +244,6 @@
                   <div class="srv-name">{srv.name}</div>
                   <div class="srv-tr dim">{srv.transport}</div>
                 </div>
-                <span class="srv-ping muted" class:pinging={srv.pinging}>
-                  {srv.pinging
-                    ? "…"
-                    : srv.pingMs !== null
-                      ? `${srv.pingMs} ms`
-                      : "n/d"}
-                </span>
               </button>
               <button
                 class="srv-detail"
@@ -810,18 +797,6 @@
     text-transform: uppercase;
     letter-spacing: 0.06em;
     margin-top: 2px;
-  }
-  .srv-ping {
-    font-variant-numeric: tabular-nums;
-    font-size: 12px;
-  }
-  .srv-ping.pinging {
-    color: var(--text-dim);
-    animation: blink 1s ease-in-out infinite;
-  }
-  @keyframes blink {
-    0%, 100% { opacity: 0.45; }
-    50% { opacity: 1; }
   }
   .chev {
     color: inherit;

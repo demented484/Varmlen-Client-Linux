@@ -5,7 +5,7 @@ mod storage;
 mod subscription;
 mod vpn;
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use subscription::{
     decode_maybe_b64, extract_description, is_supported_uri, parse_headers, parse_proxy_uri,
@@ -83,26 +83,9 @@ async fn fetch_subscription(url: String) -> Result<ImportResult, String> {
     Ok(ImportResult { meta, servers, description })
 }
 
-/// TCP RTT to host:port in milliseconds. We open a connection and measure the
-/// time until the SYN/ACK completes — effectively a layer-4 "ping" that works
-/// against Reality endpoints without raw sockets / root.
-///
-/// Timeout is 4 seconds; returns Err on timeout or connection failure.
-#[tauri::command]
-async fn ping_tcp(host: String, port: u16) -> Result<u32, String> {
-    let addr = format!("{host}:{port}");
-    let start = Instant::now();
-    match tokio::time::timeout(
-        Duration::from_millis(4000),
-        tokio::net::TcpStream::connect(&addr),
-    )
-    .await
-    {
-        Ok(Ok(_stream)) => Ok(start.elapsed().as_millis().min(u32::MAX as u128) as u32),
-        Ok(Err(e)) => Err(format!("connect: {e}")),
-        Err(_) => Err("timeout".to_string()),
-    }
-}
+// (Ping/latency probes are intentionally absent — pending a design pass.
+// vpn::vpn_icmp_ping and the helper's PingHost request are kept so we can
+// wire up either TCP, ICMP, TLS or a combination once the approach is set.)
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -112,7 +95,6 @@ pub fn run() {
             parse_vless_uri,
             parse_subscription_body,
             fetch_subscription,
-            ping_tcp,
             apps::list_installed_apps,
             apps::pick_file,
             apps::app_from_file,
@@ -125,7 +107,6 @@ pub fn run() {
             vpn::vpn_connect,
             vpn::vpn_disconnect,
             vpn::vpn_status,
-            vpn::vpn_icmp_ping,
             vpn::helper_installed,
             vpn::install_helper,
             storage::read_legacy_storage

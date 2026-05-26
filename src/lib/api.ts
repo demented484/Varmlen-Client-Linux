@@ -52,11 +52,6 @@ export function fetchSubscription(url: string): Promise<ImportResult> {
   return invoke<ImportResult>("fetch_subscription", { url });
 }
 
-/** TCP-connect RTT to host:port, in ms — the real wire latency (same as ICMP
- *  ping for a healthy server). Throws on timeout / unreachable. */
-export function pingTcp(host: string, port: number): Promise<number> {
-  return invoke<number>("ping_tcp", { host, port });
-}
 
 export interface InstalledApp {
   /** Binary / process name used to match the running app. */
@@ -148,12 +143,6 @@ export interface CoreProgress {
   speed_bps: number;
 }
 
-/** ICMP RTT via the privileged helper. Helper must be installed; throws
- *  otherwise. Useful when the user's ISP blocks raw TCP to certain server
- *  IPs but lets ICMP through, so the UI can still show a real ping. */
-export function vpnIcmpPing(host: string, timeoutMs = 2000): Promise<number> {
-  return invoke<number>("vpn_icmp_ping", { host, timeoutMs });
-}
 
 /** Enabled split-tunnel selection passed to the connect command. */
 export interface SplitInput {

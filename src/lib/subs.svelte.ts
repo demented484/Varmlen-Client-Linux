@@ -1,8 +1,6 @@
 import { browser } from "$app/environment";
 import {
   fetchSubscription,
-  pingTcp,
-  vpnIcmpPing,
   flagFor,
   stripLeadingFlag,
   formatBytes,
@@ -16,8 +14,6 @@ export interface ServerEntry {
   flag: string;
   name: string;
   transport: string;
-  pingMs: number | null;
-  pinging: boolean;
   raw: VlessServer;
 }
 
@@ -71,7 +67,10 @@ function migrateIds(subs: Subscription[]): { subs: Subscription[]; remapped: Rec
         remapped[srv.id ?? ""] = fresh;
         srv.id = fresh;
       }
-      if (typeof srv.pinging !== "boolean") srv.pinging = false;
+      // Drop any legacy ping fields that older versions persisted on the
+      // entry — pinging is gone from the UI for now.
+      delete (srv as unknown as Record<string, unknown>).pingMs;
+      delete (srv as unknown as Record<string, unknown>).pinging;
       // Drop the leading flag emoji from older labels stored before the
       // flag was rendered separately.
       srv.name = stripLeadingFlag(srv.name);
@@ -130,8 +129,6 @@ function toServerEntry(s: VlessServer): ServerEntry {
     flag: flagFor(s.label),
     name: stripLeadingFlag(s.label),
     transport: transportSummary(s),
-    pingMs: null,
-    pinging: false,
     raw: s,
   };
 }
@@ -259,8 +256,6 @@ class SubsStore {
         this.selectedServerId = servers[0].id;
       }
       this.persist();
-      // Ping in the background; don't block the import dialog on it.
-      void this.pingAll(sub.id);
     } finally {
       this.importing = false;
     }
@@ -305,7 +300,6 @@ class SubsStore {
           : s,
       );
       this.persist();
-      void this.pingAll(subId);
     } catch (e) {
       console.error("refresh failed:", e);
       this.list = this.list.map((s) =>
@@ -323,61 +317,8 @@ class SubsStore {
     this.persist();
   }
 
-  /** Re-ping every server in a subscription. Updates `pingMs` in place.
-   *
-   *  Plain TCP-connect RTT — measures the real wire latency to host:port,
-   *  same number ICMP `ping` would show. Cheap, accurate, runs all servers
-   *  in parallel. (It deliberately doesn't open a TLS / Reality handshake;
-   *  that would inflate the number to multiples of the real latency, which
-   *  is the trap clients like Happ fall into.) */
-  async pingAll(subId: string): Promise<void> {
-    const sub = this.list.find((s) => s.id === subId);
-    if (!sub) return;
-    // mark all as pinging upfront so the UI dims their values
-    this.list = this.list.map((s) =>
-      s.id === subId
-        ? { ...s, servers: s.servers.map((sv) => ({ ...sv, pinging: true })) }
-        : s,
-    );
-
-    // Cache whether the helper is reachable across one round — many ISPs
-    // block raw TCP to common proxy IPs while leaving ICMP open, in which
-    // case the helper's ICMP probe is the only way to get a real ping.
-    let helperAvailable: boolean | null = null;
-    const probe = async (host: string, port: number): Promise<number | null> => {
-      try {
-        return await pingTcp(host, port);
-      } catch {
-        // TCP blocked / filtered — try ICMP via the helper as a fallback.
-        if (helperAvailable === false) return null;
-        try {
-          const ms = await vpnIcmpPing(host, 2000);
-          helperAvailable = true;
-          return ms;
-        } catch {
-          helperAvailable = false;
-          return null;
-        }
-      }
-    };
-
-    await Promise.all(
-      sub.servers.map(async (sv) => {
-        const pingMs = await probe(sv.raw.host, sv.raw.port);
-        this.list = this.list.map((s) =>
-          s.id === subId
-            ? {
-                ...s,
-                servers: s.servers.map((x) =>
-                  x.id === sv.id ? { ...x, pingMs, pinging: false } : x,
-                ),
-              }
-            : s,
-        );
-      }),
-    );
-    this.persist();
-  }
+  // (Ping/latency display is intentionally out of the UI for now; we'll
+  // bring it back once the user decides on the measurement approach.)
 }
 
 export const subs = new SubsStore();
