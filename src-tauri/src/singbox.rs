@@ -32,119 +32,19 @@ fn is_selective(mode: &str) -> bool {
     mode == "selective"
 }
 
-/// Build the proxy outbound for the selected server.
-fn build_outbound(s: &VlessServer) -> Value {
-    let mut o = json!({
-        "type": s.protocol,
+/// The `proxy` outbound for the hybrid: sing-box forwards ALL tunneled traffic
+/// to the local xray SOCKS, which does the actual vless/reality/XHTTP transport
+/// (sing-box can't speak XHTTP). xray must already be listening before sing-box
+/// dials it — `vpn_connect` spawns xray first.
+fn socks_to_xray_outbound() -> Value {
+    json!({
+        "type": "socks",
         "tag": "proxy",
-        "server": s.host,
-        "server_port": s.port,
-    });
-    let map = o.as_object_mut().unwrap();
-
-    match s.protocol.as_str() {
-        "vless" => {
-            map.insert("uuid".into(), json!(s.uuid));
-            if let Some(flow) = s.flow.as_deref().filter(|f| !f.is_empty()) {
-                map.insert("flow".into(), json!(flow));
-            }
-            map.insert("packet_encoding".into(), json!("xudp"));
-        }
-        "vmess" => {
-            map.insert("uuid".into(), json!(s.uuid));
-            map.insert("security".into(), json!("auto"));
-            map.insert("alter_id".into(), json!(0));
-        }
-        "trojan" => {
-            map.insert("password".into(), json!(s.password.clone().unwrap_or_default()));
-        }
-        "shadowsocks" => {
-            map.insert("method".into(), json!(s.method.clone().unwrap_or_default()));
-            map.insert("password".into(), json!(s.password.clone().unwrap_or_default()));
-        }
-        _ => {}
-    }
-
-    if let Some(tls) = build_tls(s) {
-        map.insert("tls".into(), tls);
-    }
-    if let Some(tr) = build_transport(s) {
-        map.insert("transport".into(), tr);
-    }
-    o
-}
-
-/// TLS / Reality block, or None for plaintext (shadowsocks, or vless `none`).
-fn build_tls(s: &VlessServer) -> Option<Value> {
-    let server_name = s.sni.clone().filter(|x| !x.is_empty()).unwrap_or_else(|| s.host.clone());
-    let fp = s.fingerprint.clone().filter(|x| !x.is_empty()).unwrap_or_else(|| "chrome".to_string());
-
-    match s.protocol.as_str() {
-        "shadowsocks" => None,
-        "trojan" | "vmess" => {
-            // Trojan is always TLS; VMess only when its security says so.
-            if s.protocol == "vmess" && s.security != "tls" {
-                return None;
-            }
-            Some(json!({
-                "enabled": true,
-                "server_name": server_name,
-                "utls": { "enabled": true, "fingerprint": fp },
-            }))
-        }
-        _ => {
-            // vless
-            if s.security == "reality" {
-                Some(json!({
-                    "enabled": true,
-                    "server_name": server_name,
-                    "utls": { "enabled": true, "fingerprint": fp },
-                    "reality": {
-                        "enabled": true,
-                        "public_key": s.public_key.clone().unwrap_or_default(),
-                        "short_id": s.short_id.clone().unwrap_or_default(),
-                    },
-                }))
-            } else if s.security == "tls" {
-                Some(json!({
-                    "enabled": true,
-                    "server_name": server_name,
-                    "utls": { "enabled": true, "fingerprint": fp },
-                }))
-            } else {
-                None
-            }
-        }
-    }
-}
-
-/// v2ray transport block for ws/grpc/http; None for plain tcp (incl. xhttp,
-/// which sing-box doesn't implement — treated as tcp here).
-fn build_transport(s: &VlessServer) -> Option<Value> {
-    match s.transport.as_str() {
-        "ws" => {
-            let path = s.path.clone().filter(|p| !p.is_empty()).unwrap_or_else(|| "/".to_string());
-            let mut t = json!({ "type": "ws", "path": path });
-            if let Some(host) = s.raw_params.get("host").filter(|h| !h.is_empty()) {
-                t.as_object_mut().unwrap().insert("headers".into(), json!({ "Host": host }));
-            }
-            Some(t)
-        }
-        "grpc" => {
-            let service = s
-                .raw_params
-                .get("serviceName")
-                .cloned()
-                .unwrap_or_default();
-            Some(json!({ "type": "grpc", "service_name": service }))
-        }
-        "http" => {
-            let path = s.path.clone().filter(|p| !p.is_empty()).unwrap_or_else(|| "/".to_string());
-            Some(json!({ "type": "http", "path": path }))
-        }
-        // "tcp" and "xhttp" → no v2ray transport block.
-        _ => None,
-    }
+        "server": "127.0.0.1",
+        "server_port": crate::xray::XRAY_SOCKS_PORT,
+        "version": "5",
+        "udp_over_tcp": false
+    })
 }
 
 /// Route rules derived from the split-tunnel selection.
@@ -220,7 +120,12 @@ fn proxy_inbound() -> Value {
 /// Assemble the full sing-box config for the given mode ("tun" | "proxy").
 /// The client tunnels everything (subject to split rules); it deliberately
 /// does no geo-based bypass — geo routing is the server's concern.
-pub fn build_config(server: &VlessServer, split: &SplitInput, mode: &str, allow_lan: bool) -> Value {
+///
+/// In the hybrid, sing-box does TUN + routing + DNS and forwards the tunneled
+/// traffic to the local xray SOCKS (`socks_to_xray_outbound`). `server` is
+/// unused here — xray dials the actual server — but kept in the signature for
+/// the command/tests.
+pub fn build_config(_server: &VlessServer, split: &SplitInput, mode: &str, allow_lan: bool) -> Value {
     let proxy_mode = mode == "proxy";
     let (split_rules, final_out) = build_route_rules(split);
 
@@ -237,6 +142,12 @@ pub fn build_config(server: &VlessServer, split: &SplitInput, mode: &str, allow_
 
     json!({
         "log": { "level": "warn" },
+        // Anti-leak DNS: every app query is hijacked into sing-box's DNS module
+        // and resolved via `remote` (DoH 1.1.1.1, detoured through the proxy →
+        // xray → tunnel), so it egresses from the VPN node, never the ISP/RU
+        // resolver. `local` exists ONLY as a bootstrap and is never the `final`
+        // for app traffic. No `default_domain_resolver` — servers are IP
+        // literals (xray dials them), so nothing needs off-tunnel resolution.
         "dns": {
             "servers": [
                 { "type": "https", "tag": "remote", "server": "1.1.1.1", "detour": "proxy" },
@@ -247,14 +158,13 @@ pub fn build_config(server: &VlessServer, split: &SplitInput, mode: &str, allow_
         },
         "inbounds": [if proxy_mode { proxy_inbound() } else { tun_inbound() }],
         "outbounds": [
-            build_outbound(server),
+            socks_to_xray_outbound(),
             { "type": "direct", "tag": "direct" }
         ],
         "route": {
             "rules": rules,
             "final": final_out,
-            "auto_detect_interface": true,
-            "default_domain_resolver": { "server": "local" }
+            "auto_detect_interface": true
         }
     })
 }
@@ -278,48 +188,35 @@ pub fn generate_singbox_config(
 mod tests {
     use super::*;
     use crate::subscription::parse_proxy_uri;
-    use base64::Engine;
 
     fn split() -> SplitInput {
         SplitInput::default()
     }
 
     #[test]
-    fn vless_reality_outbound() {
+    fn tun_proxy_outbound_is_socks_to_xray() {
+        // In the hybrid, sing-box's proxy outbound is always a SOCKS hop to the
+        // local xray (which does the real vless/reality/xhttp transport).
         let s = parse_proxy_uri(
-            "vless://uuid-1@1.2.3.4:443?type=tcp&security=reality&flow=xtls-rprx-vision&sni=icloud.com&pbk=KEY&sid=ab&fp=chrome#X",
+            "vless://uuid-1@1.2.3.4:443?type=xhttp&security=reality&pbk=KEY&sid=ab&fp=firefox#X",
         )
         .unwrap();
         let cfg = build_config(&s, &split(), "tun", true);
         let ob = &cfg["outbounds"][0];
-        assert_eq!(ob["type"], "vless");
-        assert_eq!(ob["uuid"], "uuid-1");
-        assert_eq!(ob["flow"], "xtls-rprx-vision");
-        assert_eq!(ob["tls"]["reality"]["enabled"], true);
-        assert_eq!(ob["tls"]["reality"]["public_key"], "KEY");
-        assert_eq!(ob["tls"]["server_name"], "icloud.com");
+        assert_eq!(ob["type"], "socks");
+        assert_eq!(ob["tag"], "proxy");
+        assert_eq!(ob["server"], "127.0.0.1");
+        assert_eq!(ob["server_port"], crate::xray::XRAY_SOCKS_PORT);
     }
 
     #[test]
-    fn shadowsocks_outbound() {
-        let creds = base64::engine::general_purpose::STANDARD.encode("aes-256-gcm:pw");
-        let s = parse_proxy_uri(&format!("ss://{creds}@1.2.3.4:8388#X")).unwrap();
+    fn dns_has_no_offtunnel_default_resolver() {
+        // DNS-leak guard: `final` is the proxied DoH resolver and there's no
+        // default_domain_resolver pointing at plaintext `local`.
+        let s = parse_proxy_uri("vless://u@1.2.3.4:443?type=xhttp&security=reality&pbk=K#X").unwrap();
         let cfg = build_config(&s, &split(), "tun", true);
-        let ob = &cfg["outbounds"][0];
-        assert_eq!(ob["type"], "shadowsocks");
-        assert_eq!(ob["method"], "aes-256-gcm");
-        assert_eq!(ob["password"], "pw");
-        assert!(ob.get("tls").is_none());
-    }
-
-    #[test]
-    fn trojan_outbound_has_tls() {
-        let s = parse_proxy_uri("trojan://pw@h.example.com:443?sni=h.example.com#X").unwrap();
-        let cfg = build_config(&s, &split(), "tun", true);
-        let ob = &cfg["outbounds"][0];
-        assert_eq!(ob["type"], "trojan");
-        assert_eq!(ob["password"], "pw");
-        assert_eq!(ob["tls"]["enabled"], true);
+        assert_eq!(cfg["dns"]["final"], "remote");
+        assert!(cfg["route"].get("default_domain_resolver").is_none());
     }
 
     #[test]

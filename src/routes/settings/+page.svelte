@@ -2,8 +2,8 @@
   import { theme } from "$lib/theme.svelte";
   import { settings, type VpnMode } from "$lib/settings.svelte";
   import { i18n, t, LANGUAGES, type Lang } from "$lib/i18n.svelte";
-  import { core } from "$lib/core.svelte";
-  import { helperInstalled, installHelper } from "$lib/api";
+  import { core, xrayCore } from "$lib/core.svelte";
+  import { capsGranted, grantCaps } from "$lib/api";
   import Dropdown from "$lib/components/Dropdown.svelte";
 
   const modeOptions = $derived([
@@ -12,9 +12,10 @@
   ]);
   const modeSub = $derived(settings.vpnMode === "proxy" ? t("mode.proxySub") : t("mode.tunSub"));
 
-  // Refresh the core status when Settings opens (cheap GitHub check).
+  // Refresh both cores' status when Settings opens (cheap GitHub check).
   $effect(() => {
     void core.check();
+    void xrayCore.check();
   });
 
   /** Tri-state so we don't flash "Not installed" while the very first check
@@ -29,7 +30,7 @@
   async function refreshHelper(allowChecking = false) {
     if (allowChecking) helperState = "checking";
     try {
-      helperState = (await helperInstalled()) ? "ok" : "missing";
+      helperState = (await capsGranted()) ? "ok" : "missing";
     } catch {
       helperState = "missing";
     }
@@ -42,10 +43,7 @@
     helperBusy = true;
     helperErr = null;
     try {
-      await installHelper();
-      // systemctl restart returns before the socket is necessarily ready;
-      // retry a few times so we don't briefly show "missing" right after a
-      // successful install.
+      await grantCaps();
       for (let i = 0; i < 10; i++) {
         await refreshHelper();
         if (helperState === "ok") break;
@@ -64,11 +62,15 @@
     return helperErr ?? t("helper.notInstalled");
   });
 
+  // The versions modal is shared by both cores; `activeCore` is whichever the
+  // user opened it for.
   let showVersions = $state(false);
+  let activeCore = $state(core);
 
-  async function openVersions() {
+  async function openVersions(which: typeof core) {
+    activeCore = which;
     showVersions = true;
-    await core.loadReleases();
+    await which.loadReleases();
   }
 
   function formatReleaseDate(d: string | null): string {
@@ -97,10 +99,10 @@
     return `${v.toFixed(v >= 100 || i === 0 ? 0 : 1)} ${units[i]}`;
   }
 
-  const coreStatus = $derived.by(() => {
-    if (core.checking && !core.info) return t("core.checking");
-    const info = core.info;
-    if (!info) return core.error ? t("core.checkFailed") : t("core.checking");
+  function coreStatus(store: typeof core): string {
+    if (store.checking && !store.info) return t("core.checking");
+    const info = store.info;
+    if (!info) return store.error ? t("core.checkFailed") : t("core.checking");
     if (info.active) {
       return info.has_update && info.latest
         ? `${info.active} → ${info.latest}`
@@ -109,7 +111,7 @@
     return info.latest
       ? `${t("core.notInstalled")} · ${t("core.latest", { v: info.latest })}`
       : t("core.notInstalled");
-  });
+  }
 
 </script>
 
@@ -212,10 +214,23 @@
     <div class="list">
       <div class="row">
         <div class="row-text">
-          <div class="row-title">sing-box</div>
-          <div class="row-sub muted">{coreStatus}</div>
+          <div class="row-title">sing-box <span class="muted" style="font-weight:400">· TUN</span></div>
+          <div class="row-sub muted">{coreStatus(core)}</div>
         </div>
-        <button class="btn" onclick={openVersions} title={t("core.versionsTitle")}>
+        <button class="btn" onclick={() => openVersions(core)} title={t("core.versionsTitle")}>
+          <svg class="btn-ico" width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path d="M4 6h16M4 12h16M4 18h16" stroke="currentColor" stroke-width="1.9"
+              stroke-linecap="round" />
+          </svg>
+          <span>{t("core.versions")}</span>
+        </button>
+      </div>
+      <div class="row">
+        <div class="row-text">
+          <div class="row-title">xray <span class="muted" style="font-weight:400">· XHTTP</span></div>
+          <div class="row-sub muted">{coreStatus(xrayCore)}</div>
+        </div>
+        <button class="btn" onclick={() => openVersions(xrayCore)} title={t("core.versionsTitle")}>
           <svg class="btn-ico" width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
             <path d="M4 6h16M4 12h16M4 18h16" stroke="currentColor" stroke-width="1.9"
               stroke-linecap="round" />
@@ -226,6 +241,9 @@
     </div>
     {#if core.error}
       <div class="row-sub" style="color: var(--danger); padding: 0 4px;">{core.error}</div>
+    {/if}
+    {#if xrayCore.error}
+      <div class="row-sub" style="color: var(--danger); padding: 0 4px;">{xrayCore.error}</div>
     {/if}
   </section>
 
@@ -252,19 +270,19 @@
           </button>
         </header>
 
-        {#if core.releasesLoading && core.releases.length === 0}
+        {#if activeCore.releasesLoading && activeCore.releases.length === 0}
           <p class="muted">{t("core.checking")}</p>
-        {:else if core.error && core.releases.length === 0}
-          <p style="color: var(--danger)">{core.error}</p>
+        {:else if activeCore.error && activeCore.releases.length === 0}
+          <p style="color: var(--danger)">{activeCore.error}</p>
         {:else}
           <ul class="ver-list">
-            {#each core.releases as r (r.tag)}
+            {#each activeCore.releases as r (r.tag)}
               {@const ver = r.tag.replace(/^v/, "")}
-              {@const isActive = core.isActive(r.tag)}
-              {@const isInstalled = core.isInstalled(r.tag)}
-              {@const prog = core.progress[ver]}
-              {@const isDownloading = core.busyTags.has(ver)}
-              {@const isSwitching = core.switchingTag === ver}
+              {@const isActive = activeCore.isActive(r.tag)}
+              {@const isInstalled = activeCore.isInstalled(r.tag)}
+              {@const prog = activeCore.progress[ver]}
+              {@const isDownloading = activeCore.busyTags.has(ver)}
+              {@const isSwitching = activeCore.switchingTag === ver}
               {@const pct = prog && prog.total > 0
                 ? Math.min(100, Math.round((prog.downloaded / prog.total) * 100))
                 : prog && prog.downloaded > 0 ? 0 : 0}
@@ -299,7 +317,7 @@
                          deserve text confirmation. -->
                     <button
                       class="btn btn-sm btn-danger"
-                      onclick={() => core.uninstall(r.tag)}
+                      onclick={() => activeCore.uninstall(r.tag)}
                       disabled={isSwitching}
                       title={t("core.delete")}
                     >
@@ -311,7 +329,7 @@
                   {:else if isInstalled}
                     <button
                       class="btn btn-primary btn-sm"
-                      onclick={() => core.activate(r.tag)}
+                      onclick={() => activeCore.activate(r.tag)}
                       disabled={isSwitching}
                     >
                       {isSwitching ? "…" : t("core.use")}
@@ -324,7 +342,7 @@
                          unambiguous. -->
                     <button
                       class="btn btn-sm btn-danger"
-                      onclick={() => core.uninstall(r.tag)}
+                      onclick={() => activeCore.uninstall(r.tag)}
                       disabled={isSwitching}
                       title={t("core.delete")}
                     >
@@ -336,7 +354,7 @@
                   {:else}
                     <button
                       class="btn btn-sm"
-                      onclick={() => core.install(r.tag)}
+                      onclick={() => activeCore.install(r.tag)}
                       disabled={isDownloading}
                     >
                       <svg class="btn-ico" width="14" height="14" viewBox="0 0 24 24" fill="none"

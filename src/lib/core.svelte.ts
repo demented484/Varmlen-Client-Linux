@@ -5,8 +5,8 @@ import {
   coreInstall,
   coreUninstall,
   listCoreReleases,
-  vpnDisconnect,
   type CoreInfo,
+  type CoreKind,
   type CoreProgress,
   type CoreRelease,
 } from "$lib/api";
@@ -24,6 +24,12 @@ function msg(e: unknown): string {
  *  - `releases` is the GitHub release list, loaded on demand.
  *  - `progress[tag]` is the live download state for an in-flight install. */
 class CoreStore {
+  /** Which core this store manages. */
+  readonly kind: CoreKind;
+  constructor(kind: CoreKind) {
+    this.kind = kind;
+  }
+
   info = $state<CoreInfo | null>(null);
   releases = $state<CoreRelease[]>([]);
   releasesLoading = $state(false);
@@ -52,7 +58,7 @@ class CoreStore {
   async check(): Promise<void> {
     this.checking = true;
     try {
-      this.info = await coreInfo();
+      this.info = await coreInfo(this.kind);
       this.error = null;
     } catch (e) {
       this.error = msg(e);
@@ -65,7 +71,7 @@ class CoreStore {
     if (this.releases.length > 0) return;
     this.releasesLoading = true;
     try {
-      this.releases = await listCoreReleases();
+      this.releases = await listCoreReleases(this.kind);
     } catch (e) {
       this.error = msg(e);
     } finally {
@@ -90,7 +96,7 @@ class CoreStore {
     this.markBusy(key, true);
     this.error = null;
     try {
-      await coreInstall(version);
+      await coreInstall(this.kind, version);
       await this.check();
     } catch (e) {
       this.error = msg(e);
@@ -108,7 +114,7 @@ class CoreStore {
     this.switchingTag = t;
     this.error = null;
     try {
-      await coreActivate(t);
+      await coreActivate(this.kind, t);
       await this.check();
     } catch (e) {
       this.error = msg(e);
@@ -128,7 +134,7 @@ class CoreStore {
       if (this.isActive(t) && conn.status !== "disconnected") {
         await conn.disconnect();
       }
-      await coreUninstall(t);
+      await coreUninstall(this.kind, t);
       await this.check();
     } catch (e) {
       this.error = msg(e);
@@ -164,4 +170,7 @@ function stripV(s: string): string {
   return s.startsWith("v") ? s.slice(1) : s;
 }
 
-export const core = new CoreStore();
+/** sing-box: TUN + routing + split + DNS. */
+export const core = new CoreStore("singbox");
+/** xray: the XHTTP/Reality transport the sing-box TUN forwards into. */
+export const xrayCore = new CoreStore("xray");

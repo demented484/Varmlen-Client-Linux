@@ -179,6 +179,19 @@
             <path d="M21 12a9 9 0 1 1-3.13-6.84M21 4v5h-5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
           </svg>
         </button>
+        <button
+          class="head-btn"
+          onclick={() => subs.pingSub(sub.id)}
+          aria-label="Ping"
+          disabled={subs.isSubPinging(sub.id)}
+        >
+          <!-- speedometer / gauge — Happ's ping affordance -->
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
+            <path d="M12 21a9 9 0 1 0-9-9" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
+            <path d="M12 12l5-3" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
+            <circle cx="12" cy="12" r="1.4" fill="currentColor" />
+          </svg>
+        </button>
         <div class="menu-wrap">
           <button
             class="head-btn"
@@ -256,15 +269,7 @@
                   <div class="srv-tr dim">{srv.transport}</div>
                 </div>
               </button>
-              <span
-                class="srv-ping"
-                class:ping-good={typeof ping === "number" && ping < 150}
-                class:ping-mid={typeof ping === "number" && ping >= 150 && ping < 400}
-                class:ping-slow={typeof ping === "number" && ping >= 400}
-                class:ping-bad={ping === "timeout"}
-                class:ping-busy={ping === "pinging"}
-                aria-label="latency"
-              >
+              <span class="srv-ping" aria-label="latency">
                 {#if ping === "pinging"}…
                 {:else if ping === "timeout"}н/д
                 {:else if typeof ping === "number"}{ping}мс
@@ -831,22 +836,17 @@
     color: inherit;
     flex-shrink: 0;
   }
-  /* Latency chip sits between the server name+transport block and the
-     details chevron — Happ-style. Color tiers communicate quality at a
-     glance without needing a legend. */
+  /* Latency text sits between the server name+transport block and the
+     details chevron — Happ-style: muted, right-aligned, vertically centered. */
   .srv-ping {
+    align-self: center;
     font-variant-numeric: tabular-nums;
-    font-size: 11px;
+    font-size: 12px;
     min-width: 44px;
     text-align: right;
     padding-right: 4px;
     color: var(--muted, #888);
   }
-  .ping-good { color: #4ade80; }
-  .ping-mid  { color: #fbbf24; }
-  .ping-slow { color: #fb923c; }
-  .ping-bad  { color: #ef4444; }
-  .ping-busy { color: var(--muted, #888); opacity: 0.6; }
 
   .empty {
     text-align: center;

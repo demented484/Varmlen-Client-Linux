@@ -212,10 +212,6 @@ pub fn parse_body_meta(body: &str) -> (std::collections::HashMap<String, String>
     (headers, description)
 }
 
-/// Backwards-compatible wrapper: just the free-text description part.
-pub fn extract_description(body: &str) -> Option<String> {
-    parse_body_meta(body).1
-}
 
 /// Schemes we know how to parse.
 pub fn is_supported_uri(line: &str) -> bool {

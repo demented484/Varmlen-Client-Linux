@@ -1,13 +1,13 @@
-//! sing-box core management.
+//! VPN core management for TWO cores: sing-box (TUN + routing + split) and
+//! xray (the XHTTP/Reality transport engine the hybrid forwards into).
 //!
-//! Versions are cached side-by-side under `app_data/core/versions/<tag>/sing-box`
-//! and `core/active.txt` records which one the rest of the app should use. The
-//! user downloads + keeps as many versions as they want, then activates one with
-//! a single click — no re-download to switch. Activating also pushes the binary
-//! to the helper so TUN mode uses the same version as proxy mode.
+//! Versions are cached per-kind under
+//! `app_data/core/versions/<kind>/<tag>/<bin>` and `core/active-<kind>.txt`
+//! records which one is active for that kind. The user keeps as many versions
+//! as they want and activates one per kind with a single click.
 //!
 //! Downloads stream chunks + emit `core://progress` events so the UI can render
-//! a real progress bar (bytes, total, speed) instead of a spinner.
+//! a real progress bar. sing-box assets are `.tar.gz`; xray assets are `.zip`.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -16,8 +16,50 @@ use futures_util::StreamExt;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 
-const REPO: &str = "SagerNet/sing-box";
-const ACTIVE_FILE: &str = "active.txt";
+/// Which core a request targets. sing-box does TUN/routing; xray does the
+/// outbound transport (vless/reality/xhttp) the sing-box TUN forwards into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoreKind {
+    SingBox,
+    Xray,
+}
+
+impl CoreKind {
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "singbox" | "sing-box" => Ok(CoreKind::SingBox),
+            "xray" => Ok(CoreKind::Xray),
+            other => Err(format!("unknown core kind: {other}")),
+        }
+    }
+    /// Stable slug used in paths / active-file names.
+    fn slug(self) -> &'static str {
+        match self {
+            CoreKind::SingBox => "singbox",
+            CoreKind::Xray => "xray",
+        }
+    }
+    fn repo(self) -> &'static str {
+        match self {
+            CoreKind::SingBox => "SagerNet/sing-box",
+            CoreKind::Xray => "XTLS/Xray-core",
+        }
+    }
+    /// Binary file name inside the per-version dir.
+    pub fn bin_name(self) -> &'static str {
+        match self {
+            CoreKind::SingBox => {
+                if cfg!(windows) { "sing-box.exe" } else { "sing-box" }
+            }
+            CoreKind::Xray => {
+                if cfg!(windows) { "xray.exe" } else { "xray" }
+            }
+        }
+    }
+    fn active_file(self) -> String {
+        format!("active-{}.txt", self.slug())
+    }
+}
 
 #[derive(Serialize, Clone)]
 pub struct InstalledVersion {
@@ -27,25 +69,17 @@ pub struct InstalledVersion {
 
 #[derive(Serialize)]
 pub struct CoreInfo {
-    /// All locally-cached versions, newest first; `active` flags which one
-    /// the app (and helper, once synced) is actually running.
     pub installed: Vec<InstalledVersion>,
-    /// Tag of the active version, or null when none installed.
     pub active: Option<String>,
-    /// Latest version from GitHub releases, or null when the check failed.
     pub latest: Option<String>,
-    /// True iff `latest` is set and differs from `active` (or none active).
     pub has_update: bool,
 }
 
 #[derive(Serialize, Clone)]
 pub struct CoreProgress {
-    /// Version tag this progress event is for.
     pub tag: String,
     pub downloaded: u64,
-    /// Total size from Content-Length, or 0 if the server didn't send it.
     pub total: u64,
-    /// Bytes-per-second over the last sample window.
     pub speed_bps: u64,
 }
 
@@ -61,106 +95,142 @@ fn core_dir(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
-fn versions_dir(app: &AppHandle) -> Result<PathBuf, String> {
-    let d = core_dir(app)?.join("versions");
+fn versions_dir(app: &AppHandle, kind: CoreKind) -> Result<PathBuf, String> {
+    let d = core_dir(app)?.join("versions").join(kind.slug());
     std::fs::create_dir_all(&d).map_err(|e| format!("create versions dir: {e}"))?;
     Ok(d)
 }
 
-fn binary_name() -> &'static str {
-    if cfg!(windows) { "sing-box.exe" } else { "sing-box" }
-}
-
 /// Where the binary for a specific tag lives (may not exist yet).
-fn version_binary(app: &AppHandle, tag: &str) -> Result<PathBuf, String> {
-    Ok(versions_dir(app)?.join(strip_v(tag)).join(binary_name()))
+fn version_binary(app: &AppHandle, kind: CoreKind, tag: &str) -> Result<PathBuf, String> {
+    Ok(versions_dir(app, kind)?.join(strip_v(tag)).join(kind.bin_name()))
 }
 
 fn strip_v(tag: &str) -> &str {
     tag.strip_prefix('v').unwrap_or(tag)
 }
 
-/// The currently active version's binary path; errors if no version is active
-/// (caller should prompt the user to install one).
-pub fn binary_path(app: &AppHandle) -> Result<PathBuf, String> {
-    let active = active_tag(app)
-        .ok_or_else(|| "no sing-box core installed (Settings → VPN core)".to_string())?;
-    let bin = version_binary(app, &active)?;
+/// The active version's binary path for a kind; errors if none active/missing.
+pub fn binary_path(app: &AppHandle, kind: CoreKind) -> Result<PathBuf, String> {
+    let active = active_tag(app, kind)
+        .ok_or_else(|| format!("no {} core installed (Settings → VPN core)", kind.slug()))?;
+    let bin = version_binary(app, kind, &active)?;
     if !bin.exists() {
         return Err(format!(
-            "active core version {active} is missing on disk — pick another in Settings"
+            "active {} version {active} is missing on disk — pick another in Settings",
+            kind.slug()
         ));
     }
     Ok(bin)
 }
 
-/// Tag currently selected as active (whatever's in `active.txt`).
-pub fn active_tag(app: &AppHandle) -> Option<String> {
+/// Tag currently selected as active for a kind.
+pub fn active_tag(app: &AppHandle, kind: CoreKind) -> Option<String> {
     let dir = core_dir(app).ok()?;
-    let v = std::fs::read_to_string(dir.join(ACTIVE_FILE)).ok()?;
+    let v = std::fs::read_to_string(dir.join(kind.active_file())).ok()?;
     let v = v.trim().to_string();
     if v.is_empty() { None } else { Some(v) }
 }
 
-fn write_active(app: &AppHandle, tag: &str) -> Result<(), String> {
+fn write_active(app: &AppHandle, kind: CoreKind, tag: &str) -> Result<(), String> {
     let dir = core_dir(app)?;
-    std::fs::write(dir.join(ACTIVE_FILE), strip_v(tag))
-        .map_err(|e| format!("write active.txt: {e}"))
+    std::fs::write(dir.join(kind.active_file()), strip_v(tag))
+        .map_err(|e| format!("write active file: {e}"))
 }
 
-fn clear_active(app: &AppHandle) -> Result<(), String> {
+fn clear_active(app: &AppHandle, kind: CoreKind) -> Result<(), String> {
     let dir = core_dir(app)?;
-    let p = dir.join(ACTIVE_FILE);
+    let p = dir.join(kind.active_file());
     if p.exists() {
-        std::fs::remove_file(p).map_err(|e| format!("remove active.txt: {e}"))?;
+        std::fs::remove_file(p).map_err(|e| format!("remove active file: {e}"))?;
     }
     Ok(())
 }
 
-/// One-time migration of the old single-binary layout
-/// (`core/sing-box` + `core/version.txt`) into the new per-version cache
-/// (`core/versions/<tag>/sing-box` + `core/active.txt`). Idempotent: a no-op
-/// once the old files are gone.
+/// One-time migration of older sing-box layouts into the per-kind cache:
+///   - very old: `core/sing-box` + `core/version.txt`
+///   - prior:    `core/versions/<tag>/sing-box` + `core/active.txt`
+/// Both fold into `core/versions/singbox/<tag>/sing-box` + `active-singbox.txt`.
+/// Idempotent: a no-op once migrated.
 fn migrate_legacy_layout(app: &AppHandle) {
     let Ok(dir) = core_dir(app) else { return };
-    let old_bin = dir.join(binary_name());
-    let old_ver_file = dir.join("version.txt");
-    if !old_bin.exists() {
-        return;
-    }
-    let ver = std::fs::read_to_string(&old_ver_file)
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "legacy".to_string());
+    let sb = CoreKind::SingBox;
 
-    if let Ok(target) = version_binary(app, &ver) {
-        if let Some(parent) = target.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if !target.exists() && std::fs::rename(&old_bin, &target).is_err() {
-            // Cross-device move? fall back to copy + remove.
-            if std::fs::copy(&old_bin, &target).is_ok() {
-                let _ = std::fs::remove_file(&old_bin);
+    // (a) prior per-tag layout: core/versions/<tag>/sing-box
+    let old_versions = dir.join("versions");
+    if let Ok(entries) = std::fs::read_dir(&old_versions) {
+        for e in entries.flatten() {
+            // Skip the new per-kind subdirs.
+            let name = e.file_name().to_string_lossy().to_string();
+            if name == "singbox" || name == "xray" {
+                continue;
+            }
+            let old_bin = e.path().join(sb.bin_name());
+            if old_bin.exists() {
+                if let Ok(target) = version_binary(app, sb, &name) {
+                    if let Some(parent) = target.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    if !target.exists() {
+                        if std::fs::rename(&old_bin, &target).is_err() {
+                            if std::fs::copy(&old_bin, &target).is_ok() {
+                                let _ = std::fs::remove_file(&old_bin);
+                            }
+                        }
+                    }
+                    let _ = std::fs::remove_dir_all(e.path());
+                }
             }
         }
-        if active_tag(app).is_none() {
-            let _ = write_active(app, &ver);
+    }
+
+    // (b) old active.txt → active-singbox.txt
+    let old_active = dir.join("active.txt");
+    if old_active.exists() && active_tag(app, sb).is_none() {
+        if let Ok(v) = std::fs::read_to_string(&old_active) {
+            let v = v.trim();
+            if !v.is_empty() {
+                let _ = write_active(app, sb, v);
+            }
         }
     }
-    let _ = std::fs::remove_file(&old_ver_file);
+    let _ = std::fs::remove_file(&old_active);
+
+    // (c) very old single-binary layout: core/sing-box + version.txt
+    let old_bin = dir.join(sb.bin_name());
+    if old_bin.exists() {
+        let ver = std::fs::read_to_string(dir.join("version.txt"))
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "legacy".to_string());
+        if let Ok(target) = version_binary(app, sb, &ver) {
+            if let Some(parent) = target.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if !target.exists() && std::fs::rename(&old_bin, &target).is_err() {
+                if std::fs::copy(&old_bin, &target).is_ok() {
+                    let _ = std::fs::remove_file(&old_bin);
+                }
+            }
+            if active_tag(app, sb).is_none() {
+                let _ = write_active(app, sb, &ver);
+            }
+        }
+        let _ = std::fs::remove_file(dir.join("version.txt"));
+    }
 }
 
-/// All tags with a binary on disk, newest-first by simple version ordering.
-fn installed_tags(app: &AppHandle) -> Vec<String> {
+/// All tags with a binary on disk for a kind, newest-first.
+fn installed_tags(app: &AppHandle, kind: CoreKind) -> Vec<String> {
     migrate_legacy_layout(app);
-    let Ok(dir) = versions_dir(app) else { return Vec::new() };
+    let Ok(dir) = versions_dir(app, kind) else { return Vec::new() };
     let Ok(entries) = std::fs::read_dir(&dir) else { return Vec::new() };
     let mut tags: Vec<String> = entries
         .filter_map(|e| e.ok())
         .filter_map(|e| {
             let name = e.file_name().to_string_lossy().to_string();
-            if e.path().join(binary_name()).exists() {
+            if e.path().join(kind.bin_name()).exists() {
                 Some(name)
             } else {
                 None
@@ -171,8 +241,6 @@ fn installed_tags(app: &AppHandle) -> Vec<String> {
     tags
 }
 
-/// Compare semver-ish tags ("1.13.0" vs "1.12.4"). Falls back to lexical for
-/// anything that doesn't parse.
 fn version_cmp(a: &str, b: &str) -> std::cmp::Ordering {
     let parts = |s: &str| -> Vec<u32> {
         strip_v(s)
@@ -194,14 +262,10 @@ fn http_client() -> Result<reqwest::Client, String> {
         .map_err(|e| format!("http client: {e}"))
 }
 
-async fn fetch_latest_release() -> Result<serde_json::Value, String> {
+async fn fetch_latest_release(kind: CoreKind) -> Result<serde_json::Value, String> {
     let client = http_client()?;
-    let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
-    let resp = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| format!("release request: {e}"))?;
+    let url = format!("https://api.github.com/repos/{}/releases/latest", kind.repo());
+    let resp = client.get(url).send().await.map_err(|e| format!("release request: {e}"))?;
     if !resp.status().is_success() {
         return Err(format!("GitHub API HTTP {}", resp.status()));
     }
@@ -209,10 +273,10 @@ async fn fetch_latest_release() -> Result<serde_json::Value, String> {
     serde_json::from_str(&text).map_err(|e| format!("release json: {e}"))
 }
 
-async fn fetch_release_by_tag(tag: &str) -> Result<serde_json::Value, String> {
+async fn fetch_release_by_tag(kind: CoreKind, tag: &str) -> Result<serde_json::Value, String> {
     let client = http_client()?;
     let tag = if tag.starts_with('v') { tag.to_string() } else { format!("v{tag}") };
-    let url = format!("https://api.github.com/repos/{REPO}/releases/tags/{tag}");
+    let url = format!("https://api.github.com/repos/{}/releases/tags/{tag}", kind.repo());
     let resp = client.get(url).send().await.map_err(|e| format!("release request: {e}"))?;
     if !resp.status().is_success() {
         return Err(format!("GitHub API HTTP {}", resp.status()));
@@ -225,8 +289,8 @@ fn version_from_tag(release: &serde_json::Value) -> Option<String> {
     release.get("tag_name").and_then(|t| t.as_str()).map(|t| strip_v(t).to_string())
 }
 
-async fn latest_version() -> Result<String, String> {
-    let release = fetch_latest_release().await?;
+async fn latest_version(kind: CoreKind) -> Result<String, String> {
+    let release = fetch_latest_release(kind).await?;
     version_from_tag(&release).ok_or_else(|| "no tag_name in release".to_string())
 }
 
@@ -239,9 +303,10 @@ pub struct CoreRelease {
 }
 
 #[tauri::command]
-pub async fn list_core_releases() -> Result<Vec<CoreRelease>, String> {
+pub async fn list_core_releases(kind: String) -> Result<Vec<CoreRelease>, String> {
+    let kind = CoreKind::parse(&kind)?;
     let client = http_client()?;
-    let url = format!("https://api.github.com/repos/{REPO}/releases?per_page=30");
+    let url = format!("https://api.github.com/repos/{}/releases?per_page=30", kind.repo());
     let resp = client.get(url).send().await.map_err(|e| format!("releases request: {e}"))?;
     if !resp.status().is_success() {
         return Err(format!("GitHub API HTTP {}", resp.status()));
@@ -269,30 +334,42 @@ pub async fn list_core_releases() -> Result<Vec<CoreRelease>, String> {
 
 // --- download + install ----------------------------------------------------
 
-/// sing-box names release assets `sing-box-<ver>-<os>-<arch>.tar.gz`.
-fn asset_suffix() -> Result<String, String> {
-    let os = match std::env::consts::OS {
-        "linux" => "linux",
-        "macos" => "darwin",
-        "windows" => "windows",
-        other => return Err(format!("unsupported OS: {other}")),
-    };
-    let arch = match std::env::consts::ARCH {
-        "x86_64" => "amd64",
-        "aarch64" => "arm64",
-        other => return Err(format!("unsupported arch: {other}")),
-    };
-    Ok(format!("-{os}-{arch}.tar.gz"))
+/// Does the asset name match the OS/arch build we want for this kind?
+/// sing-box: `*-linux-amd64.tar.gz`. xray: `Xray-linux-64.zip` (amd64) /
+/// `Xray-linux-arm64-v8a.zip`.
+fn asset_matches(kind: CoreKind, name: &str) -> bool {
+    match kind {
+        CoreKind::SingBox => {
+            let os = match std::env::consts::OS {
+                "linux" => "linux",
+                "macos" => "darwin",
+                "windows" => "windows",
+                _ => return false,
+            };
+            let arch = match std::env::consts::ARCH {
+                "x86_64" => "amd64",
+                "aarch64" => "arm64",
+                _ => return false,
+            };
+            name.ends_with(&format!("-{os}-{arch}.tar.gz")) && !name.contains("legacy")
+        }
+        CoreKind::Xray => {
+            // xray only matters on Linux here (TUN host is Linux).
+            match std::env::consts::ARCH {
+                "x86_64" => name == "Xray-linux-64.zip",
+                "aarch64" => name == "Xray-linux-arm64-v8a.zip",
+                _ => false,
+            }
+        }
+    }
 }
 
-/// Download the asset with progress events, verify its SHA256 against the
-/// release's per-asset digest, and extract the binary into the per-tag dir.
 async fn download_and_install(
     app: &AppHandle,
+    kind: CoreKind,
     tag: &str,
     release: &serde_json::Value,
 ) -> Result<(), String> {
-    let suffix = asset_suffix()?;
     let asset = release
         .get("assets")
         .and_then(|a| a.as_array())
@@ -301,10 +378,10 @@ async fn download_and_install(
         .find(|a| {
             a.get("name")
                 .and_then(|n| n.as_str())
-                .map(|name| name.ends_with(&suffix) && !name.contains("legacy"))
+                .map(|name| asset_matches(kind, name))
                 .unwrap_or(false)
         })
-        .ok_or_else(|| format!("no asset matching '*{suffix}'"))?;
+        .ok_or_else(|| format!("no matching {} asset for this platform", kind.slug()))?;
 
     let url = asset
         .get("browser_download_url")
@@ -336,7 +413,6 @@ async fn download_and_install(
         buf.extend_from_slice(&chunk);
         window_bytes += chunk.len() as u64;
 
-        // Sample the speed every ~250 ms so the displayed number is steady.
         let now = Instant::now();
         if now.duration_since(window_start) >= Duration::from_millis(250) {
             let elapsed = now.duration_since(window_start).as_secs_f64();
@@ -347,7 +423,6 @@ async fn download_and_install(
             window_bytes = 0;
         }
 
-        // Throttle progress events to ~10/s — the UI doesn't need more.
         if now.duration_since(last_emit) >= Duration::from_millis(100) {
             let _ = app.emit(
                 "core://progress",
@@ -357,7 +432,6 @@ async fn download_and_install(
         }
     }
 
-    // Final 100% event so progress bars don't get stuck at 99%.
     let _ = app.emit(
         "core://progress",
         CoreProgress { tag: tag.to_string(), downloaded: buf.len() as u64, total: buf.len() as u64, speed_bps },
@@ -372,10 +446,13 @@ async fn download_and_install(
         }
     }
 
-    let dest = version_binary(app, tag)?;
+    let dest = version_binary(app, kind, tag)?;
     std::fs::create_dir_all(dest.parent().unwrap())
         .map_err(|e| format!("create version dir: {e}"))?;
-    extract_binary(&buf, &dest)?;
+    match kind {
+        CoreKind::SingBox => extract_binary_targz(&buf, &dest, kind.bin_name())?,
+        CoreKind::Xray => extract_binary_zip(&buf, &dest, kind.bin_name())?,
+    }
     Ok(())
 }
 
@@ -386,122 +463,142 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hasher.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Pull the `sing-box` binary out of the release tarball and write it to `dest`.
-fn extract_binary(tar_gz: &[u8], dest: &PathBuf) -> Result<(), String> {
+fn set_exec(dest: &PathBuf) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o755));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dest;
+    }
+}
+
+/// Pull `member` out of a .tar.gz and write it to `dest`.
+fn extract_binary_targz(tar_gz: &[u8], dest: &PathBuf, member: &str) -> Result<(), String> {
     use flate2::read::GzDecoder;
     let mut archive = tar::Archive::new(GzDecoder::new(tar_gz));
     let entries = archive.entries().map_err(|e| format!("tar: {e}"))?;
     for entry in entries {
         let mut entry = entry.map_err(|e| format!("tar entry: {e}"))?;
         let path = entry.path().map_err(|e| format!("tar path: {e}"))?;
-        let is_bin = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(|n| n == binary_name())
-            .unwrap_or(false);
+        let is_bin = path.file_name().and_then(|n| n.to_str()).map(|n| n == member).unwrap_or(false);
         if is_bin {
             entry.unpack(dest).map_err(|e| format!("unpack: {e}"))?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o755));
-            }
+            set_exec(dest);
             return Ok(());
         }
     }
-    Err("sing-box binary not found in archive".to_string())
+    Err(format!("{member} not found in archive"))
 }
 
-// --- helper sync -----------------------------------------------------------
-
-/// After activating a version, push the binary to the helper so TUN mode
-/// (which runs sing-box as root via the helper) uses the same version. The
-/// helper accepts a path inside the user's app-data dir and copies it to its
-/// fixed root-owned location.
-fn sync_helper(app: &AppHandle) -> Result<(), String> {
-    use crate::vpn::helper_install_core;
-    let bin = binary_path(app)?;
-    helper_install_core(bin)
+/// Pull `member` out of a .zip and write it to `dest`.
+fn extract_binary_zip(zip_bytes: &[u8], dest: &PathBuf, member: &str) -> Result<(), String> {
+    use std::io::{Cursor, Read, Write};
+    let mut archive =
+        zip::ZipArchive::new(Cursor::new(zip_bytes)).map_err(|e| format!("zip open: {e}"))?;
+    for i in 0..archive.len() {
+        let mut file = archive.by_index(i).map_err(|e| format!("zip entry: {e}"))?;
+        let name = file.name().rsplit('/').next().unwrap_or("").to_string();
+        if name == member {
+            let mut out = std::fs::File::create(dest).map_err(|e| format!("create binary: {e}"))?;
+            let mut chunk = [0u8; 65536];
+            loop {
+                let n = file.read(&mut chunk).map_err(|e| format!("zip read: {e}"))?;
+                if n == 0 {
+                    break;
+                }
+                out.write_all(&chunk[..n]).map_err(|e| format!("write binary: {e}"))?;
+            }
+            drop(out);
+            set_exec(dest);
+            return Ok(());
+        }
+    }
+    Err(format!("{member} not found in archive"))
 }
 
 // --- public API ------------------------------------------------------------
 
 #[tauri::command]
-pub async fn core_info(app: AppHandle) -> CoreInfo {
-    let active = active_tag(&app);
-    let installed: Vec<InstalledVersion> = installed_tags(&app)
+pub async fn core_info(app: AppHandle, kind: String) -> Result<CoreInfo, String> {
+    let kind = CoreKind::parse(&kind)?;
+    let active = active_tag(&app, kind);
+    let installed: Vec<InstalledVersion> = installed_tags(&app, kind)
         .into_iter()
         .map(|tag| InstalledVersion {
             active: active.as_deref() == Some(tag.as_str()),
             tag,
         })
         .collect();
-    let latest = latest_version().await.ok();
+    let latest = latest_version(kind).await.ok();
     let has_update = match (&active, &latest) {
         (_, None) => false,
         (None, Some(_)) => true,
         (Some(a), Some(l)) => version_cmp(l, a) == std::cmp::Ordering::Greater,
     };
-    CoreInfo { installed, active, latest, has_update }
+    Ok(CoreInfo { installed, active, latest, has_update })
 }
 
-/// Download `version` (or the latest release when null) into the per-tag cache.
-/// If nothing is active yet, automatically activate the new version. Emits
-/// `core://progress` while downloading. Returns the installed tag.
+/// Download `version` (or latest when null) for `kind`. First install for a
+/// kind auto-activates it. sing-box installs trigger a setcap prompt (TUN
+/// needs CAP_NET_ADMIN); xray needs no caps.
 #[tauri::command]
-pub async fn core_install(app: AppHandle, version: Option<String>) -> Result<String, String> {
+pub async fn core_install(app: AppHandle, kind: String, version: Option<String>) -> Result<String, String> {
+    let kind = CoreKind::parse(&kind)?;
     let release = match version {
-        Some(t) => fetch_release_by_tag(&t).await?,
-        None => fetch_latest_release().await?,
+        Some(t) => fetch_release_by_tag(kind, &t).await?,
+        None => fetch_latest_release(kind).await?,
     };
     let tag = version_from_tag(&release).ok_or("no version in release")?;
 
-    download_and_install(&app, &tag, &release).await?;
+    download_and_install(&app, kind, &tag, &release).await?;
 
-    // First-install convenience: if nothing was active, make this one active
-    // (and sync it to the helper) so the user can immediately connect.
-    if active_tag(&app).is_none() {
-        write_active(&app, &tag)?;
-        let _ = sync_helper(&app);
-    } else if active_tag(&app).as_deref() == Some(tag.as_str()) {
-        // Re-install of the currently active version: refresh the helper copy.
-        let _ = sync_helper(&app);
+    let became_active = if active_tag(&app, kind).is_none() {
+        write_active(&app, kind, &tag)?;
+        true
+    } else {
+        active_tag(&app, kind).as_deref() == Some(tag.as_str())
+    };
+    // File capabilities are cleared whenever the binary is (re)written, so the
+    // active sing-box must be re-capped after any download of the active tag.
+    if became_active && kind == CoreKind::SingBox {
+        let app2 = app.clone();
+        let _ = tokio::task::spawn_blocking(move || crate::vpn::request_setcap_blocking(&app2)).await;
     }
     Ok(tag)
 }
 
-/// Switch the active version to `tag` (must already be downloaded) and push
-/// the binary to the helper so TUN mode picks it up.
+/// Switch the active version for `kind`. Re-cap sing-box afterwards.
 #[tauri::command]
-pub async fn core_activate(app: AppHandle, tag: String) -> Result<(), String> {
-    let bin = version_binary(&app, &tag)?;
+pub async fn core_activate(app: AppHandle, kind: String, tag: String) -> Result<(), String> {
+    let kind = CoreKind::parse(&kind)?;
+    let bin = version_binary(&app, kind, &tag)?;
     if !bin.exists() {
         return Err(format!("version {tag} isn't downloaded"));
     }
-    write_active(&app, &tag)?;
-    // Best-effort helper sync — when the helper isn't installed yet, proxy
-    // mode still works; activation succeeds either way.
-    let _ = sync_helper(&app);
+    write_active(&app, kind, &tag)?;
+    if kind == CoreKind::SingBox {
+        let app2 = app.clone();
+        let _ = tokio::task::spawn_blocking(move || crate::vpn::request_setcap_blocking(&app2)).await;
+    }
     Ok(())
 }
 
-/// Delete a cached version. Deleting the active one is allowed: callers are
-/// expected to disconnect first (the frontend does), and we clear active.txt
-/// so the next connect attempt errors clearly with "no core installed".
 #[tauri::command]
-pub async fn core_uninstall(app: AppHandle, tag: String) -> Result<(), String> {
-    let was_active = active_tag(&app).as_deref() == Some(strip_v(&tag));
-    let dir = versions_dir(&app)?.join(strip_v(&tag));
+pub async fn core_uninstall(app: AppHandle, kind: String, tag: String) -> Result<(), String> {
+    let kind = CoreKind::parse(&kind)?;
+    let was_active = active_tag(&app, kind).as_deref() == Some(strip_v(&tag));
+    let dir = versions_dir(&app, kind)?.join(strip_v(&tag));
     if dir.exists() {
         std::fs::remove_dir_all(&dir).map_err(|e| format!("remove version dir: {e}"))?;
     }
     if was_active {
-        let _ = clear_active(&app);
+        let _ = clear_active(&app, kind);
     }
-    // If somehow we end up with nothing installed at all, clear the marker
-    // defensively so core_info() reports a clean "no core" state.
-    if installed_tags(&app).is_empty() {
-        let _ = clear_active(&app);
+    if installed_tags(&app, kind).is_empty() {
+        let _ = clear_active(&app, kind);
     }
     Ok(())
 }

@@ -4,29 +4,30 @@
   import { page } from "$app/state";
   import { NAV } from "$lib/nav";
   import { t } from "$lib/i18n.svelte";
-  import { core } from "$lib/core.svelte";
+  import { core, xrayCore } from "$lib/core.svelte";
   import { conn } from "$lib/conn.svelte";
   import { subs } from "$lib/subs.svelte";
   import { split } from "$lib/split.svelte";
   import { settings } from "$lib/settings.svelte";
-  import { readLegacyStorage, helperInstalled, installHelper } from "$lib/api";
+  import { readLegacyStorage, capsGranted, grantCaps } from "$lib/api";
   import "$lib/theme.svelte"; // module-level init applies persisted theme
 
-  /** Trigger the privileged helper install (pkexec prompt) on the very first
-   *  launch, once the core is ready. Tracked via localStorage so we don't
-   *  prompt every time — the user can always do it manually in Settings. */
-  async function maybeAutoInstallHelper() {
+  /** Grant network capabilities (one pkexec prompt) on the very first launch,
+   *  once the cores are ready. Also removes the legacy root helper if present.
+   *  Tracked via localStorage so we don't prompt every time — the user can
+   *  always do it manually in Settings. */
+  async function maybeGrantCaps() {
     if (typeof window === "undefined") return;
-    if (localStorage.getItem("aegisvpn.helperAutoTried") === "1") return;
+    if (localStorage.getItem("aegisvpn.capsAutoTried") === "1") return;
     try {
-      if (await helperInstalled()) {
-        localStorage.setItem("aegisvpn.helperAutoTried", "1");
+      if (await capsGranted()) {
+        localStorage.setItem("aegisvpn.capsAutoTried", "1");
         return;
       }
-      localStorage.setItem("aegisvpn.helperAutoTried", "1");
-      await installHelper();
+      localStorage.setItem("aegisvpn.capsAutoTried", "1");
+      await grantCaps();
     } catch (e) {
-      console.warn("[helper] auto-install:", e);
+      console.warn("[caps] auto-grant:", e);
     }
   }
 
@@ -63,8 +64,11 @@
   // (auto), then prompt for the privileged helper (once).
   onMount(async () => {
     await migrateLegacyStorage();
+    // Both cores are required for the hybrid: sing-box (TUN) + xray (transport).
     await core.autoInit();
-    await maybeAutoInstallHelper();
+    await xrayCore.autoInit();
+    // Grant caps last (needs sing-box on disk) — also migrates off the old helper.
+    await maybeGrantCaps();
   });
 
   // Reflect the real VPN state on launch: if the helper still runs sing-box

@@ -97,27 +97,29 @@ export interface CoreInfo {
   has_update: boolean;
 }
 
-/** Installed/active vs latest sing-box core version (queries GitHub releases). */
-export function coreInfo(): Promise<CoreInfo> {
-  return invoke<CoreInfo>("core_info");
+/** Which core: "singbox" (TUN + routing) or "xray" (XHTTP/Reality transport). */
+export type CoreKind = "singbox" | "xray";
+
+/** Installed/active vs latest core version (queries GitHub releases). */
+export function coreInfo(kind: CoreKind): Promise<CoreInfo> {
+  return invoke<CoreInfo>("core_info", { kind });
 }
 
-/** Download a specific sing-box version (or latest when `version` is null)
- *  into the local cache. Emits `core://progress` events while running.
- *  First-install case auto-activates the new version. */
-export function coreInstall(version: string | null = null): Promise<string> {
-  return invoke<string>("core_install", { version });
+/** Download a specific version (or latest when `version` is null) into the
+ *  local cache. Emits `core://progress` events. First install for a kind
+ *  auto-activates it; sing-box installs trigger a setcap prompt. */
+export function coreInstall(kind: CoreKind, version: string | null = null): Promise<string> {
+  return invoke<string>("core_install", { kind, version });
 }
 
-/** Switch the active version to one that's already downloaded; pushes the
- *  binary to the privileged helper so TUN mode picks it up too. */
-export function coreActivate(tag: string): Promise<void> {
-  return invoke<void>("core_activate", { tag });
+/** Switch the active version for a kind (must already be downloaded). */
+export function coreActivate(kind: CoreKind, tag: string): Promise<void> {
+  return invoke<void>("core_activate", { kind, tag });
 }
 
-/** Delete a cached version from disk. Refuses to delete the active one. */
-export function coreUninstall(tag: string): Promise<void> {
-  return invoke<void>("core_uninstall", { tag });
+/** Delete a cached version from disk. */
+export function coreUninstall(kind: CoreKind, tag: string): Promise<void> {
+  return invoke<void>("core_uninstall", { kind, tag });
 }
 
 export interface CoreRelease {
@@ -127,9 +129,9 @@ export interface CoreRelease {
   prerelease: boolean;
 }
 
-/** Recent sing-box releases (newest first) for the version picker. */
-export function listCoreReleases(): Promise<CoreRelease[]> {
-  return invoke<CoreRelease[]>("list_core_releases");
+/** Recent releases (newest first) for the version picker. */
+export function listCoreReleases(kind: CoreKind): Promise<CoreRelease[]> {
+  return invoke<CoreRelease[]>("list_core_releases", { kind });
 }
 
 export interface CoreProgress {
@@ -180,14 +182,16 @@ export function vpnStatus(): Promise<HelperResponse> {
   return invoke<HelperResponse>("vpn_status");
 }
 
-/** Whether the privileged helper is installed and reachable. */
-export function helperInstalled(): Promise<boolean> {
-  return invoke<boolean>("helper_installed");
+/** Whether the cores have the network capabilities they need (sing-box has
+ *  cap_net_admin). Replaces the old root-helper check. */
+export function capsGranted(): Promise<boolean> {
+  return invoke<boolean>("caps_granted");
 }
 
-/** Install the privileged helper via a one-time pkexec (polkit) prompt. */
-export function installHelper(): Promise<void> {
-  return invoke<void>("install_helper");
+/** Grant network permissions (setcap via one pkexec prompt). Also removes the
+ *  legacy root helper if present. Replaces installHelper. */
+export function grantCaps(): Promise<void> {
+  return invoke<void>("grant_caps");
 }
 
 /** TCP-connect RTT to host:port in ms. Source-bound to the user's physical

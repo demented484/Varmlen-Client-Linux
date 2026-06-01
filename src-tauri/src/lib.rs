@@ -4,6 +4,7 @@ mod singbox;
 mod storage;
 mod subscription;
 mod vpn;
+mod xray;
 
 use std::time::Duration;
 
@@ -111,11 +112,12 @@ pub fn run() {
             core::core_uninstall,
             core::list_core_releases,
             singbox::generate_singbox_config,
+            xray::generate_xray_config,
             vpn::vpn_connect,
             vpn::vpn_disconnect,
             vpn::vpn_status,
-            vpn::helper_installed,
-            vpn::install_helper,
+            vpn::caps_granted,
+            vpn::grant_caps,
             vpn::tcp_ping_host,
             storage::read_legacy_storage
         ])
@@ -138,7 +140,7 @@ pub fn run() {
                 // Run on Tauri's tokio pool — vpn_disconnect is async now
                 // and we need a runtime context to await it.
                 tauri::async_runtime::spawn(async move {
-                    let _ = vpn::vpn_disconnect().await;
+                    let _ = vpn::vpn_disconnect(app.clone()).await;
                     // Beat so the tunnel is fully torn down before the next
                     // launch, not still mid-teardown.
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;

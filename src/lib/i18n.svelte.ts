@@ -94,8 +94,8 @@ const EN: Dict = {
   "settings.vpnMode": "VPN mode",
   "mode.tun": "TUN (system-wide)",
   "mode.proxy": "Proxy (SOCKS/HTTP)",
-  "mode.tunSub": "Routes every app. Needs the system helper.",
-  "mode.proxySub": "Local proxy at 127.0.0.1:2080 — no root. Point your apps/system at it.",
+  "mode.tunSub": "Routes every app. Needs network permissions.",
+  "mode.proxySub": "Local proxy at 127.0.0.1:2081 — no root. Point your apps/system at it.",
 
   // VPN core (sing-box)
   "settings.core": "VPN core",
@@ -109,7 +109,7 @@ const EN: Dict = {
   "core.update": "Update",
   "core.updating": "Downloading…",
   "core.versions": "Versions",
-  "core.versionsTitle": "sing-box versions",
+  "core.versionsTitle": "Core versions",
   "core.preview": "pre-release",
   "core.currentlyInstalled": "currently installed",
   "core.active": "Active",
@@ -118,15 +118,15 @@ const EN: Dict = {
   "core.reinstall": "Re-download",
   "core.delete": "Delete",
 
-  // Privileged helper
-  "settings.helper": "System helper",
-  "helper.title": "Helper service",
-  "helper.ready": "Installed and running",
-  "helper.notInstalled": "Not installed — required to connect",
+  // Network permissions (setcap on the cores; no root daemon)
+  "settings.helper": "Network permissions",
+  "helper.title": "Network permissions",
+  "helper.ready": "Granted",
+  "helper.notInstalled": "Not granted — required for TUN mode",
   "helper.checking": "Checking…",
-  "helper.install": "Set up",
-  "helper.reinstall": "Reinstall",
-  "helper.installing": "Installing…",
+  "helper.install": "Grant",
+  "helper.reinstall": "Re-grant",
+  "helper.installing": "Granting…",
 };
 
 const RU: Dict = {
@@ -208,8 +208,8 @@ const RU: Dict = {
   "settings.vpnMode": "Режим VPN",
   "mode.tun": "TUN (всё устройство)",
   "mode.proxy": "Прокси (SOCKS/HTTP)",
-  "mode.tunSub": "Весь трафик системы. Нужен системный хелпер.",
-  "mode.proxySub": "Локальный прокси 127.0.0.1:2080 — без root. Укажи его в приложениях/системе.",
+  "mode.tunSub": "Весь трафик системы. Нужны сетевые права.",
+  "mode.proxySub": "Локальный прокси 127.0.0.1:2081 — без root. Укажи его в приложениях/системе.",
 
   "settings.core": "Ядро VPN",
   "core.checking": "Проверка обновлений…",
@@ -222,7 +222,7 @@ const RU: Dict = {
   "core.update": "Обновить",
   "core.updating": "Загрузка…",
   "core.versions": "Версии",
-  "core.versionsTitle": "Версии sing-box",
+  "core.versionsTitle": "Версии ядра",
   "core.preview": "пре-релиз",
   "core.currentlyInstalled": "сейчас установлена",
   "core.active": "Активна",
@@ -231,14 +231,14 @@ const RU: Dict = {
   "core.reinstall": "Перекачать",
   "core.delete": "Удалить",
 
-  "settings.helper": "Системный хелпер",
-  "helper.title": "Служба-хелпер",
-  "helper.ready": "Установлен и работает",
-  "helper.notInstalled": "Не установлен — нужен для подключения",
+  "settings.helper": "Сетевые права",
+  "helper.title": "Сетевые права",
+  "helper.ready": "Выданы",
+  "helper.notInstalled": "Не выданы — нужны для режима TUN",
   "helper.checking": "Проверка…",
-  "helper.install": "Установить",
-  "helper.reinstall": "Переустановить",
-  "helper.installing": "Установка…",
+  "helper.install": "Выдать",
+  "helper.reinstall": "Выдать заново",
+  "helper.installing": "Выдача…",
 };
 
 const DICTS: Record<Lang, Dict> = { en: EN, ru: RU };
