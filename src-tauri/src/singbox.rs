@@ -129,11 +129,15 @@ pub fn build_config(_server: &VlessServer, split: &SplitInput, mode: &str, allow
     let proxy_mode = mode == "proxy";
     let (split_rules, final_out) = build_route_rules(split);
 
-    // Canonical route rule order: sniff → DNS hijack (TUN only) → optionally
-    // keep private/LAN traffic direct (per the "Allow LAN" toggle) → split.
+    // Canonical route rule order: sniff → DNS hijack (TUN only) → xray bypass
+    // → optionally keep private/LAN traffic direct → split.
     let mut rules = vec![json!({ "action": "sniff" })];
     if !proxy_mode {
         rules.push(json!({ "protocol": "dns", "action": "hijack-dns" }));
+        // xray is sing-box's upstream transport; its own connections to the
+        // remote VLESS server must bypass the TUN or they loop back through
+        // sing-box → xray → sing-box indefinitely.
+        rules.push(json!({ "process_name": ["xray"], "outbound": "direct" }));
     }
     if allow_lan {
         rules.push(json!({ "ip_is_private": true, "outbound": "direct" }));
@@ -145,13 +149,18 @@ pub fn build_config(_server: &VlessServer, split: &SplitInput, mode: &str, allow
         // Anti-leak DNS: every app query is hijacked into sing-box's DNS module
         // and resolved via `remote` (DoH 1.1.1.1, detoured through the proxy →
         // xray → tunnel), so it egresses from the VPN node, never the ISP/RU
-        // resolver. `local` exists ONLY as a bootstrap and is never the `final`
-        // for app traffic. No `default_domain_resolver` — servers are IP
-        // literals (xray dials them), so nothing needs off-tunnel resolution.
+        // resolver. `local` exists ONLY as a bootstrap. `default_domain_resolver`
+        // must point at `remote` (1.12+ requires it on all outbound dial fields);
+        // our outbounds only dial IP literals so it is never actually consulted.
         "dns": {
             "servers": [
-                { "type": "https", "tag": "remote", "server": "1.1.1.1", "detour": "proxy" },
-                { "type": "udp", "tag": "local", "server": "1.1.1.1" }
+                {
+                    "type": "https", "tag": "remote", "server": "1.1.1.1",
+                    "detour": "proxy",
+                },
+                {
+                    "type": "udp", "tag": "local", "server": "1.1.1.1",
+                },
             ],
             "final": "remote",
             "strategy": "prefer_ipv4"
@@ -164,7 +173,10 @@ pub fn build_config(_server: &VlessServer, split: &SplitInput, mode: &str, allow
         "route": {
             "rules": rules,
             "final": final_out,
-            "auto_detect_interface": true
+            "auto_detect_interface": true,
+            // 1.12+ requires a default resolver for outbound dial fields.
+            // Our outbounds only dial IP literals, but this field is mandatory.
+            "default_domain_resolver": "remote",
         }
     })
 }
@@ -210,13 +222,14 @@ mod tests {
     }
 
     #[test]
-    fn dns_has_no_offtunnel_default_resolver() {
-        // DNS-leak guard: `final` is the proxied DoH resolver and there's no
-        // default_domain_resolver pointing at plaintext `local`.
+    fn dns_routes_through_proxy_no_leak() {
+        // DNS-leak guard: `final` must be the proxied DoH resolver, never `local`.
+        // `route.default_domain_resolver` is `remote` (1.12+ mandatory field) —
+        // safe because our outbounds dial IP literals, so it is never consulted.
         let s = parse_proxy_uri("vless://u@1.2.3.4:443?type=xhttp&security=reality&pbk=K#X").unwrap();
         let cfg = build_config(&s, &split(), "tun", true);
         assert_eq!(cfg["dns"]["final"], "remote");
-        assert!(cfg["route"].get("default_domain_resolver").is_none());
+        assert_eq!(cfg["route"]["default_domain_resolver"], "remote");
     }
 
     #[test]

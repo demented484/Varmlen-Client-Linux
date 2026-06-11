@@ -272,12 +272,18 @@ fn spawn_core(bin: &PathBuf, cfg_path: &PathBuf) -> Result<Child, String> {
         }
         return Err(last_error_line(&err));
     }
-    // Drain stderr to the journal so the pipe never fills.
+    // Drain stderr to a log file + journal so the pipe never fills.
+    let log_path = cfg_path.with_extension("log");
     if let Some(stderr) = child.stderr.take() {
         std::thread::spawn(move || {
-            use std::io::{BufRead, BufReader};
+            use std::io::{BufRead, BufReader, Write};
+            let mut f = std::fs::OpenOptions::new()
+                .create(true).append(true).open(&log_path).ok();
             for line in BufReader::new(stderr).lines().map_while(Result::ok) {
                 eprintln!("core: {line}");
+                if let Some(ref mut file) = f {
+                    let _ = writeln!(file, "{line}");
+                }
             }
         });
     }
