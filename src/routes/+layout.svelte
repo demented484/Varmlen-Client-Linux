@@ -75,6 +75,10 @@
   // "disconnected".
   onMount(() => void conn.refresh());
 
+  // Auto-refresh subscriptions on their server-advertised interval (the UI
+  // shows "auto-update Nh"); checks on launch and periodically thereafter.
+  onMount(() => subs.startAutoRefresh());
+
   // Live-reconnect when the config changes (location / split / mode / settings)
   // while connected. Reading these here registers them as effect dependencies.
   $effect(() => {

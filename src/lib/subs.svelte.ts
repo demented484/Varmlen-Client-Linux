@@ -170,6 +170,9 @@ class SubsStore {
   selectedServerId = $state<string | null>(_initialSubs.selectedServerId);
   importing = $state(false);
 
+  private autoRefreshStarted = false;
+  private autoRefreshTimer: ReturnType<typeof setInterval> | null = null;
+
   private persist(): void {
     if (!browser) return;
     localStorage.setItem(
@@ -342,6 +345,35 @@ class SubsStore {
       this.list = this.list.map((s) =>
         s.id === subId ? { ...s, refreshing: false } : s,
       );
+    }
+  }
+
+  /** Start the background auto-refresh loop: each subscription is re-fetched
+   *  once its server-advertised interval has elapsed since the last update
+   *  (`importedAt` is bumped on every successful refresh, so it survives
+   *  restarts). Safe to call once on app start — checks immediately, then every
+   *  few minutes so long-running sessions pick up due refreshes. Idempotent. */
+  startAutoRefresh(): void {
+    if (this.autoRefreshStarted) return;
+    this.autoRefreshStarted = true;
+    const check = () => void this.refreshDue();
+    check();
+    this.autoRefreshTimer = setInterval(check, 5 * 60 * 1000);
+  }
+
+  /** Refresh every subscription whose update interval has elapsed. */
+  private async refreshDue(): Promise<void> {
+    const now = Date.now();
+    const due = this.list.filter((s) => {
+      if (!s.updateIntervalHours || s.updateIntervalHours <= 0) return false;
+      if (s.refreshing) return false;
+      const last = Date.parse(s.importedAt);
+      if (Number.isNaN(last)) return true; // unknown last-update → refresh now
+      return now - last >= s.updateIntervalHours * 3_600_000;
+    });
+    // Sequential so we don't hammer the panel when several are due at once.
+    for (const s of due) {
+      await this.refresh(s.id);
     }
   }
 
