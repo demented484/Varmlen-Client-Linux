@@ -6,9 +6,11 @@ import {
   formatBytes,
   formatExpires,
   tcpPingHost,
+  proxyGetPing,
   type ImportResult,
   type VlessServer,
 } from "$lib/api";
+import { settings, type PingMethod } from "$lib/settings.svelte";
 
 /** Ping result for a server entry. `null` = unknown / not yet measured,
  *  `"pinging"` = probe in flight, `"timeout"` = host unreachable / timed out,
@@ -46,6 +48,8 @@ export interface Subscription {
   webPageUrl: string | null;
   servers: ServerEntry[];
   collapsed: boolean;
+  /** Pinned subscriptions sort to the top of the list. */
+  pinned: boolean;
   /** True while refresh() is in flight. Not persisted. */
   refreshing?: boolean;
 }
@@ -55,7 +59,7 @@ interface Persisted {
   selectedServerId: string | null;
 }
 
-const KEY = "aegisvpn.subs";
+const KEY = "varmlen.subs";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -67,6 +71,9 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 function migrateIds(subs: Subscription[]): { subs: Subscription[]; remapped: Record<string, string> } {
   const remapped: Record<string, string> = {};
   for (const sub of subs) {
+    // Drop balancer/auto-select sentinels (host "balancer.host") — they aren't
+    // connectable servers; the backend also rejects them at parse time now.
+    sub.servers = sub.servers.filter((srv) => srv.raw?.host !== "balancer.host");
     for (const srv of sub.servers) {
       if (!srv.id || !UUID_RE.test(srv.id)) {
         const fresh = crypto.randomUUID();
@@ -86,6 +93,7 @@ function migrateIds(subs: Subscription[]): { subs: Subscription[]; remapped: Rec
     }
     if (sub.description === undefined) sub.description = null;
     if (sub.webPageUrl === undefined) sub.webPageUrl = null;
+    if (sub.pinned === undefined) sub.pinned = false;
     if (sub.refreshing) sub.refreshing = false;
   }
   return { subs, remapped };
@@ -215,6 +223,22 @@ class SubsStore {
     ) {
       this.selectedServerId = null;
     }
+    this.prunePings();
+    this.persist();
+  }
+
+  /** Pinned subscriptions first, otherwise insertion order (Array.sort is
+   *  stable, so unpinned entries keep their relative order). */
+  get ordered(): Subscription[] {
+    return [...this.list].sort((a, b) => Number(b.pinned) - Number(a.pinned));
+  }
+
+  togglePin(subId: string): void {
+    // Only one subscription may be pinned: pinning one unpins every other.
+    const willPin = !this.list.find((s) => s.id === subId)?.pinned;
+    this.list = this.list.map((s) =>
+      s.id === subId ? { ...s, pinned: willPin } : { ...s, pinned: false },
+    );
     this.persist();
   }
 
@@ -258,15 +282,13 @@ class SubsStore {
         webPageUrl: result.meta.web_page_url,
         servers,
         collapsed: false,
+        pinned: false,
       };
       this.list = [...this.list, sub];
       if (!this.selectedServerId && servers.length > 0) {
         this.selectedServerId = servers[0].id;
       }
       this.persist();
-      // Kick a ping pass for the new servers so the UI doesn't sit on "–"
-      // until the user opens it. Intentionally not awaited.
-      void Promise.all(servers.map((srv) => this.pingServer(srv)));
     } finally {
       this.importing = false;
     }
@@ -312,9 +334,9 @@ class SubsStore {
           : s,
       );
       this.persist();
-      // The old server IDs were just dropped (new ones are random), so the
-      // old `pings` entries are dead weight — refresh them.
-      void Promise.all(freshServers.map((srv) => this.pingServer(srv)));
+      // The old server IDs were just dropped (new ones are random) — drop their
+      // now-dead ping entries.
+      this.prunePings();
     } catch (e) {
       console.error("refresh failed:", e);
       this.list = this.list.map((s) =>
@@ -332,35 +354,73 @@ class SubsStore {
     this.persist();
   }
 
-  // Ephemeral per-server ping state. Not persisted — we re-measure on app
-  // start and on subscription refresh, mirroring what Happ does on open.
+  // Ephemeral per-server ping state. Not persisted, and never measured
+  // automatically — the user triggers pings explicitly via the ping button.
   pings = $state<Record<string, PingState>>({});
 
-  /** Probe one server. Updates `pings[id]` in place; never throws. */
-  async pingServer(srv: ServerEntry): Promise<void> {
+  /** Drop ping entries for servers that no longer exist — refresh() replaces a
+   *  sub's server IDs and remove() deletes a sub, so without this `pings` would
+   *  accumulate dead keys over a session. */
+  private prunePings(): void {
+    const live = new Set(this.list.flatMap((s) => s.servers).map((s) => s.id));
+    const pruned: Record<string, PingState> = {};
+    for (const id of Object.keys(this.pings)) {
+      if (live.has(id)) pruned[id] = this.pings[id];
+    }
+    this.pings = pruned;
+  }
+
+  /** Probe one server with the user's chosen method (TCP or via-proxy real
+   *  delay). Updates `pings[id]` in place; never throws. */
+  async pingServer(srv: ServerEntry, method: PingMethod = settings.pingMethod): Promise<void> {
     this.pings = { ...this.pings, [srv.id]: "pinging" };
     try {
-      const rtt = await tcpPingHost(srv.raw.host, srv.raw.port, 2500);
+      const rtt =
+        method === "proxy"
+          ? await proxyGetPing(srv.raw, 5000)
+          : await tcpPingHost(srv.raw.host, srv.raw.port, 2500);
       this.pings = { ...this.pings, [srv.id]: rtt };
     } catch {
       this.pings = { ...this.pings, [srv.id]: "timeout" };
     }
   }
 
-  /** Probe every server across every subscription in parallel. Safe to call
-   *  while one is already in flight; the in-flight ones just get overwritten
-   *  with fresh values. */
-  async pingAll(): Promise<void> {
-    const all: ServerEntry[] = this.list.flatMap((s) => s.servers);
-    await Promise.all(all.map((srv) => this.pingServer(srv)));
+  /** Probe a batch with bounded concurrency. Proxy pings each spin a throwaway
+   *  xray, so they run far fewer at a time than the cheap TCP probes. The
+   *  method is captured once so a mid-batch settings change stays consistent. */
+  private async pingMany(servers: ServerEntry[]): Promise<void> {
+    const method = settings.pingMethod;
+    // TCP probes are cheap (a connect) so run them all but for a sanity cap.
+    // Proxy probes each spin a throwaway xray, so keep that more bounded.
+    const limit = method === "proxy" ? 8 : 32;
+    // Mark the whole batch in-flight up front so every old result clears at
+    // once, instead of one-by-one as the bounded-concurrency workers reach
+    // each server (the actual probing stays rate-limited below).
+    const next = { ...this.pings };
+    for (const s of servers) next[s.id] = "pinging";
+    this.pings = next;
+    let i = 0;
+    const worker = async () => {
+      while (i < servers.length) await this.pingServer(servers[i++], method);
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(limit, servers.length) }, worker),
+    );
   }
 
-  /** Probe every server inside a single subscription in parallel. Used by the
+  /** Probe every server across every subscription. Safe to call while one is
+   *  already in flight; the in-flight ones just get overwritten. */
+  async pingAll(): Promise<void> {
+    this.prunePings();
+    await this.pingMany(this.list.flatMap((s) => s.servers));
+  }
+
+  /** Probe every server inside a single subscription. Used by the
    *  per-subscription ping button. */
   async pingSub(subId: string): Promise<void> {
     const sub = this.list.find((s) => s.id === subId);
     if (!sub) return;
-    await Promise.all(sub.servers.map((srv) => this.pingServer(srv)));
+    await this.pingMany(sub.servers);
   }
 
   /** True iff at least one server in this subscription has an in-flight probe. */

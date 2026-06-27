@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Varmlen
+GenericName=VPN Client
+Comment=Varmlen — VLESS/Reality VPN client
+Icon=varmlen
+Exec=varmlen
+Terminal=false
+Categories=Network;Security;
+StartupWMClass=Varmlen

@@ -27,6 +27,16 @@ pub enum ParseError {
     MissingHost,
     #[error("missing port")]
     MissingPort,
+    #[error("auto-select / balancer entry — not a connectable server")]
+    BalancerEntry,
+}
+
+/// Some providers ship an "auto-select"/balancer entry as a sentinel host (e.g.
+/// borealisvpn's `balancer.host`) instead of a real server. The plain-vless
+/// subscription doesn't carry the balancer's member list, so these aren't
+/// connectable — we drop them rather than show a broken server.
+fn is_balancer_sentinel(host: &str) -> bool {
+    matches!(host.trim().to_ascii_lowercase().as_str(), "balancer.host")
 }
 
 fn default_protocol() -> String {
@@ -225,18 +235,23 @@ pub fn is_supported_uri(line: &str) -> bool {
 /// Parse any supported proxy URI, dispatching on its scheme.
 pub fn parse_proxy_uri(uri: &str) -> Result<VlessServer, ParseError> {
     let uri = uri.trim();
-    if uri.starts_with("vless://") {
-        parse_vless(uri)
+    let server = if uri.starts_with("vless://") {
+        parse_vless(uri)?
     } else if uri.starts_with("trojan://") {
-        parse_trojan(uri)
+        parse_trojan(uri)?
     } else if uri.starts_with("ss://") {
-        parse_shadowsocks(uri)
+        parse_shadowsocks(uri)?
     } else if uri.starts_with("vmess://") {
-        parse_vmess(uri)
+        parse_vmess(uri)?
     } else {
         let scheme = uri.split("://").next().unwrap_or(uri);
-        Err(ParseError::UnsupportedScheme(scheme.to_string()))
+        return Err(ParseError::UnsupportedScheme(scheme.to_string()));
+    };
+    // Drop balancer/auto-select sentinels — they aren't real, connectable servers.
+    if is_balancer_sentinel(&server.host) {
+        return Err(ParseError::BalancerEntry);
     }
+    Ok(server)
 }
 
 fn label_from(fragment: Option<&str>, host: &str, port: u16) -> String {
@@ -308,6 +323,11 @@ pub fn parse_trojan(uri: &str) -> Result<VlessServer, ParseError> {
     s.sni = params.get("sni").cloned();
     s.fingerprint = params.get("fp").cloned();
     s.path = params.get("path").cloned();
+    // Trojan can also run over REALITY/vision — capture those fields too.
+    s.public_key = params.get("pbk").cloned();
+    s.short_id = params.get("sid").cloned();
+    s.flow = params.get("flow").cloned();
+    s.mode = params.get("mode").cloned();
     s.raw_params = params;
     Ok(s)
 }
@@ -360,11 +380,15 @@ pub fn parse_vmess(uri: &str) -> Result<VlessServer, ParseError> {
     if host.is_empty() {
         return Err(ParseError::MissingHost);
     }
-    // port may be a number or a string.
+    // port may be a number or a string — validate the range instead of casting
+    // (a bare `as u16` silently wraps 65616 -> 80).
     let port: u16 = match v.get("port") {
-        Some(serde_json::Value::Number(n)) => n.as_u64().unwrap_or(0) as u16,
-        Some(serde_json::Value::String(st)) => st.parse().unwrap_or(0),
-        _ => 0,
+        Some(serde_json::Value::Number(n)) => n
+            .as_u64()
+            .filter(|p| (1..=65535).contains(p))
+            .ok_or(ParseError::MissingPort)? as u16,
+        Some(serde_json::Value::String(st)) => st.parse().map_err(|_| ParseError::MissingPort)?,
+        _ => return Err(ParseError::MissingPort),
     };
     if port == 0 {
         return Err(ParseError::MissingPort);
@@ -377,13 +401,51 @@ pub fn parse_vmess(uri: &str) -> Result<VlessServer, ParseError> {
 
     let mut s = VlessServer::base("vmess", host.clone(), port, ps.unwrap_or_else(|| format!("{host}:{port}")));
     s.uuid = uuid;
-    s.transport = v.get("net").and_then(|x| x.as_str()).unwrap_or("tcp").to_string();
+    let net = v.get("net").and_then(|x| x.as_str()).unwrap_or("tcp").to_string();
+    s.transport = net.clone();
     s.security = match v.get("tls").and_then(|x| x.as_str()) {
         Some("tls") => "tls".to_string(),
+        Some("reality") => "reality".to_string(),
         _ => "none".to_string(),
     };
     s.sni = v.get("sni").and_then(|x| x.as_str()).map(|s| s.to_string());
     s.path = v.get("path").and_then(|x| x.as_str()).map(|s| s.to_string());
+    s.fingerprint = v.get("fp").and_then(|x| x.as_str()).map(|s| s.to_string());
+
+    // vmess overloads its keys per transport. Mirror them into raw_params under
+    // the names the xray config generator reads, so ws/grpc/httpupgrade/h2 hosts
+    // and grpc serviceName aren't silently dropped.
+    let str_of = |k: &str| v.get(k).and_then(|x| x.as_str()).map(|s| s.to_string());
+    let mut raw: HashMap<String, String> = HashMap::new();
+    if let Some(h) = str_of("host").filter(|h| !h.is_empty()) {
+        raw.insert("host".into(), h);
+    }
+    if let Some(a) = str_of("alpn").filter(|a| !a.is_empty()) {
+        raw.insert("alpn".into(), a);
+    }
+    if let Some(scy) = str_of("scy").filter(|x| !x.is_empty()) {
+        raw.insert("scy".into(), scy);
+    }
+    // `aid` may be a number or a string.
+    if let Some(aid) = v.get("aid") {
+        match aid {
+            serde_json::Value::Number(n) => { raw.insert("aid".into(), n.to_string()); }
+            serde_json::Value::String(st) if !st.is_empty() => { raw.insert("aid".into(), st.clone()); }
+            _ => {}
+        }
+    }
+    // `type` is the header-obfs type for tcp/kcp, and the gRPC mode for grpc.
+    let header_type = str_of("type").filter(|t| !t.is_empty() && t != "none");
+    if net == "grpc" {
+        // grpc encodes serviceName in `path`; `type` carries multi/gun mode.
+        if let Some(p) = s.path.take().filter(|p| !p.is_empty()) {
+            raw.insert("serviceName".into(), p);
+        }
+        s.mode = header_type;
+    } else if let Some(ht) = header_type {
+        raw.insert("headerType".into(), ht);
+    }
+    s.raw_params = raw;
     Ok(s)
 }
 
@@ -552,6 +614,28 @@ mod tests {
     }
 
     #[test]
+    fn drops_balancer_sentinel() {
+        // borealisvpn-style auto-select entry: a sentinel host, not a real server.
+        let uri = "vless://0eeff936-aa72-4e11-a18a-d3e996f1f37b@balancer.host:443?type=tcp&security=reality&sni=api-maps.yandex.ru&pbk=ABC&sid=DEAD&flow=xtls-rprx-vision#LTE";
+        assert!(matches!(parse_proxy_uri(uri), Err(ParseError::BalancerEntry)));
+        // ...and it's silently skipped during a subscription import.
+        let body = format!("vless://a@h-a:443?type=tcp&security=reality#Real\n{uri}");
+        assert_eq!(parse_subscription(&body).len(), 1);
+    }
+
+    #[test]
+    fn vmess_rejects_out_of_range_port() {
+        use base64::Engine as _;
+        // A numeric port above u16 must be rejected, not wrapped (65616 -> 80).
+        let json = r#"{"v":"2","add":"1.2.3.4","port":65616,"id":"3f7e7d8c-1234-5678-9abc-def012345678","aid":"0","net":"tcp"}"#;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(json);
+        assert!(matches!(
+            parse_vmess(&format!("vmess://{b64}")),
+            Err(ParseError::MissingPort)
+        ));
+    }
+
+    #[test]
     fn parses_plaintext_subscription() {
         let body = "# c\nvless://a@h-a:443?type=tcp&security=reality#A\nvless://b@h-b:443?type=xhttp&security=reality#B\ngarbage";
         let v = parse_subscription(body);
@@ -654,13 +738,13 @@ mod tests {
     #[test]
     fn parses_meta_headers() {
         let m = parse_headers(|name| match name {
-            "profile-title" => Some("AegisVPN".into()),
+            "profile-title" => Some("Varmlen".into()),
             "profile-update-interval" => Some("12".into()),
             "subscription-userinfo" => Some("upload=10; download=200; total=1099511627776; expire=1781461695".into()),
             "support-url" => Some("https://t.me/x_bot".into()),
             _ => None,
         });
-        assert_eq!(m.title.as_deref(), Some("AegisVPN"));
+        assert_eq!(m.title.as_deref(), Some("Varmlen"));
         assert_eq!(m.update_interval_hours, Some(12));
         assert_eq!(m.upload_bytes, Some(10));
         assert_eq!(m.download_bytes, Some(200));
@@ -689,9 +773,9 @@ mod tests {
     #[test]
     fn plain_title_is_left_untouched() {
         let m = parse_headers(|name| match name {
-            "profile-title" => Some("AegisVPN".into()),
+            "profile-title" => Some("Varmlen".into()),
             _ => None,
         });
-        assert_eq!(m.title.as_deref(), Some("AegisVPN"));
+        assert_eq!(m.title.as_deref(), Some("Varmlen"));
     }
 }

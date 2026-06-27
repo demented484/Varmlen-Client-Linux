@@ -1,7 +1,7 @@
 import { browser } from "$app/environment";
 
 export type Lang = "en" | "ru";
-const KEY = "aegisvpn.lang";
+const KEY = "varmlen.lang";
 
 type Dict = Record<string, string>;
 
@@ -15,7 +15,11 @@ const EN: Dict = {
   "status.disconnected": "Not connected",
   "status.connecting": "Connecting",
   "status.connected": "Connected",
+  "status.dropped": "VPN dropped — traffic blocked",
   "conn.selectLocation": "Select a location first",
+  "conn.dropped": "Connection lost. The kill switch is blocking all traffic. Reconnect, or allow traffic below.",
+  "conn.droppedNoKill": "Connection lost.",
+  "conn.allowTraffic": "Disconnect & allow traffic",
   "home.empty": "No subscriptions yet. Tap + in the top-right corner.",
   "home.autoUpdate": "auto-update {h}h",
   "home.expires": "Expires: {date}",
@@ -23,6 +27,8 @@ const EN: Dict = {
   // subscription menu
   "menu.info": "Subscription info",
   "menu.rename": "Rename",
+  "menu.pin": "Pin",
+  "menu.unpin": "Unpin",
   "menu.remove": "Remove subscription",
 
   // info modal
@@ -77,6 +83,7 @@ const EN: Dict = {
   "split.manualHint": "Don't see your app (e.g. a Steam game)? Type its process name, or choose its file.",
   "split.manualPlaceholder": "Process name (e.g. cs2)",
   "split.chooseFile": "Choose from file…",
+  "split.addSelected": "Add ({n})",
 
   // settings
   "settings.title": "Settings",
@@ -89,6 +96,12 @@ const EN: Dict = {
   "settings.killswitchSub": "Block all traffic if the VPN connection drops.",
   "settings.allowLan": "Allow LAN traffic",
   "settings.allowLanSub": "Keep printers, NAS, and local devices reachable.",
+  "settings.pingMethod": "Ping method",
+  "settings.pingMethodSub": "How server latency is measured.",
+  "ping.tcp": "TCP",
+  "ping.proxy": "Via proxy (GET)",
+  "ping.na": "n/a",
+  "ping.ms": "{n} ms",
 
   // VPN mode
   "settings.vpnMode": "VPN mode",
@@ -97,7 +110,7 @@ const EN: Dict = {
   "mode.tunSub": "Routes every app. Needs network permissions.",
   "mode.proxySub": "Local proxy at 127.0.0.1:2081 — no root. Point your apps/system at it.",
 
-  // VPN core (sing-box)
+  // VPN core (xray)
   "settings.core": "VPN core",
   "core.checking": "Checking for updates…",
   "core.checkFailed": "Couldn't check for updates",
@@ -110,6 +123,11 @@ const EN: Dict = {
   "core.updating": "Downloading…",
   "core.versions": "Versions",
   "core.versionsTitle": "Core versions",
+  "core.downloaded": "Downloaded",
+  "core.available": "Available",
+  "core.fetch": "Fetch",
+  "core.fetchHint": "Fetch to see versions available to download.",
+  "core.noDownloaded": "No versions downloaded yet.",
   "core.preview": "pre-release",
   "core.currentlyInstalled": "currently installed",
   "core.active": "Active",
@@ -137,13 +155,19 @@ const RU: Dict = {
   "status.disconnected": "Не подключено",
   "status.connecting": "Подключение",
   "status.connected": "Подключено",
+  "status.dropped": "VPN отвалился — трафик заблокирован",
   "conn.selectLocation": "Сначала выберите локацию",
+  "conn.dropped": "Соединение потеряно. Kill switch блокирует весь трафик. Переподключитесь или разрешите трафик ниже.",
+  "conn.droppedNoKill": "Соединение потеряно.",
+  "conn.allowTraffic": "Отключить и разрешить трафик",
   "home.empty": "Пока нет подписок. Нажмите + в правом верхнем углу.",
   "home.autoUpdate": "автообновление {h}ч",
   "home.expires": "Истекает: {date}",
 
   "menu.info": "Информация о подписке",
   "menu.rename": "Переименовать",
+  "menu.pin": "Закрепить",
+  "menu.unpin": "Открепить",
   "menu.remove": "Удалить подписку",
 
   "info.url": "Ссылка",
@@ -193,6 +217,7 @@ const RU: Dict = {
   "split.manualHint": "Нет приложения в списке (например, игра Steam)? Впишите имя его процесса или выберите файл.",
   "split.manualPlaceholder": "Имя процесса (например cs2)",
   "split.chooseFile": "Выбрать файл…",
+  "split.addSelected": "Добавить ({n})",
 
   "settings.title": "Настройки",
   "settings.appearance": "Оформление",
@@ -204,6 +229,12 @@ const RU: Dict = {
   "settings.killswitchSub": "Блокировать весь трафик, если VPN отключился.",
   "settings.allowLan": "Разрешить локальную сеть",
   "settings.allowLanSub": "Оставить доступными принтеры, NAS и локальные устройства.",
+  "settings.pingMethod": "Метод пинга",
+  "settings.pingMethodSub": "Как измеряется задержка серверов.",
+  "ping.tcp": "TCP",
+  "ping.proxy": "Через прокси (GET)",
+  "ping.na": "н/д",
+  "ping.ms": "{n} мс",
 
   "settings.vpnMode": "Режим VPN",
   "mode.tun": "TUN (всё устройство)",
@@ -223,6 +254,11 @@ const RU: Dict = {
   "core.updating": "Загрузка…",
   "core.versions": "Версии",
   "core.versionsTitle": "Версии ядра",
+  "core.downloaded": "Скачанные",
+  "core.available": "Доступные",
+  "core.fetch": "Получить",
+  "core.fetchHint": "Нажмите «Получить», чтобы увидеть доступные для скачивания версии.",
+  "core.noDownloaded": "Пока нет скачанных версий.",
   "core.preview": "пре-релиз",
   "core.currentlyInstalled": "сейчас установлена",
   "core.active": "Активна",

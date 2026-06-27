@@ -1,16 +1,19 @@
 [package]
-name = "aegis-probe"
-version = "0.1.0"
+name = "varmlen-probe"
+version = "0.0.1"
 edition = "2021"
-license = "AGPL-3.0-only"
-description = "Small setcap'd helper for AegisVPN: tunnel-bypass latency probes, killswitch, TUN cleanup"
+license = "MIT"
+description = "Small setcap'd helper for Varmlen: tunnel-bypass latency probes, killswitch, TUN cleanup"
 
 [[bin]]
-name = "aegis-probe"
+name = "varmlen-probe"
 path = "src/main.rs"
 
 [dependencies]
 libc = "0.2"
-# SO_MARK + SO_BINDTODEVICE for probes that must bypass sing-box's TUN /
-# auto_redirect nftables fast-path (catches by destination, not source IP).
+# SO_MARK + SO_BINDTODEVICE for probes that must bypass the tun (traffic routes
+# into the tun by destination, so a plain source bind isn't enough).
 socket2 = { version = "0.5", features = ["all"] }
+# Raise CAP_NET_ADMIN into the ambient set so the `ip`/`nft` child processes we
+# spawn inherit it — file capabilities alone do NOT propagate across execve.
+caps = "0.5"

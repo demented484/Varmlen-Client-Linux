@@ -1,8 +1,8 @@
 <script lang="ts">
   import { theme } from "$lib/theme.svelte";
-  import { settings, type VpnMode } from "$lib/settings.svelte";
+  import { settings, type VpnMode, type PingMethod } from "$lib/settings.svelte";
   import { i18n, t, LANGUAGES, type Lang } from "$lib/i18n.svelte";
-  import { core, xrayCore } from "$lib/core.svelte";
+  import { core } from "$lib/core.svelte";
   import { capsGranted, grantCaps } from "$lib/api";
   import Dropdown from "$lib/components/Dropdown.svelte";
 
@@ -12,10 +12,14 @@
   ]);
   const modeSub = $derived(settings.vpnMode === "proxy" ? t("mode.proxySub") : t("mode.tunSub"));
 
-  // Refresh both cores' status when Settings opens (cheap GitHub check).
+  const pingOptions = $derived([
+    { value: "tcp", label: t("ping.tcp") },
+    { value: "proxy", label: t("ping.proxy") },
+  ]);
+
+  // Refresh the core's status when Settings opens (cheap GitHub check).
   $effect(() => {
     void core.check();
-    void xrayCore.check();
   });
 
   /** Tri-state so we don't flash "Not installed" while the very first check
@@ -67,10 +71,11 @@
   let showVersions = $state(false);
   let activeCore = $state(core);
 
-  async function openVersions(which: typeof core) {
+  function openVersions(which: typeof core) {
     activeCore = which;
     showVersions = true;
-    await which.loadReleases();
+    // The "Available" list loads only when the user clicks Fetch; "Downloaded"
+    // shows immediately from the already-known installed versions.
   }
 
   function formatReleaseDate(d: string | null): string {
@@ -114,6 +119,20 @@
   }
 
 </script>
+
+{#snippet delBtn(tag: string, disabled: boolean)}
+  <button
+    class="btn btn-sm btn-danger"
+    onclick={() => activeCore.uninstall(tag)}
+    {disabled}
+    title={t("core.delete")}
+  >
+    <svg class="btn-ico" width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+      <path d="M9 3a1 1 0 0 0-1 1v1H4a1 1 0 1 0 0 2h1l1 13a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2l1-13h1a1 1 0 1 0 0-2h-4V4a1 1 0 0 0-1-1H9zm1 2h4v1h-4V5zm-3 3h10l-.9 12.1a.1.1 0 0 1-.1.1H8.1a.1.1 0 0 1-.1-.1L7 8zm3 2a1 1 0 0 0-1 1v6a1 1 0 1 0 2 0v-6a1 1 0 0 0-1-1zm4 0a1 1 0 0 0-1 1v6a1 1 0 1 0 2 0v-6a1 1 0 0 0-1-1z" />
+    </svg>
+    <span>{t("core.delete")}</span>
+  </button>
+{/snippet}
 
 <header class="topbar">
   <h1>{t("settings.title")}</h1>
@@ -206,6 +225,18 @@
           <span class="slider"></span>
         </span>
       </label>
+      <div class="row">
+        <div class="row-text">
+          <div class="row-title">{t("settings.pingMethod")}</div>
+          <div class="row-sub muted">{t("settings.pingMethodSub")}</div>
+        </div>
+        <Dropdown
+          value={settings.pingMethod}
+          options={pingOptions}
+          onChange={(v) => settings.setPingMethod(v as PingMethod)}
+          ariaLabel={t("settings.pingMethod")}
+        />
+      </div>
     </div>
   </section>
 
@@ -214,23 +245,10 @@
     <div class="list">
       <div class="row">
         <div class="row-text">
-          <div class="row-title">sing-box <span class="muted" style="font-weight:400">· TUN</span></div>
+          <div class="row-title">xray <span class="muted" style="font-weight:400">· TUN</span></div>
           <div class="row-sub muted">{coreStatus(core)}</div>
         </div>
         <button class="btn" onclick={() => openVersions(core)} title={t("core.versionsTitle")}>
-          <svg class="btn-ico" width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-            <path d="M4 6h16M4 12h16M4 18h16" stroke="currentColor" stroke-width="1.9"
-              stroke-linecap="round" />
-          </svg>
-          <span>{t("core.versions")}</span>
-        </button>
-      </div>
-      <div class="row">
-        <div class="row-text">
-          <div class="row-title">xray <span class="muted" style="font-weight:400">· XHTTP</span></div>
-          <div class="row-sub muted">{coreStatus(xrayCore)}</div>
-        </div>
-        <button class="btn" onclick={() => openVersions(xrayCore)} title={t("core.versionsTitle")}>
           <svg class="btn-ico" width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
             <path d="M4 6h16M4 12h16M4 18h16" stroke="currentColor" stroke-width="1.9"
               stroke-linecap="round" />
@@ -242,17 +260,18 @@
     {#if core.error}
       <div class="row-sub" style="color: var(--danger); padding: 0 4px;">{core.error}</div>
     {/if}
-    {#if xrayCore.error}
-      <div class="row-sub" style="color: var(--danger); padding: 0 4px;">{xrayCore.error}</div>
-    {/if}
   </section>
 
   {#if showVersions}
+    {@const installed = activeCore.info?.installed ?? []}
+    {@const available = activeCore.releases.filter((r) => !activeCore.isInstalled(r.tag))}
     <div class="modal-backdrop" onclick={() => (showVersions = false)} role="presentation">
       <div
         class="modal card"
         onclick={(e) => e.stopPropagation()}
+        onkeydown={(e) => e.key === "Escape" && (showVersions = false)}
         role="dialog"
+        tabindex="-1"
         aria-modal="true"
         aria-label={t("core.versionsTitle")}
       >
@@ -270,23 +289,67 @@
           </button>
         </header>
 
-        {#if activeCore.releasesLoading && activeCore.releases.length === 0}
-          <p class="muted">{t("core.checking")}</p>
-        {:else if activeCore.error && activeCore.releases.length === 0}
-          <p style="color: var(--danger)">{activeCore.error}</p>
+        <!-- Downloaded — shown immediately, before any fetch. -->
+        <h3 class="ver-section">{t("core.downloaded")}</h3>
+        {#if installed.length === 0}
+          <p class="muted ver-empty">{t("core.noDownloaded")}</p>
         {:else}
           <ul class="ver-list">
-            {#each activeCore.releases as r (r.tag)}
+            {#each installed as v (v.tag)}
+              {@const isSwitching = activeCore.switchingTag === v.tag}
+              <li class="ver-row" class:current={v.active}>
+                <div class="ver-info">
+                  <span class="ver-tag">{v.tag}</span>
+                  {#if v.active}<span class="ver-meta muted">{t("core.active")}</span>{/if}
+                </div>
+                <div class="ver-actions">
+                  {#if !v.active}
+                    <button
+                      class="btn btn-primary btn-sm"
+                      onclick={() => activeCore.activate(v.tag)}
+                      disabled={isSwitching}
+                    >
+                      {isSwitching ? "…" : t("core.use")}
+                    </button>
+                  {/if}
+                  {@render delBtn(v.tag, isSwitching)}
+                </div>
+              </li>
+            {/each}
+          </ul>
+        {/if}
+
+        <!-- Available — loaded on demand via Fetch. -->
+        <div class="ver-section-head">
+          <h3 class="ver-section">{t("core.available")}</h3>
+          <button
+            class="btn btn-sm"
+            onclick={() => activeCore.loadReleases()}
+            disabled={activeCore.releasesLoading}
+          >
+            {activeCore.releasesLoading ? t("core.updating") : t("core.fetch")}
+          </button>
+        </div>
+        {#if activeCore.releases.length === 0}
+          {#if activeCore.releasesLoading}
+            <p class="muted ver-empty">{t("core.checking")}</p>
+          {:else if activeCore.error}
+            <p class="ver-empty" style="color: var(--danger)">{activeCore.error}</p>
+          {:else}
+            <p class="muted ver-empty">{t("core.fetchHint")}</p>
+          {/if}
+        {:else if available.length === 0}
+          <p class="muted ver-empty">{t("core.upToDate")}</p>
+        {:else}
+          <ul class="ver-list">
+            {#each available as r (r.tag)}
               {@const ver = r.tag.replace(/^v/, "")}
-              {@const isActive = activeCore.isActive(r.tag)}
-              {@const isInstalled = activeCore.isInstalled(r.tag)}
               {@const prog = activeCore.progress[ver]}
               {@const isDownloading = activeCore.busyTags.has(ver)}
-              {@const isSwitching = activeCore.switchingTag === ver}
               {@const pct = prog && prog.total > 0
                 ? Math.min(100, Math.round((prog.downloaded / prog.total) * 100))
-                : prog && prog.downloaded > 0 ? 0 : 0}
-              <li class="ver-row" class:current={isActive}>
+                : 0}
+              <li class="ver-row">
                 <div class="ver-info">
                   <span class="ver-tag">{r.tag}</span>
                   <span class="ver-meta muted">
@@ -294,7 +357,6 @@
                     {#if r.prerelease}<span class="badge">{t("core.preview")}</span>{/if}
                   </span>
                 </div>
-
                 <div class="ver-actions">
                   {#if isDownloading && prog}
                     <div class="progress" aria-label="downloading">
@@ -303,62 +365,17 @@
                       </div>
                       <div class="progress-meta muted">
                         {formatBytes(prog.downloaded)}
-                        {#if prog.total > 0}
-                          / {formatBytes(prog.total)} · {pct}%
-                        {/if}
+                        {#if prog.total > 0}/ {formatBytes(prog.total)} · {pct}%{/if}
                         · {formatBps(prog.speed_bps)}
                       </div>
                     </div>
-                  {:else if isActive}
-                    <!-- No badge: the active row is already tinted accent so
-                         "this one is current" is obvious without a label.
-                         Delete still spells out "Delete" because removing the
-                         version the user is running is destructive enough to
-                         deserve text confirmation. -->
-                    <button
-                      class="btn btn-sm btn-danger"
-                      onclick={() => activeCore.uninstall(r.tag)}
-                      disabled={isSwitching}
-                      title={t("core.delete")}
-                    >
-                      <svg class="btn-ico" width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-                        <path d="M9 3a1 1 0 0 0-1 1v1H4a1 1 0 1 0 0 2h1l1 13a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2l1-13h1a1 1 0 1 0 0-2h-4V4a1 1 0 0 0-1-1H9zm1 2h4v1h-4V5zm-3 3h10l-.9 12.1a.1.1 0 0 1-.1.1H8.1a.1.1 0 0 1-.1-.1L7 8zm3 2a1 1 0 0 0-1 1v6a1 1 0 1 0 2 0v-6a1 1 0 0 0-1-1zm4 0a1 1 0 0 0-1 1v6a1 1 0 1 0 2 0v-6a1 1 0 0 0-1-1z" />
-                      </svg>
-                      <span>{t("core.delete")}</span>
-                    </button>
-                  {:else if isInstalled}
-                    <button
-                      class="btn btn-primary btn-sm"
-                      onclick={() => activeCore.activate(r.tag)}
-                      disabled={isSwitching}
-                    >
-                      {isSwitching ? "…" : t("core.use")}
-                    </button>
-                    <!-- Non-active row: a proper text+icon Delete button
-                         (matching the active row's). The earlier icon-only
-                         square rendered as an unrecognisable red dot in
-                         WebKitGTK — the multi-subpath SVG was being clipped
-                         or simplified out by the renderer. Plain text is
-                         unambiguous. -->
-                    <button
-                      class="btn btn-sm btn-danger"
-                      onclick={() => activeCore.uninstall(r.tag)}
-                      disabled={isSwitching}
-                      title={t("core.delete")}
-                    >
-                      <svg class="btn-ico" width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-                        <path d="M9 3a1 1 0 0 0-1 1v1H4a1 1 0 1 0 0 2h1l1 13a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2l1-13h1a1 1 0 1 0 0-2h-4V4a1 1 0 0 0-1-1H9zm1 2h4v1h-4V5zm-3 3h10l-.9 12.1a.1.1 0 0 1-.1.1H8.1a.1.1 0 0 1-.1-.1L7 8zm3 2a1 1 0 0 0-1 1v6a1 1 0 1 0 2 0v-6a1 1 0 0 0-1-1zm4 0a1 1 0 0 0-1 1v6a1 1 0 1 0 2 0v-6a1 1 0 0 0-1-1z" />
-                      </svg>
-                      <span>{t("core.delete")}</span>
-                    </button>
                   {:else}
                     <button
                       class="btn btn-sm"
                       onclick={() => activeCore.install(r.tag)}
                       disabled={isDownloading}
                     >
-                      <svg class="btn-ico" width="14" height="14" viewBox="0 0 24 24" fill="none"
-                        aria-hidden="true">
+                      <svg class="btn-ico" width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true">
                         <path d="M12 4v12m0 0l-4-4m4 4l4-4M5 20h14"
                           stroke="currentColor" stroke-width="1.9"
                           stroke-linecap="round" stroke-linejoin="round" />
@@ -592,10 +609,34 @@
     vertical-align: -2px;
   }
 
+  .ver-section {
+    margin: 6px 0 0;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+  .ver-section-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    margin-top: 8px;
+  }
+  .ver-section-head .ver-section {
+    margin: 0;
+  }
+  .ver-empty {
+    margin: 0;
+    font-size: 13px;
+    padding: 2px 2px 0;
+  }
   .ver-list {
     list-style: none;
     margin: 0;
     padding: 0;
+    max-height: 42vh;
     overflow-y: auto;
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
@@ -653,13 +694,16 @@
   }
   /* Destructive (delete) — outline red so it reads as "removes data" without
      screaming for attention next to a primary action. */
+  /* Rest state used to be near-invisible (faint border, transparent fill).
+     Give it a clearly visible danger border + a subtle fill at rest, and a
+     stronger fill on hover. */
   :global(.btn.btn-danger) {
-    border-color: var(--danger-faint);
+    border-color: var(--danger);
     color: var(--danger);
-    background: transparent;
+    background: var(--danger-faint);
   }
   :global(.btn.btn-danger:hover:not(:disabled)) {
-    background: var(--danger-faint);
+    background: var(--danger-faint-2);
     border-color: var(--danger);
   }
 

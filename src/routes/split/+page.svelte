@@ -18,6 +18,8 @@
   let pickerQuery = $state("");
   let installed = $state<InstalledApp[]>([]);
   let pickerLoading = $state(false);
+  // Apps tapped in the picker — committed only when the user confirms with Add.
+  let selected = $state<Set<string>>(new Set());
 
   const addedIds = $derived(new Set(split.apps.map((a) => a.id)));
   const pickerResults = $derived.by(() => {
@@ -31,6 +33,7 @@
   async function openAddApp() {
     showAddApp = true;
     pickerQuery = "";
+    selected = new Set();
     if (installed.length > 0) return;
     pickerLoading = true;
     try {
@@ -42,8 +45,21 @@
     }
   }
 
-  function addInstalled(app: InstalledApp) {
-    split.addApp({ id: app.id, name: app.name, icon: app.icon ?? "📦" });
+  function toggleSelect(app: InstalledApp) {
+    const next = new Set(selected);
+    if (next.has(app.id)) next.delete(app.id);
+    else next.add(app.id);
+    selected = next;
+  }
+
+  function confirmAdd() {
+    for (const app of installed) {
+      if (selected.has(app.id)) {
+        split.addApp({ id: app.id, name: app.name, icon: app.icon ?? "📦" });
+      }
+    }
+    selected = new Set();
+    showAddApp = false;
   }
 
   async function pickFromFile() {
@@ -185,7 +201,14 @@
       aria-modal="true"
       aria-label={t("split.addApp")}
     >
-      <h2>{t("split.addApp")}</h2>
+      <header class="modal-head">
+        <h2>{t("split.addApp")}</h2>
+        <button class="icon-btn" onclick={() => (showAddApp = false)} aria-label={t("common.close")}>
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
+          </svg>
+        </button>
+      </header>
       <input type="search" placeholder={t("split.searchInstalled")} bind:value={pickerQuery} />
 
       <div class="picker">
@@ -199,7 +222,8 @@
           {#each pickerResults as app (app.id)}
             <button
               class="picker-row"
-              onclick={() => addInstalled(app)}
+              class:selected={selected.has(app.id)}
+              onclick={() => toggleSelect(app)}
               disabled={addedIds.has(app.id)}
             >
               {@render appIcon(app.icon)}
@@ -207,7 +231,7 @@
                 <div class="app-name">{app.name}</div>
                 <div class="app-id dim">{app.id}</div>
               </div>
-              {#if addedIds.has(app.id)}
+              {#if addedIds.has(app.id) || selected.has(app.id)}
                 <svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true">
                   <path d="M5 12.5L10 17.5L19.5 8" stroke="var(--accent)" stroke-width="2.5" fill="none" stroke-linecap="round" stroke-linejoin="round" />
                 </svg>
@@ -219,8 +243,10 @@
 
       <p class="muted small-note">{t("split.pickFileHint")}</p>
       <div class="modal-actions">
-        <button class="btn" onclick={() => (showAddApp = false)}>{t("common.close")}</button>
-        <button class="btn btn-primary" onclick={pickFromFile}>{t("split.chooseFile")}</button>
+        <button class="btn" onclick={pickFromFile}>{t("split.chooseFile")}</button>
+        <button class="btn btn-primary" onclick={confirmAdd} disabled={selected.size === 0}>
+          {t("split.addSelected", { n: selected.size })}
+        </button>
       </div>
     </div>
   </div>
@@ -249,6 +275,13 @@
     display: flex;
     flex-direction: column;
     gap: 12px;
+  }
+  /* Keep the children at their natural height so a long apps/sites list makes
+     the page overflow and scroll. Without this, `.list` (overflow:hidden →
+     flex min-height:0) gets shrunk by the flex column and clips its rows
+     instead of scrolling. */
+  .page > :global(*) {
+    flex-shrink: 0;
   }
 
   /* Tabs span the full width like every other panel. */
@@ -397,6 +430,28 @@
   }
   .modal h2 { margin: 0; font-size: 17px; font-weight: 600; }
   .modal p { margin: 0; font-size: 13px; }
+  .modal-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+  }
+  .icon-btn {
+    background: transparent;
+    border: 0;
+    color: var(--text-muted);
+    padding: 6px;
+    border-radius: 8px;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    transition: background var(--transition), color var(--transition);
+  }
+  .icon-btn:hover {
+    background: var(--bg-elev-2);
+    color: var(--text);
+  }
 
   .picker {
     max-height: 320px;
@@ -426,6 +481,9 @@
   .picker-row:disabled {
     opacity: 0.55;
     cursor: default;
+  }
+  .picker-row.selected {
+    background: var(--accent-faint);
   }
   .picker-msg {
     padding: 18px 12px;

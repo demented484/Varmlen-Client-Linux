@@ -1,15 +1,14 @@
-//! Client side of connect/disconnect — hybrid, no root daemon.
+//! Client side of connect/disconnect — xray-native, no root daemon.
 //!
-//! - "tun" mode: full-system TUN. sing-box (setcap cap_net_admin) creates the
-//!   TUN + routing + split + DNS and forwards everything to a local xray SOCKS;
-//!   xray (plain user, no caps) does the vless/reality/XHTTP transport. The GUI
-//!   owns both child processes directly. The killswitch is applied/removed by
-//!   the setcap'd `aegis-probe` at connect/disconnect.
+//! - "tun" mode: full-system TUN. xray (setcap cap_net_admin) owns its native
+//!   `tun` inbound and does the per-app/site split + DNS + vless/reality/XHTTP
+//!   transport itself. xray's tun manages no routes, so the setcap'd
+//!   `varmlen-probe` lays the routing (`route-up`) + killswitch around it. The GUI
+//!   owns the single xray child process directly.
 //! - "proxy" mode: just xray's SOCKS inbound on 127.0.0.1:XRAY_SOCKS_PORT — no
 //!   TUN, no caps. Apps point at it.
 //!
-//! sing-box can't speak XHTTP, which is why xray is the upstream. There is no
-//! unix socket / systemd service anymore.
+//! There is no unix socket / systemd service, and no second core anymore.
 
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -19,9 +18,9 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::core::CoreKind;
-use crate::singbox::{build_config, SplitInput};
+use crate::split::SplitInput;
 use crate::subscription::VlessServer;
-use crate::xray::build_xray_config;
+use crate::xray::{build_xray_config, TunMode};
 
 /// Returned to the frontend; shape unchanged from the old socket protocol so
 /// `api.ts` keeps working.
@@ -42,6 +41,10 @@ impl HelperResponse {
     fn disconnected() -> Self {
         HelperResponse { ok: true, state: "disconnected".into(), pid: None, error: None, rtt_ms: None }
     }
+    /// Tunnel died unexpectedly; the kill switch is holding traffic blocked.
+    fn dropped() -> Self {
+        HelperResponse { ok: true, state: "dropped".into(), pid: None, error: None, rtt_ms: None }
+    }
 }
 
 // --- child processes (owned by the GUI) ------------------------------------
@@ -50,9 +53,81 @@ fn xray_child() -> &'static Mutex<Option<Child>> {
     static C: OnceLock<Mutex<Option<Child>>> = OnceLock::new();
     C.get_or_init(|| Mutex::new(None))
 }
-fn singbox_child() -> &'static Mutex<Option<Child>> {
-    static C: OnceLock<Mutex<Option<Child>>> = OnceLock::new();
-    C.get_or_init(|| Mutex::new(None))
+
+/// Serializes connect/disconnect end-to-end. Without it two overlapping
+/// vpn_connect calls can interleave around the brief child-slot lock and orphan
+/// an xray process + tunnel; disconnect also takes it so it can't race a connect.
+fn vpn_op_lock() -> &'static tokio::sync::Mutex<()> {
+    static L: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    L.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+// --- connection phase + crash watcher --------------------------------------
+//
+// The kill switch is a fail-closed feature: if xray dies unexpectedly while the
+// user enabled it, traffic stays BLOCKED (the nft drop table + routes-into-a-
+// dead-tun keep everything from leaking out the physical NIC). A background
+// watcher detects the crash and moves us to a distinct "dropped" phase so the UI
+// can say "VPN dropped — traffic blocked" instead of a misleading "disconnected"
+// (which implies traffic flows freely). With the kill switch OFF, the watcher
+// instead tears the routing down so direct connectivity is restored.
+
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+/// "disconnected" | "connected" | "dropped". Authoritative for vpn_status.
+fn conn_phase() -> &'static Mutex<String> {
+    static P: OnceLock<Mutex<String>> = OnceLock::new();
+    P.get_or_init(|| Mutex::new("disconnected".into()))
+}
+fn set_phase(p: &str) {
+    *conn_phase().lock().unwrap() = p.to_string();
+}
+
+/// Bumped on every connect; a watcher exits once its generation is stale (a
+/// newer connect superseded it).
+static CONN_GEN: AtomicU64 = AtomicU64::new(0);
+/// Set before an intentional stop_all (user disconnect / reconnect) so the
+/// watcher never mistakes a deliberate teardown for a crash.
+static INTENTIONAL_STOP: AtomicBool = AtomicBool::new(false);
+
+/// React to an unexpected xray exit. Kill switch on → keep blocking (the point),
+/// just mark the phase. Off → restore direct connectivity via the helper cleanup.
+fn handle_crash(app: &tauri::AppHandle, killswitch: bool) {
+    use tauri::Emitter;
+    if killswitch {
+        set_phase("dropped");
+        let _ = app.emit("vpn-dropped", true);
+    } else {
+        if let Some(probe) = probe_bin(app) {
+            let _ = Command::new(&probe).arg("cleanup").status();
+        }
+        set_phase("disconnected");
+        let _ = app.emit("vpn-dropped", false);
+    }
+}
+
+/// Poll the xray child once a second; on an unexpected exit, run `handle_crash`.
+/// Exits quietly when superseded (stale generation) or on an intentional stop.
+fn spawn_crash_watcher(app: tauri::AppHandle, killswitch: bool, generation: u64) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_millis(1000));
+        if CONN_GEN.load(Ordering::SeqCst) != generation
+            || INTENTIONAL_STOP.load(Ordering::SeqCst)
+        {
+            return;
+        }
+        if pid_of(xray_child()).is_some() {
+            continue;
+        }
+        // xray is gone — re-check it wasn't a deliberate/superseded stop racing us.
+        if CONN_GEN.load(Ordering::SeqCst) != generation
+            || INTENTIONAL_STOP.load(Ordering::SeqCst)
+        {
+            return;
+        }
+        handle_crash(&app, killswitch);
+        return;
+    });
 }
 
 fn pid_of(slot: &Mutex<Option<Child>>) -> Option<u32> {
@@ -69,9 +144,9 @@ fn pid_of(slot: &Mutex<Option<Child>>) -> Option<u32> {
     }
 }
 
-/// SIGTERM a child so it can tear down cleanly (sing-box must remove its TUN
-/// routes + auto_redirect nftables; a SIGKILL would leave the box unrouteable),
-/// wait up to ~5s, then SIGKILL.
+/// SIGTERM a child so it can tear down cleanly (xray closes its native tun fd,
+/// which removes the device), wait up to ~5s, then SIGKILL. The kernel routing
+/// is the helper's (`route-down`), not xray's.
 fn terminate_gracefully(child: &mut Child) {
     let pid = child.id() as i32;
     unsafe { libc::kill(pid, libc::SIGTERM); }
@@ -85,18 +160,20 @@ fn terminate_gracefully(child: &mut Child) {
     let _ = child.wait();
 }
 
-/// Stop both cores + killswitch + stray TUN. Order: killswitch down, sing-box
-/// (graceful, tears down routes), xray, then a best-effort probe cleanup.
+/// Stop xray + tear down routing/killswitch. Fail-open order: drop the
+/// killswitch FIRST so a partial teardown never black-holes the box, then
+/// SIGTERM xray (closes the tun fd), then the helper's `cleanup` (route-down +
+/// killswitch-down + stray-TUN delete).
 fn stop_all(app: &tauri::AppHandle) {
     if let Some(probe) = probe_bin(app) {
         let _ = Command::new(&probe).arg("killswitch-down").status();
     }
-    if let Some(mut c) = singbox_child().lock().unwrap().take() {
+    // Take the child out of the slot BEFORE terminating so the mutex guard is
+    // not held across the (up to ~5s) graceful shutdown — otherwise a concurrent
+    // vpn_status()/connect would block on the lock for the whole teardown.
+    let child = xray_child().lock().unwrap().take();
+    if let Some(mut c) = child {
         terminate_gracefully(&mut c);
-    }
-    if let Some(mut c) = xray_child().lock().unwrap().take() {
-        let _ = c.kill();
-        let _ = c.wait();
     }
     if let Some(probe) = probe_bin(app) {
         let _ = Command::new(&probe).arg("cleanup").status();
@@ -116,48 +193,48 @@ fn last_error_line(stderr: &str) -> String {
 
 // --- resource locations ----------------------------------------------------
 
-/// Locate the bundled `aegis-probe`. Dev: helper build output. Packaged: the
+/// Locate the bundled `varmlen-probe`. Dev: helper build output. Packaged: the
 /// copy placed in app-data/bin (resource → bin on first run; see grant_caps).
 fn probe_bin(app: &tauri::AppHandle) -> Option<PathBuf> {
     use tauri::Manager;
     // Installed copy (what we setcap).
     if let Ok(data) = app.path().app_data_dir() {
-        let p = data.join("bin").join("aegis-probe");
+        let p = data.join("bin").join("varmlen-probe");
         if p.exists() {
             return Some(p);
         }
     }
     // Dev fallback: the freshly-built binary in the helper crate.
-    let dev = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../helper/target/release/aegis-probe"));
+    let dev = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../helper/target/release/varmlen-probe"));
     if dev.exists() {
         return Some(dev);
     }
     None
 }
 
-/// The aegis-probe source binary to install/setcap (resource in prod, dev build
+/// The varmlen-probe source binary to install/setcap (resource in prod, dev build
 /// output otherwise).
 fn probe_source(app: &tauri::AppHandle) -> Option<PathBuf> {
     use tauri::Manager;
     if let Ok(res) = app.path().resource_dir() {
-        let p = res.join("aegis-probe");
+        let p = res.join("varmlen-probe");
         if p.exists() {
             return Some(p);
         }
     }
-    let dev = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../helper/target/release/aegis-probe"));
+    let dev = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../helper/target/release/varmlen-probe"));
     dev.exists().then_some(dev)
 }
 
 fn setcap_script(app: &tauri::AppHandle) -> Option<PathBuf> {
     use tauri::Manager;
     if let Ok(res) = app.path().resource_dir() {
-        let p = res.join("aegis-setcap.sh");
+        let p = res.join("varmlen-setcap.sh");
         if p.exists() {
             return Some(p);
         }
     }
-    let dev = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../helper/aegis-setcap.sh"));
+    let dev = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../helper/varmlen-setcap.sh"));
     dev.exists().then_some(dev)
 }
 
@@ -201,20 +278,21 @@ fn has_cap(bin: &PathBuf, cap: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Run the setcap batch via pkexec (one prompt): grant caps to the active
-/// sing-box + aegis-probe, optionally removing the legacy root helper too.
-/// Blocking (pkexec shows a password dialog) — call from spawn_blocking.
+/// Run the setcap batch via pkexec (one prompt): grant caps to the active xray
+/// (its native TUN needs CAP_NET_ADMIN) + varmlen-probe, optionally removing the
+/// legacy root helper too. Blocking (pkexec shows a password dialog) — call
+/// from spawn_blocking.
 pub fn request_setcap_blocking(app: &tauri::AppHandle) -> Result<(), String> {
     let script = setcap_script(app).ok_or("setcap script not found")?;
-    let singbox = crate::core::binary_path(app, CoreKind::SingBox)
-        .map_err(|e| format!("sing-box core: {e}"))?;
-    // Ensure aegis-probe is installed in app-data/bin so we can setcap a stable path.
+    let xray = crate::core::binary_path(app, CoreKind::Xray)
+        .map_err(|e| format!("xray core: {e}"))?;
+    // Ensure varmlen-probe is installed in app-data/bin so we can setcap a stable path.
     let probe = ensure_probe_installed(app)?;
 
     let mut cmd = Command::new("pkexec");
-    cmd.arg(&script).arg(&singbox).arg(&probe);
+    cmd.arg(&script).arg(&xray).arg(&probe);
     // If the legacy root helper is present, fold its removal into this prompt.
-    if std::path::Path::new("/etc/systemd/system/aegisvpn-helper.service").exists() {
+    if std::path::Path::new("/etc/systemd/system/varmlen-helper.service").exists() {
         if let Some(unins) = old_helper_uninstall(app) {
             cmd.arg(unins);
         }
@@ -227,26 +305,32 @@ pub fn request_setcap_blocking(app: &tauri::AppHandle) -> Result<(), String> {
     }
 }
 
-/// Copy the bundled aegis-probe into app-data/bin (idempotent) so it has a
+/// Copy the bundled varmlen-probe into app-data/bin (idempotent) so it has a
 /// stable path to setcap (resources get replaced on app update, clearing caps).
 fn ensure_probe_installed(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     use tauri::Manager;
     let data = app.path().app_data_dir().map_err(|e| format!("app data dir: {e}"))?;
     let bin_dir = data.join("bin");
     std::fs::create_dir_all(&bin_dir).map_err(|e| format!("create bin dir: {e}"))?;
-    let dest = bin_dir.join("aegis-probe");
-    let src = probe_source(app).ok_or("bundled aegis-probe not found")?;
+    let dest = bin_dir.join("varmlen-probe");
+    let src = probe_source(app).ok_or("bundled varmlen-probe not found")?;
     // Only copy if missing or different size (cheap freshness check).
     let need = !dest.exists()
         || std::fs::metadata(&dest).map(|m| m.len()).ok()
             != std::fs::metadata(&src).map(|m| m.len()).ok();
     if need {
-        std::fs::copy(&src, &dest).map_err(|e| format!("copy probe: {e}"))?;
+        // Install atomically: copy to a temp file, then rename over `dest`. An
+        // in-place copy fails with ETXTBSY ("text file busy") whenever a probe
+        // is running from `dest` (e.g. a server latency ping); rename swaps the
+        // directory entry and leaves any running process on the old inode.
+        let tmp = bin_dir.join("varmlen-probe.new");
+        std::fs::copy(&src, &tmp).map_err(|e| format!("copy probe: {e}"))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755));
+            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755));
         }
+        std::fs::rename(&tmp, &dest).map_err(|e| format!("install probe: {e}"))?;
     }
     Ok(dest)
 }
@@ -294,9 +378,29 @@ fn runtime_dir() -> PathBuf {
     let base = std::env::var("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| std::env::temp_dir());
-    let d = base.join("aegisvpn");
+    let d = base.join("varmlen");
     let _ = std::fs::create_dir_all(&d);
+    // The configs written here embed server credentials (uuid/password/reality
+    // keys). Lock the dir to the owner — esp. important on the world-writable
+    // /tmp fallback when XDG_RUNTIME_DIR is unset.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700));
+    }
     d
+}
+
+/// Write a config file containing credentials with 0600 perms (the runtime dir
+/// is already 0700; this is belt-and-suspenders).
+fn write_private(path: &PathBuf, content: &str) -> Result<(), String> {
+    std::fs::write(path, content).map_err(|e| format!("write {}: {e}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -308,74 +412,141 @@ pub async fn vpn_connect(
     killswitch: bool,
     allow_lan: bool,
 ) -> Result<HelperResponse, String> {
-    let xray_cfg = serde_json::to_string(&build_xray_config(&server)).map_err(|e| e.to_string())?;
+    // Hold the op lock for the whole connect so it can't interleave with another
+    // connect/disconnect and orphan a tunnel.
+    let _op = vpn_op_lock().lock().await;
+    let xray_cfg = serde_json::to_string(&build_xray_config(
+        &server,
+        &split,
+        &mode,
+        TunMode::XrayNative,
+        allow_lan,
+    ))
+    .map_err(|e| e.to_string())?;
+    // Validation config: a SOCKS-inbound variant with the SAME routing /
+    // outbounds / dns. `xray run -test` on a tun inbound needs CAP_NET_ADMIN and
+    // actually creates the device, so we instead validate this device-free
+    // variant (the tun inbound itself is static {name,mtu} and can't have a
+    // per-server config error).
+    let validate_cfg = serde_json::to_string(&build_xray_config(
+        &server,
+        &split,
+        &mode,
+        TunMode::Tun2socks,
+        allow_lan,
+    ))
+    .map_err(|e| e.to_string())?;
     let server_host = server.host.clone();
 
     tokio::task::spawn_blocking(move || -> Result<HelperResponse, String> {
+        // Mark the upcoming teardown intentional so any prior crash-watcher exits
+        // without firing; cleared once we're successfully connected again.
+        INTENTIONAL_STOP.store(true, Ordering::SeqCst);
         stop_all(&app);
+        // stop_all just lifted any kill switch / routes, so we're no longer in a
+        // "dropped" (blocked) phase — clear it so a *failed* reconnect can't leave
+        // vpn_status falsely reporting blocked.
+        set_phase("disconnected");
 
         let xray_bin = crate::core::binary_path(&app, CoreKind::Xray)
             .map_err(|e| format!("xray core: {e} — install it in Settings → VPN core"))?;
         let rt = runtime_dir();
-
-        // 1) xray first (the SOCKS upstream sing-box dials).
         let xray_path = rt.join("xray.json");
-        std::fs::write(&xray_path, &xray_cfg).map_err(|e| format!("write xray cfg: {e}"))?;
-        let xray = spawn_core(&xray_bin, &xray_path).map_err(|e| format!("xray: {e}"))?;
-        *xray_child().lock().unwrap() = Some(xray);
+        write_private(&xray_path, &xray_cfg)?;
+
+        // Validate the device-free variant before touching any kernel state.
+        let validate_path = rt.join("xray-validate.json");
+        write_private(&validate_path, &validate_cfg)?;
+        validate_xray(&xray_bin, &validate_path)?;
 
         if mode == "proxy" {
-            // Proxy mode is just xray's SOCKS inbound — no TUN, no sing-box.
+            // Local SOCKS only — no TUN, no caps, no routing. No kill switch
+            // applies, so a crash just means "disconnected" (no watcher needed).
+            let xray = spawn_core(&xray_bin, &xray_path).map_err(|e| format!("xray: {e}"))?;
+            *xray_child().lock().unwrap() = Some(xray);
             let pid = pid_of(xray_child()).unwrap_or(0);
+            CONN_GEN.fetch_add(1, Ordering::SeqCst);
+            INTENTIONAL_STOP.store(false, Ordering::SeqCst);
+            set_phase("connected");
             return Ok(HelperResponse::connected(pid));
         }
 
-        // 2) sing-box TUN (needs caps). Preflight.
-        let singbox_bin = crate::core::binary_path(&app, CoreKind::SingBox)
-            .map_err(|e| format!("sing-box core: {e}"))?;
-        if !has_cap(&singbox_bin, "cap_net_admin") {
-            stop_all(&app);
+        // TUN mode: xray owns the native tun and needs CAP_NET_ADMIN.
+        if !has_cap(&xray_bin, "cap_net_admin") {
             return Err(
-                "sing-box lacks network permissions — click \"Grant network permissions\" in Settings"
-                    .into(),
+                "xray lacks network permissions — click \"Grant network permissions\" in Settings".into(),
             );
         }
-        let sb_cfg = serde_json::to_string(&build_config(&server, &split, &mode, allow_lan))
-            .map_err(|e| e.to_string())?;
-        let sb_path = rt.join("singbox.json");
-        std::fs::write(&sb_path, &sb_cfg).map_err(|e| format!("write singbox cfg: {e}"))?;
-        // Validate before launch.
-        let check = Command::new(&singbox_bin).arg("check").arg("-c").arg(&sb_path).output();
-        if let Ok(out) = check {
-            if !out.status.success() {
-                stop_all(&app);
-                return Err(format!("sing-box config invalid: {}", last_error_line(&String::from_utf8_lossy(&out.stderr))));
-            }
+        let server_ips = resolve_ips(&server_host);
+        if server_ips.is_empty() {
+            return Err(format!("could not resolve server address '{server_host}'"));
         }
-        let sb = match spawn_core(&singbox_bin, &sb_path) {
+
+        // 1) xray first: it creates varmlen0 and starts reading. No routes point
+        //    into the tun yet, so traffic still uses the physical default.
+        let xray = match spawn_core(&xray_bin, &xray_path) {
             Ok(c) => c,
             Err(e) => {
                 stop_all(&app);
-                return Err(format!("sing-box: {e}"));
+                return Err(format!("xray: {e}"));
             }
         };
-        let pid = sb.id();
-        *singbox_child().lock().unwrap() = Some(sb);
+        let pid = xray.id();
+        *xray_child().lock().unwrap() = Some(xray);
 
-        // 3) killswitch via the setcap'd probe.
-        if killswitch {
-            if let Some(probe) = probe_bin(&app) {
-                let mut cmd = Command::new(&probe);
-                cmd.arg("killswitch-up");
-                if allow_lan {
-                    cmd.arg("--allow-lan");
-                }
-                for ip in resolve_ips(&server_host) {
-                    cmd.arg(ip.to_string());
-                }
-                let _ = cmd.status();
+        // 2) route-up: lay the routing the native tun needs (anti-loop server
+        //    route first, then the default into the tun) via the setcap'd probe.
+        let Some(probe) = probe_bin(&app) else {
+            stop_all(&app);
+            return Err("varmlen-probe helper not found".into());
+        };
+        let mut up = Command::new(&probe);
+        up.arg("route-up");
+        for ip in &server_ips {
+            up.arg("--server").arg(ip.to_string());
+        }
+        match up.output() {
+            Ok(o) if o.status.success() => {}
+            Ok(o) => {
+                stop_all(&app);
+                return Err(format!(
+                    "routing setup failed: {}",
+                    last_error_line(&String::from_utf8_lossy(&o.stderr))
+                ));
+            }
+            Err(e) => {
+                stop_all(&app);
+                return Err(format!("routing setup failed: {e}"));
             }
         }
+
+        // 3) killswitch (optional), last. The user explicitly enabled it, so
+        //    fail CLOSED if it can't be applied — never report "connected" with
+        //    a silently-absent kill switch.
+        if killswitch {
+            let mut ks = Command::new(&probe);
+            ks.arg("killswitch-up");
+            if allow_lan {
+                ks.arg("--allow-lan");
+            }
+            for ip in &server_ips {
+                ks.arg(ip.to_string());
+            }
+            let applied = ks.status().map(|s| s.success()).unwrap_or(false);
+            if !applied {
+                stop_all(&app);
+                return Err(
+                    "kill switch could not be applied — check network permissions in Settings".into(),
+                );
+            }
+        }
+
+        // Connected. Arm the crash watcher: a fresh generation (supersedes any
+        // prior watcher) and clear the intentional-stop flag.
+        let generation = CONN_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+        INTENTIONAL_STOP.store(false, Ordering::SeqCst);
+        set_phase("connected");
+        spawn_crash_watcher(app.clone(), killswitch, generation);
 
         Ok(HelperResponse::connected(pid))
     })
@@ -383,18 +554,45 @@ pub async fn vpn_connect(
     .map_err(|e| format!("join: {e}"))?
 }
 
+/// Validate an xray config with `xray run -test -c <file>` before launch.
+fn validate_xray(bin: &PathBuf, cfg: &PathBuf) -> Result<(), String> {
+    let out = Command::new(bin)
+        .arg("run")
+        .arg("-test")
+        .arg("-c")
+        .arg(cfg)
+        .output()
+        .map_err(|e| format!("xray validate: {e}"))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    // xray writes config errors to stderr (and sometimes stdout).
+    let mut msg = last_error_line(&String::from_utf8_lossy(&out.stderr));
+    if msg == "no output" {
+        msg = last_error_line(&String::from_utf8_lossy(&out.stdout));
+    }
+    Err(format!("xray config invalid: {msg}"))
+}
+
 #[tauri::command]
 pub async fn vpn_disconnect(app: tauri::AppHandle) -> Result<HelperResponse, String> {
+    let _op = vpn_op_lock().lock().await;
+    // A user-initiated stop: silence the crash watcher and drop to disconnected
+    // (this also lifts the kill switch from a "dropped" state, restoring traffic).
+    INTENTIONAL_STOP.store(true, Ordering::SeqCst);
     let _ = tokio::task::spawn_blocking(move || stop_all(&app)).await;
+    set_phase("disconnected");
     Ok(HelperResponse::disconnected())
 }
 
 #[tauri::command]
 pub async fn vpn_status() -> Result<HelperResponse, String> {
-    // sing-box alive → tun connected; else xray alone alive → proxy connected.
-    if let Some(pid) = pid_of(singbox_child()) {
-        return Ok(HelperResponse::connected(pid));
+    // The crash watcher owns the "dropped" phase (tunnel died, kill switch
+    // holding) — report it distinctly so the UI doesn't claim "disconnected".
+    if conn_phase().lock().unwrap().as_str() == "dropped" {
+        return Ok(HelperResponse::dropped());
     }
+    // The single xray process alive → connected (tun or proxy mode).
     if let Some(pid) = pid_of(xray_child()) {
         return Ok(HelperResponse::connected(pid));
     }
@@ -406,10 +604,9 @@ pub async fn vpn_status() -> Result<HelperResponse, String> {
 #[tauri::command]
 pub async fn caps_granted(app: tauri::AppHandle) -> bool {
     tokio::task::spawn_blocking(move || {
-        let sb_ok = crate::core::binary_path(&app, CoreKind::SingBox)
+        crate::core::binary_path(&app, CoreKind::Xray)
             .map(|b| has_cap(&b, "cap_net_admin"))
-            .unwrap_or(false);
-        sb_ok
+            .unwrap_or(false)
     })
     .await
     .unwrap_or(false)
@@ -425,8 +622,8 @@ pub async fn grant_caps(app: tauri::AppHandle) -> Result<(), String> {
 
 // --- location ping ----------------------------------------------------------
 
-/// Local source-bound TCP connect — fallback when aegis-probe is unavailable.
-/// Can't escape sing-box's auto_redirect while connected (no caps), so the RTT
+/// Local source-bound TCP connect — fallback when varmlen-probe is unavailable.
+/// Can't escape the tun's default route while connected (no caps), so the RTT
 /// is only accurate when disconnected.
 fn tcp_ping_local(host: &str, port: u16, timeout: Duration) -> Result<u32, String> {
     use socket2::{Domain, Protocol, SockAddr, Socket, Type};
@@ -444,7 +641,7 @@ fn tcp_ping_local(host: &str, port: u16, timeout: Duration) -> Result<u32, Strin
     Ok(started.elapsed().as_millis().min(u32::MAX as u128) as u32)
 }
 
-/// TCP-connect RTT — Happ-style latency probe. Uses the setcap'd aegis-probe
+/// TCP-connect RTT — Happ-style latency probe. Uses the setcap'd varmlen-probe
 /// (SO_MARK + SO_BINDTODEVICE) so it bypasses the active tunnel; falls back to
 /// a plain local connect if the probe is missing/uncapped.
 #[tauri::command]
@@ -467,4 +664,104 @@ pub async fn tcp_ping_host(app: tauri::AppHandle, host: String, port: u16, timeo
     })
     .await
     .map_err(|e| format!("join: {e}"))?
+}
+
+/// A free ephemeral local TCP port (bind to :0, read the assigned port, release).
+/// There is an unavoidable TOCTOU window before xray re-binds it; a foreign
+/// listener that wins the race is caught later by the socks handshake failing.
+fn free_local_port() -> Result<u16, String> {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|l| l.local_addr())
+        .map(|a| a.port())
+        .map_err(|e| format!("alloc port: {e}"))
+}
+
+/// Per-server via-proxy latency: spin a throwaway xray (the server as the only
+/// outbound + a local SOCKS on an ephemeral port), time an HTTP GET to a 204
+/// endpoint through it, then tear it down. The probe outbound carries
+/// `sockopt.mark`, so it measures cleanly whether or not the main tunnel is up.
+#[tauri::command]
+pub async fn proxy_get_ping(
+    app: tauri::AppHandle,
+    server: VlessServer,
+    timeout_ms: Option<u32>,
+) -> Result<u32, String> {
+    let ms = timeout_ms.unwrap_or(5000) as u64;
+    let xray_bin = crate::core::binary_path(&app, CoreKind::Xray)
+        .map_err(|e| format!("xray core: {e}"))?;
+    let port = free_local_port()?;
+    let cfg = serde_json::to_string(&crate::xray::build_ping_config(&server, port))
+        .map_err(|e| e.to_string())?;
+    let cfg_path = runtime_dir().join(format!("ping-{port}.json"));
+    if let Err(e) = write_private(&cfg_path, &cfg) {
+        let _ = std::fs::remove_file(&cfg_path);
+        return Err(e);
+    }
+
+    let mut child = Command::new(&xray_bin)
+        .arg("run")
+        .arg("-c")
+        .arg(&cfg_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("spawn xray: {e}"))?;
+
+    // The whole op is bounded by `ms`; always clean up the child + temp config.
+    let deadline = Instant::now() + Duration::from_millis(ms);
+    let result = async {
+        // Wait for the socks port, but bail the instant xray dies (e.g. an
+        // unsupported/malformed server) instead of burning the whole budget.
+        loop {
+            if let Ok(Some(_)) = child.try_wait() {
+                return Err("xray exited before the proxy was ready".to_string());
+            }
+            let connectable = tokio::task::spawn_blocking(move || {
+                std::net::TcpStream::connect_timeout(
+                    &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+                    Duration::from_millis(100),
+                )
+                .is_ok()
+            })
+            .await
+            .unwrap_or(false);
+            if connectable {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Err("proxy did not start".to_string());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let client = reqwest::Client::builder()
+            .proxy(
+                reqwest::Proxy::all(format!("socks5h://127.0.0.1:{port}"))
+                    .map_err(|e| format!("proxy: {e}"))?,
+            )
+            // Don't chase a captive-portal / interception redirect — a non-204
+            // must surface as a failure, not be followed to some 200 page.
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_millis(ms))
+            .build()
+            .map_err(|e| format!("client: {e}"))?;
+        let started = Instant::now();
+        let resp = client
+            .get("http://cp.cloudflare.com/generate_204")
+            .send()
+            .await
+            .map_err(|e| format!("get: {e}"))?;
+        // generate_204 returns exactly 204 on a clean path; anything else means
+        // interception / an upstream block, not a healthy server.
+        if resp.status().as_u16() != 204 {
+            return Err(format!("unexpected status {}", resp.status()));
+        }
+        Ok(started.elapsed().as_millis().min(u32::MAX as u128) as u32)
+    }
+    .await;
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_file(&cfg_path);
+    result
 }

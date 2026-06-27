@@ -85,9 +85,10 @@ const LAUNCHERS: &[&str] = &[
 ];
 
 /// A stable, unique identifier for an app — ideally the real process name that
-/// sing-box matches. Normally the binary; for launcher-fronted entries (Steam
-/// → "steam", Flatpak → "flatpak") we resolve the actual process: Flatpak via
-/// its install metadata / launch wrapper, else fall back to a unique id.
+/// xray's `process` routing matcher matches. Normally the binary; for
+/// launcher-fronted entries (Steam → "steam", Flatpak → "flatpak") we resolve
+/// the actual process: Flatpak via its install metadata / launch wrapper, else
+/// fall back to a unique id.
 fn derive_app_id(exec: &str, desktop_stem: &str) -> String {
     let bin = binary_from_exec(exec).unwrap_or_else(|| desktop_stem.to_string());
     if !LAUNCHERS.contains(&bin.as_str()) {
@@ -97,8 +98,8 @@ fn derive_app_id(exec: &str, desktop_stem: &str) -> String {
         if let Some(appid) = exec.split_whitespace().find(|t| {
             !t.starts_with('-') && !t.starts_with('%') && t.matches('.').count() >= 2
         }) {
-            // The real process (e.g. "zen") — what sing-box matches — not the
-            // reverse-DNS app id.
+            // The real process (e.g. "zen") — what xray's process matcher
+            // matches — not the reverse-DNS app id.
             return flatpak_process_name(appid).unwrap_or_else(|| appid.to_string());
         }
     }

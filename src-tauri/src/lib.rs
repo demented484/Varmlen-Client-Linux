@@ -1,6 +1,6 @@
 mod apps;
 mod core;
-mod singbox;
+mod split;
 mod storage;
 mod subscription;
 mod vpn;
@@ -28,6 +28,37 @@ fn parse_subscription_body(body: String) -> Vec<VlessServer> {
 ///
 /// If `url` is a raw `vless://` link, returns a single-server result with
 /// an empty meta block.
+
+/// True for hosts we refuse to fetch (SSRF guard): localhost and literal
+/// loopback / private / link-local / CGNAT addresses. A domain that *resolves*
+/// to a private IP isn't caught here — an accepted residual for now.
+fn is_blocked_host(host: &str) -> bool {
+    let h = host
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
+    if h == "localhost" || h.ends_with(".localhost") {
+        return true;
+    }
+    match h.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => {
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || (v4.octets()[0] == 100 && (64..=127).contains(&v4.octets()[1]))
+        }
+        Ok(std::net::IpAddr::V6(v6)) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || (v6.octets()[0] & 0xfe) == 0xfc
+                || (v6.octets()[0] == 0xfe && (v6.octets()[1] & 0xc0) == 0x80)
+        }
+        Err(_) => false,
+    }
+}
+
 #[tauri::command]
 async fn fetch_subscription(url: String) -> Result<ImportResult, String> {
     let trimmed = url.trim();
@@ -44,9 +75,29 @@ async fn fetch_subscription(url: String) -> Result<ImportResult, String> {
             .map_err(|e| e.to_string());
     }
 
+    // SSRF guard: web schemes only, and reject loopback/private/link-local
+    // targets (a benign-looking URL could otherwise 30x into LAN/metadata).
+    let parsed = url::Url::parse(trimmed).map_err(|e| format!("bad URL: {e}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(format!("unsupported URL scheme: {}", parsed.scheme()));
+    }
+    if parsed.host_str().map(is_blocked_host).unwrap_or(true) {
+        return Err("refusing to fetch a loopback/private address".to_string());
+    }
+
     let client = reqwest::Client::builder()
-        .user_agent("AegisVPN/0.1 (sub-importer)")
+        .user_agent("Varmlen/0.1 (sub-importer)")
         .timeout(Duration::from_secs(15))
+        // Validate every redirect hop too, so a 30x can't escape the guard.
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 5 {
+                attempt.error("too many redirects")
+            } else if attempt.url().host_str().map(is_blocked_host).unwrap_or(true) {
+                attempt.error("redirect to a loopback/private address")
+            } else {
+                attempt.follow()
+            }
+        }))
         .build()
         .map_err(|e| format!("http client: {e}"))?;
 
@@ -60,8 +111,30 @@ async fn fetch_subscription(url: String) -> Result<ImportResult, String> {
         return Err(format!("HTTP {}", resp.status()));
     }
 
+    // Cap the body: subscriptions are KB-scale; bail past the limit so a
+    // malicious endpoint can't OOM us with an unbounded response.
+    const MAX_SUB_BYTES: usize = 8 * 1024 * 1024;
+    if resp
+        .content_length()
+        .map(|l| l > MAX_SUB_BYTES as u64)
+        .unwrap_or(false)
+    {
+        return Err("subscription too large".to_string());
+    }
     let headers = resp.headers().clone();
-    let body = resp.text().await.map_err(|e| format!("read body: {e}"))?;
+    let mut buf: Vec<u8> = Vec::new();
+    {
+        use futures_util::StreamExt;
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| format!("read body: {e}"))?;
+            buf.extend_from_slice(&chunk);
+            if buf.len() > MAX_SUB_BYTES {
+                return Err("subscription exceeded size limit".to_string());
+            }
+        }
+    }
+    let body = String::from_utf8_lossy(&buf).into_owned();
     let servers = parse_subscription(&body);
 
     // Some panels (Marzban / Happ-style) inline the metadata as `#key: value`
@@ -97,6 +170,28 @@ async fn fetch_subscription(url: String) -> Result<ImportResult, String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // WebKitGTK on Linux (especially under Wayland) has long-standing DMABUF /
+    // compositing rendering bugs that show up as a blank window or an outright
+    // failure to launch. Disable the DMABUF renderer + compositing (cheap and
+    // safe) and fall back to XWayland under a Wayland session, so the app starts
+    // out of the box with no `.desktop` env hacks. Everything stays overridable
+    // — we only set a variable the user hasn't already set themselves.
+    #[cfg(target_os = "linux")]
+    {
+        fn set_default(key: &str, val: &str) {
+            if std::env::var_os(key).is_none() {
+                std::env::set_var(key, val);
+            }
+        }
+        set_default("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+        set_default("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
+        let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some()
+            || std::env::var("XDG_SESSION_TYPE").map(|s| s == "wayland").unwrap_or(false);
+        if wayland {
+            set_default("GDK_BACKEND", "x11");
+        }
+    }
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
@@ -111,7 +206,6 @@ pub fn run() {
             core::core_activate,
             core::core_uninstall,
             core::list_core_releases,
-            singbox::generate_singbox_config,
             xray::generate_xray_config,
             vpn::vpn_connect,
             vpn::vpn_disconnect,
@@ -119,12 +213,13 @@ pub fn run() {
             vpn::caps_granted,
             vpn::grant_caps,
             vpn::tcp_ping_host,
+            vpn::proxy_get_ping,
             storage::read_legacy_storage
         ])
         .on_window_event(|window, event| {
-            // Closing the window must tear the VPN down too — otherwise the
-            // helper's sing-box keeps running long after the GUI is gone, and
-            // the user is stuck on the tunnel with no UI to disconnect.
+            // Closing the window must tear the VPN down too — otherwise xray
+            // keeps the tunnel up long after the GUI is gone, and the user is
+            // stuck on the tunnel with no UI to disconnect.
             //
             // Tauri exits the process as soon as this handler returns, racing
             // the Unix-socket round-trip to the helper. We block the default
@@ -148,7 +243,11 @@ pub fn run() {
                 });
             }
         })
-        .setup(|_app| {
+        .setup(|app| {
+            // Seed the bundled xray into the core dir if nothing is installed,
+            // so the app has a working core on first launch even when GitHub is
+            // unreachable (censored networks). No-op once a core exists.
+            core::seed_bundled_core(app.handle());
             // Devtools stay available on demand (right-click → Inspect, or the
             // shortcut) in debug builds; we just don't pop them open on launch.
             Ok(())

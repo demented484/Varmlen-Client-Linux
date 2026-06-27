@@ -3,11 +3,12 @@
 version = 4
 
 [[package]]
-name = "aegis-probe"
-version = "0.1.0"
+name = "caps"
+version = "0.5.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd1ddba47aba30b6a889298ad0109c3b8dcb0e8fc993b459daa7067d46f865e0"
 dependencies = [
  "libc",
- "socket2",
 ]
 
 [[package]]
@@ -24,6 +25,15 @@ checksum = "e22376abed350d73dd1cd119b57ffccad95b4e585a7cda43e286245ce23c0678"
 dependencies = [
  "libc",
  "windows-sys",
+]
+
+[[package]]
+name = "varmlen-probe"
+version = "0.0.1"
+dependencies = [
+ "caps",
+ "libc",
+ "socket2",
 ]
 
 [[package]]

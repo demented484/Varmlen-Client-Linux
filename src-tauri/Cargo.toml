@@ -1,9 +1,9 @@
 [package]
-name = "aegisvpn"
-version = "0.1.0"
-description = "AegisVPN — open-source sing-box client with per-app and per-domain split tunneling"
-authors = ["AegisVPN contributors"]
-license = "AGPL-3.0-only"
+name = "varmlen"
+version = "0.0.1"
+description = "Varmlen — open-source xray-core client with per-app and per-domain split tunneling"
+authors = ["Varmlen contributors"]
+license = "MIT"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -12,7 +12,7 @@ edition = "2021"
 # The `_lib` suffix may seem redundant but it is necessary
 # to make the lib name unique and wouldn't conflict with the bin name.
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
-name = "aegisvpn_lib"
+name = "varmlen_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
@@ -27,11 +27,12 @@ url = "2"
 percent-encoding = "2"
 base64 = "0.22"
 thiserror = "2"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "socks"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 flate2 = "1"
 tar = "0.4"
-# xray-core ships its release binary in a .zip (unlike sing-box's tar.gz).
+# xray-core ships its release binary in a .zip; flate2/tar remain for a future
+# tar.gz-distributed fallback core.
 zip = { version = "2", default-features = false, features = ["deflate"] }
 sha2 = "0.10"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }

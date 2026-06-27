@@ -1,18 +1,18 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "AegisVPN",
-  "version": "0.1.0",
-  "identifier": "vpn.aegis.client",
+  "productName": "Varmlen",
+  "version": "0.0.1",
+  "identifier": "app.varmlen.client",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://127.0.0.1:1420",
-    "beforeBuildCommand": "npm run build",
+    "beforeBuildCommand": "npm run build && cargo build --release --manifest-path helper/Cargo.toml && bash scripts/fetch-xray.sh",
     "frontendDist": "../build"
   },
   "app": {
     "windows": [
       {
-        "title": "AegisVPN",
+        "title": "Varmlen",
         "width": 440,
         "height": 720,
         "minWidth": 380,
@@ -21,7 +21,7 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost; frame-src 'none'; object-src 'none'; base-uri 'self'; form-action 'none'"
     }
   },
   "bundle": {
@@ -33,6 +33,12 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "resources": {
+      "../helper/target/release/varmlen-probe": "varmlen-probe",
+      "../helper/varmlen-setcap.sh": "varmlen-setcap.sh",
+      "../helper/uninstall.sh": "uninstall.sh",
+      "cores/xray": "xray"
+    }
   }
 }

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Remove the AegisVPN privileged helper. Run as root.
+# Remove the Varmlen privileged helper. Run as root.
 set -euo pipefail
 
 if [[ $EUID -ne 0 ]]; then
@@ -7,9 +7,9 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
-systemctl disable --now aegisvpn-helper.service 2>/dev/null || true
-rm -f /etc/systemd/system/aegisvpn-helper.service
-rm -rf /usr/local/lib/aegisvpn
+systemctl disable --now varmlen-helper.service 2>/dev/null || true
+rm -f /etc/systemd/system/varmlen-helper.service
+rm -rf /usr/local/lib/varmlen
 systemctl daemon-reload
 
-echo "AegisVPN helper removed."
+echo "Varmlen helper removed."

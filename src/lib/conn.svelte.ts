@@ -3,8 +3,11 @@ import { subs } from "$lib/subs.svelte";
 import { split } from "$lib/split.svelte";
 import { settings } from "$lib/settings.svelte";
 import { t } from "$lib/i18n.svelte";
+import { listen } from "@tauri-apps/api/event";
 
-export type Status = "disconnected" | "connecting" | "connected";
+// "dropped": the tunnel died unexpectedly and the kill switch is holding traffic
+// blocked (fail-closed). Distinct from "disconnected" so the UI can say so.
+export type Status = "disconnected" | "connecting" | "connected" | "dropped";
 
 function msg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
@@ -23,8 +26,29 @@ class ConnStore {
   status = $state<Status>("disconnected");
   /** Last connect error, surfaced under the power button. */
   error = $state<string | null>(null);
+  /** True while in the "dropped" phase WITH the kill switch holding traffic. */
+  blockedByKillswitch = $state(false);
 
   private reapplyTimer: ReturnType<typeof setTimeout> | null = null;
+  private dropListenerStarted = false;
+
+  /** Subscribe to backend "vpn-dropped" events (tunnel died unexpectedly). The
+   *  payload is `true` when the kill switch is holding traffic blocked. */
+  startDropListener(): void {
+    if (this.dropListenerStarted) return;
+    this.dropListenerStarted = true;
+    void listen<boolean>("vpn-dropped", (e) => {
+      if (e.payload) {
+        this.status = "dropped";
+        this.blockedByKillswitch = true;
+        this.error = t("conn.dropped");
+      } else {
+        this.status = "disconnected";
+        this.blockedByKillswitch = false;
+        this.error = t("conn.droppedNoKill");
+      }
+    });
+  }
   /** Signature of the config last applied, to avoid redundant reconnects. */
   private lastSig: string | null = null;
 
@@ -58,13 +82,22 @@ class ConnStore {
   async toggle(): Promise<void> {
     if (this.status === "connected" || this.status === "connecting") {
       await this.disconnect();
+    } else if (this.status === "dropped") {
+      // From a kill-switch-blocked drop, the power button reconnects.
+      await this.connect();
     } else {
       await this.connect();
     }
   }
 
+  /** Clear a kill-switch-blocked drop without reconnecting (restores traffic). */
+  async clearDrop(): Promise<void> {
+    await this.disconnect();
+  }
+
   async connect(): Promise<void> {
     this.error = null;
+    this.blockedByKillswitch = false;
     const server = subs.selectedServerRaw();
     if (!server) {
       this.error = t("conn.selectLocation");
@@ -105,17 +138,29 @@ class ConnStore {
       // best effort — drop to disconnected regardless
     }
     this.status = "disconnected";
+    this.blockedByKillswitch = false;
+    this.error = null;
   }
 
   /** Reconcile UI with the helper's actual state (e.g. window recreated while
-   *  still connected, or core crashed). */
+   *  still connected, or core crashed/dropped while the window was away). */
   async refresh(): Promise<void> {
+    this.startDropListener();
     try {
       const resp = await vpnStatus();
       if (resp.state === "connected") {
         this.status = "connected";
-      } else if (resp.state === "disconnected" && this.status === "connected") {
+        this.blockedByKillswitch = false;
+      } else if (resp.state === "dropped") {
+        this.status = "dropped";
+        this.blockedByKillswitch = true;
+        this.error = t("conn.dropped");
+      } else if (
+        resp.state === "disconnected" &&
+        (this.status === "connected" || this.status === "dropped")
+      ) {
         this.status = "disconnected";
+        this.blockedByKillswitch = false;
       }
     } catch {
       // helper unreachable — leave UI as is

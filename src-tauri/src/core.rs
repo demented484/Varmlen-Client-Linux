@@ -1,13 +1,12 @@
-//! VPN core management for TWO cores: sing-box (TUN + routing + split) and
-//! xray (the XHTTP/Reality transport engine the hybrid forwards into).
+//! VPN core management for the xray core (native TUN + routing + transport).
 //!
 //! Versions are cached per-kind under
 //! `app_data/core/versions/<kind>/<tag>/<bin>` and `core/active-<kind>.txt`
 //! records which one is active for that kind. The user keeps as many versions
-//! as they want and activates one per kind with a single click.
+//! as they want and activates one with a single click.
 //!
 //! Downloads stream chunks + emit `core://progress` events so the UI can render
-//! a real progress bar. sing-box assets are `.tar.gz`; xray assets are `.zip`.
+//! a real progress bar. xray assets are `.zip`.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -16,45 +15,33 @@ use futures_util::StreamExt;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 
-/// Which core a request targets. sing-box does TUN/routing; xray does the
-/// outbound transport (vless/reality/xhttp) the sing-box TUN forwards into.
+/// Which core a request targets. xray is now the sole core: its native tun does
+/// TUN capture, its routing does the per-app/site split + DNS, and its outbound
+/// does the vless/reality/xhttp transport. The enum is kept (single variant) so
+/// a second downloadable core — e.g. a future tun2socks fallback — can be added
+/// without reworking the download/activate plumbing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CoreKind {
-    SingBox,
     Xray,
 }
 
 impl CoreKind {
     pub fn parse(s: &str) -> Result<Self, String> {
         match s {
-            "singbox" | "sing-box" => Ok(CoreKind::SingBox),
             "xray" => Ok(CoreKind::Xray),
             other => Err(format!("unknown core kind: {other}")),
         }
     }
     /// Stable slug used in paths / active-file names.
     fn slug(self) -> &'static str {
-        match self {
-            CoreKind::SingBox => "singbox",
-            CoreKind::Xray => "xray",
-        }
+        "xray"
     }
     fn repo(self) -> &'static str {
-        match self {
-            CoreKind::SingBox => "SagerNet/sing-box",
-            CoreKind::Xray => "XTLS/Xray-core",
-        }
+        "XTLS/Xray-core"
     }
     /// Binary file name inside the per-version dir.
     pub fn bin_name(self) -> &'static str {
-        match self {
-            CoreKind::SingBox => {
-                if cfg!(windows) { "sing-box.exe" } else { "sing-box" }
-            }
-            CoreKind::Xray => {
-                if cfg!(windows) { "xray.exe" } else { "xray" }
-            }
-        }
+        if cfg!(windows) { "xray.exe" } else { "xray" }
     }
     fn active_file(self) -> String {
         format!("active-{}.txt", self.slug())
@@ -103,6 +90,9 @@ fn versions_dir(app: &AppHandle, kind: CoreKind) -> Result<PathBuf, String> {
 
 /// Where the binary for a specific tag lives (may not exist yet).
 fn version_binary(app: &AppHandle, kind: CoreKind, tag: &str) -> Result<PathBuf, String> {
+    if !valid_tag(tag) {
+        return Err(format!("invalid version tag: {tag}"));
+    }
     Ok(versions_dir(app, kind)?.join(strip_v(tag)).join(kind.bin_name()))
 }
 
@@ -110,7 +100,68 @@ fn strip_v(tag: &str) -> &str {
     tag.strip_prefix('v').unwrap_or(tag)
 }
 
+/// A tag is only ever used as a path component (`versions/<tag>/…`), so reject
+/// anything that could escape that dir: version-ish chars only — no `/`, `\`,
+/// no `.`/`..` component, not absolute, bounded length. Untrusted (it comes
+/// from the GitHub API / the frontend), so validate before any path use.
+fn valid_tag(tag: &str) -> bool {
+    let t = strip_v(tag);
+    !t.is_empty()
+        && t.len() <= 64
+        && t != "."
+        && t != ".."
+        && t.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+' | b'_'))
+}
+
 /// The active version's binary path for a kind; errors if none active/missing.
+/// The xray binary shipped as a Tauri resource (None if absent, e.g. in some
+/// dev runs). Bundled so the app has a working core on first launch without
+/// reaching GitHub — vital in censored networks where the download is blocked.
+fn bundled_core_path(app: &AppHandle, kind: CoreKind) -> Option<PathBuf> {
+    if kind != CoreKind::Xray {
+        return None;
+    }
+    let p = app.path().resource_dir().ok()?.join("xray");
+    p.exists().then_some(p)
+}
+
+/// Read a core binary's own version (`xray version` → "26.6.27"), so the seeded
+/// version dir is named correctly without a hardcoded tag to keep in sync.
+fn core_version_of(bin: &PathBuf) -> Option<String> {
+    let out = std::process::Command::new(bin).arg("version").output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    // First line: "Xray 26.6.27 (Xray, Penetrates Everything.) <hash> ..."
+    text.lines().next()?.split_whitespace().nth(1).map(|s| s.to_string())
+}
+
+/// Seed the bundled core into the versions dir if NOTHING is installed yet, so
+/// the app works offline on first launch. Idempotent + best-effort: a no-op
+/// when a usable core already exists or no bundled binary is present. The
+/// seeded binary still gets its caps via the normal grant flow.
+pub fn seed_bundled_core(app: &AppHandle) {
+    let kind = CoreKind::Xray;
+    if binary_path(app, kind).is_ok() {
+        return; // already have a usable, active core
+    }
+    let Some(src) = bundled_core_path(app, kind) else { return };
+    let Some(tag) = core_version_of(&src).filter(|t| valid_tag(t)) else { return };
+    let Ok(dest) = version_binary(app, kind, &tag) else { return };
+    if let Some(parent) = dest.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+    if std::fs::copy(&src, &dest).is_err() {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755));
+    }
+    let _ = write_active(app, kind, &tag);
+}
+
 pub fn binary_path(app: &AppHandle, kind: CoreKind) -> Result<PathBuf, String> {
     let active = active_tag(app, kind)
         .ok_or_else(|| format!("no {} core installed (Settings → VPN core)", kind.slug()))?;
@@ -147,78 +198,15 @@ fn clear_active(app: &AppHandle, kind: CoreKind) -> Result<(), String> {
     Ok(())
 }
 
-/// One-time migration of older sing-box layouts into the per-kind cache:
-///   - very old: `core/sing-box` + `core/version.txt`
-///   - prior:    `core/versions/<tag>/sing-box` + `core/active.txt`
-/// Both fold into `core/versions/singbox/<tag>/sing-box` + `active-singbox.txt`.
-/// Idempotent: a no-op once migrated.
+/// One-time cleanup of stale sing-box artifacts from the dual-core era. xray is
+/// now the sole core, so any cached sing-box binary/active-file is dead weight.
+/// Idempotent: a no-op once cleaned.
 fn migrate_legacy_layout(app: &AppHandle) {
     let Ok(dir) = core_dir(app) else { return };
-    let sb = CoreKind::SingBox;
-
-    // (a) prior per-tag layout: core/versions/<tag>/sing-box
-    let old_versions = dir.join("versions");
-    if let Ok(entries) = std::fs::read_dir(&old_versions) {
-        for e in entries.flatten() {
-            // Skip the new per-kind subdirs.
-            let name = e.file_name().to_string_lossy().to_string();
-            if name == "singbox" || name == "xray" {
-                continue;
-            }
-            let old_bin = e.path().join(sb.bin_name());
-            if old_bin.exists() {
-                if let Ok(target) = version_binary(app, sb, &name) {
-                    if let Some(parent) = target.parent() {
-                        let _ = std::fs::create_dir_all(parent);
-                    }
-                    if !target.exists() {
-                        if std::fs::rename(&old_bin, &target).is_err() {
-                            if std::fs::copy(&old_bin, &target).is_ok() {
-                                let _ = std::fs::remove_file(&old_bin);
-                            }
-                        }
-                    }
-                    let _ = std::fs::remove_dir_all(e.path());
-                }
-            }
-        }
+    for f in ["sing-box", "version.txt", "active.txt", "active-singbox.txt"] {
+        let _ = std::fs::remove_file(dir.join(f));
     }
-
-    // (b) old active.txt → active-singbox.txt
-    let old_active = dir.join("active.txt");
-    if old_active.exists() && active_tag(app, sb).is_none() {
-        if let Ok(v) = std::fs::read_to_string(&old_active) {
-            let v = v.trim();
-            if !v.is_empty() {
-                let _ = write_active(app, sb, v);
-            }
-        }
-    }
-    let _ = std::fs::remove_file(&old_active);
-
-    // (c) very old single-binary layout: core/sing-box + version.txt
-    let old_bin = dir.join(sb.bin_name());
-    if old_bin.exists() {
-        let ver = std::fs::read_to_string(dir.join("version.txt"))
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "legacy".to_string());
-        if let Ok(target) = version_binary(app, sb, &ver) {
-            if let Some(parent) = target.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            if !target.exists() && std::fs::rename(&old_bin, &target).is_err() {
-                if std::fs::copy(&old_bin, &target).is_ok() {
-                    let _ = std::fs::remove_file(&old_bin);
-                }
-            }
-            if active_tag(app, sb).is_none() {
-                let _ = write_active(app, sb, &ver);
-            }
-        }
-        let _ = std::fs::remove_file(dir.join("version.txt"));
-    }
+    let _ = std::fs::remove_dir_all(dir.join("versions").join("singbox"));
 }
 
 /// All tags with a binary on disk for a kind, newest-first.
@@ -256,7 +244,7 @@ fn version_cmp(a: &str, b: &str) -> std::cmp::Ordering {
 
 fn http_client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
-        .user_agent("AegisVPN/0.1 (core-updater)")
+        .user_agent("Varmlen/0.1 (core-updater)")
         .timeout(Duration::from_secs(60))
         .build()
         .map_err(|e| format!("http client: {e}"))
@@ -286,7 +274,11 @@ async fn fetch_release_by_tag(kind: CoreKind, tag: &str) -> Result<serde_json::V
 }
 
 fn version_from_tag(release: &serde_json::Value) -> Option<String> {
-    release.get("tag_name").and_then(|t| t.as_str()).map(|t| strip_v(t).to_string())
+    release
+        .get("tag_name")
+        .and_then(|t| t.as_str())
+        .filter(|t| valid_tag(t))
+        .map(|t| strip_v(t).to_string())
 }
 
 async fn latest_version(kind: CoreKind) -> Result<String, String> {
@@ -335,26 +327,11 @@ pub async fn list_core_releases(kind: String) -> Result<Vec<CoreRelease>, String
 // --- download + install ----------------------------------------------------
 
 /// Does the asset name match the OS/arch build we want for this kind?
-/// sing-box: `*-linux-amd64.tar.gz`. xray: `Xray-linux-64.zip` (amd64) /
-/// `Xray-linux-arm64-v8a.zip`.
+/// xray: `Xray-linux-64.zip` (amd64) / `Xray-linux-arm64-v8a.zip`.
 fn asset_matches(kind: CoreKind, name: &str) -> bool {
     match kind {
-        CoreKind::SingBox => {
-            let os = match std::env::consts::OS {
-                "linux" => "linux",
-                "macos" => "darwin",
-                "windows" => "windows",
-                _ => return false,
-            };
-            let arch = match std::env::consts::ARCH {
-                "x86_64" => "amd64",
-                "aarch64" => "arm64",
-                _ => return false,
-            };
-            name.ends_with(&format!("-{os}-{arch}.tar.gz")) && !name.contains("legacy")
-        }
         CoreKind::Xray => {
-            // xray only matters on Linux here (TUN host is Linux).
+            // The native-TUN host is Linux only.
             match std::env::consts::ARCH {
                 "x86_64" => name == "Xray-linux-64.zip",
                 "aarch64" => name == "Xray-linux-arm64-v8a.zip",
@@ -388,7 +365,14 @@ async fn download_and_install(
         .and_then(|u| u.as_str())
         .ok_or("asset has no download url")?
         .to_string();
+    // Cap the asset size taken from the (untrusted) release JSON: a huge / u64::MAX
+    // `size` would otherwise panic Vec::with_capacity (capacity overflow) or OOM
+    // the eagerly-buffered body. A core is tens of MB; 256 MB is generous.
+    const MAX_CORE_BYTES: u64 = 256 * 1024 * 1024;
     let total: u64 = asset.get("size").and_then(|s| s.as_u64()).unwrap_or(0);
+    if total > MAX_CORE_BYTES {
+        return Err(format!("core asset too large: {total} bytes"));
+    }
     let digest = asset
         .get("digest")
         .and_then(|d| d.as_str())
@@ -411,6 +395,10 @@ async fn download_and_install(
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| format!("download chunk: {e}"))?;
         buf.extend_from_slice(&chunk);
+        // Hard ceiling in case the body exceeds the declared size.
+        if buf.len() as u64 > MAX_CORE_BYTES {
+            return Err("core download exceeded size limit".into());
+        }
         window_bytes += chunk.len() as u64;
 
         let now = Instant::now();
@@ -449,10 +437,7 @@ async fn download_and_install(
     let dest = version_binary(app, kind, tag)?;
     std::fs::create_dir_all(dest.parent().unwrap())
         .map_err(|e| format!("create version dir: {e}"))?;
-    match kind {
-        CoreKind::SingBox => extract_binary_targz(&buf, &dest, kind.bin_name())?,
-        CoreKind::Xray => extract_binary_zip(&buf, &dest, kind.bin_name())?,
-    }
+    extract_binary_zip(&buf, &dest, kind.bin_name())?;
     Ok(())
 }
 
@@ -475,7 +460,9 @@ fn set_exec(dest: &PathBuf) {
     }
 }
 
-/// Pull `member` out of a .tar.gz and write it to `dest`.
+/// Pull `member` out of a .tar.gz and write it to `dest`. Currently unused
+/// (xray ships `.zip`); kept for a future tar.gz-distributed fallback core.
+#[allow(dead_code)]
 fn extract_binary_targz(tar_gz: &[u8], dest: &PathBuf, member: &str) -> Result<(), String> {
     use flate2::read::GzDecoder;
     let mut archive = tar::Archive::new(GzDecoder::new(tar_gz));
@@ -542,8 +529,8 @@ pub async fn core_info(app: AppHandle, kind: String) -> Result<CoreInfo, String>
 }
 
 /// Download `version` (or latest when null) for `kind`. First install for a
-/// kind auto-activates it. sing-box installs trigger a setcap prompt (TUN
-/// needs CAP_NET_ADMIN); xray needs no caps.
+/// kind auto-activates it. xray installs trigger a setcap prompt: its native TUN
+/// needs CAP_NET_ADMIN (file caps are cleared whenever the binary is rewritten).
 #[tauri::command]
 pub async fn core_install(app: AppHandle, kind: String, version: Option<String>) -> Result<String, String> {
     let kind = CoreKind::parse(&kind)?;
@@ -562,15 +549,16 @@ pub async fn core_install(app: AppHandle, kind: String, version: Option<String>)
         active_tag(&app, kind).as_deref() == Some(tag.as_str())
     };
     // File capabilities are cleared whenever the binary is (re)written, so the
-    // active sing-box must be re-capped after any download of the active tag.
-    if became_active && kind == CoreKind::SingBox {
+    // active xray must be re-capped after any download of the active tag.
+    if became_active && kind == CoreKind::Xray {
         let app2 = app.clone();
         let _ = tokio::task::spawn_blocking(move || crate::vpn::request_setcap_blocking(&app2)).await;
     }
     Ok(tag)
 }
 
-/// Switch the active version for `kind`. Re-cap sing-box afterwards.
+/// Switch the active version for `kind`. Re-cap xray afterwards (its native TUN
+/// needs CAP_NET_ADMIN and caps are bound to the specific binary).
 #[tauri::command]
 pub async fn core_activate(app: AppHandle, kind: String, tag: String) -> Result<(), String> {
     let kind = CoreKind::parse(&kind)?;
@@ -579,7 +567,7 @@ pub async fn core_activate(app: AppHandle, kind: String, tag: String) -> Result<
         return Err(format!("version {tag} isn't downloaded"));
     }
     write_active(&app, kind, &tag)?;
-    if kind == CoreKind::SingBox {
+    if kind == CoreKind::Xray {
         let app2 = app.clone();
         let _ = tokio::task::spawn_blocking(move || crate::vpn::request_setcap_blocking(&app2)).await;
     }
@@ -589,6 +577,9 @@ pub async fn core_activate(app: AppHandle, kind: String, tag: String) -> Result<
 #[tauri::command]
 pub async fn core_uninstall(app: AppHandle, kind: String, tag: String) -> Result<(), String> {
     let kind = CoreKind::parse(&kind)?;
+    if !valid_tag(&tag) {
+        return Err(format!("invalid version tag: {tag}"));
+    }
     let was_active = active_tag(&app, kind).as_deref() == Some(strip_v(&tag));
     let dir = versions_dir(&app, kind)?.join(strip_v(&tag));
     if dir.exists() {
@@ -601,4 +592,29 @@ pub async fn core_uninstall(app: AppHandle, kind: String, tag: String) -> Result
         let _ = clear_active(&app, kind);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn valid_tag_accepts_versions_and_rejects_traversal() {
+        for ok in ["v1.2.3", "26.3.27", "v2024.1.0-beta.1", "1.8.4+build_2"] {
+            assert!(valid_tag(ok), "{ok} should be valid");
+        }
+        for bad in [
+            "",
+            "v",
+            "..",
+            ".",
+            "a/b",
+            "../../etc",
+            "/home/daniil/.config/autostart/x",
+            "v../../x",
+            "a\\b",
+        ] {
+            assert!(!valid_tag(bad), "{bad:?} should be rejected");
+        }
+    }
 }

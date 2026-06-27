@@ -43,6 +43,7 @@
 :root {
   --danger: #e5484d;
   --danger-faint: rgba(229, 72, 77, 0.14);
+  --danger-faint-2: rgba(229, 72, 77, 0.26);
   --warn: #f5a524;
 
   --radius-sm: 8px;
@@ -201,15 +202,19 @@ a {
   height: 22px;
   left: 2px;
   top: 2px;
-  background: #ffffff;
+  /* The knob is the inverse of the track in each state so it always contrasts:
+     --text over the elevated off-track, --accent-on over the accent on-track
+     (a plain white knob vanished on the near-white accent track in dark mode). */
+  background: var(--text);
   border-radius: 50%;
-  transition: transform var(--transition);
+  transition: transform var(--transition), background var(--transition);
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
 }
 .switch input:checked + .slider {
   background: var(--accent);
 }
 .switch input:checked + .slider::before {
+  background: var(--accent-on);
   transform: translateX(16px);
 }
 

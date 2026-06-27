@@ -1,18 +1,8 @@
 <script lang="ts">
-  import { onMount } from "svelte";
   import { openUrl } from "@tauri-apps/plugin-opener";
   import { conn } from "$lib/conn.svelte";
   import { subs } from "$lib/subs.svelte";
   import { t } from "$lib/i18n.svelte";
-
-  // Refresh latencies on app open and every 5 min while the home view is
-  // mounted, so the displayed numbers stay current without the user pulling
-  // to refresh. The ping store handles "in flight" overlap gracefully.
-  onMount(() => {
-    void subs.pingAll();
-    const id = setInterval(() => void subs.pingAll(), 5 * 60 * 1000);
-    return () => clearInterval(id);
-  });
 
   import type { Subscription, ServerEntry } from "$lib/subs.svelte";
 
@@ -74,7 +64,10 @@
 
   // Subscription headers (support / web-page URLs) are attacker-controlled, so
   // only hand the OS opener a vetted web/Telegram scheme — never file:, etc.
-  const SAFE_SCHEMES = new Set(["http:", "https:", "tg:"]);
+  // Web schemes only. tg: action URIs (tg://proxy, tg://socks, tg://msg_url)
+  // from an attacker-controlled Support-Url could inject a proxy/contact via the
+  // OS opener — https://t.me/… links still work.
+  const SAFE_SCHEMES = new Set(["http:", "https:"]);
   async function open(url: string | null) {
     if (!url) return;
     let scheme: string;
@@ -109,7 +102,6 @@
 </script>
 
 <header class="topbar">
-  <h1 class="app-title">AegisVPN</h1>
   <button class="icon-btn" onclick={() => (showImport = true)} aria-label="Add subscription">
     <svg width="22" height="22" viewBox="0 0 24 24" fill="none">
       <path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" />
@@ -138,12 +130,15 @@
     </button>
     <div class="status-text" data-status={conn.status}>{statusLabel}</div>
     {#if conn.error}
-      <div class="conn-error">{conn.error}</div>
+      <div class="conn-error" class:blocked={conn.status === "dropped"}>{conn.error}</div>
+    {/if}
+    {#if conn.status === "dropped"}
+      <button class="link-btn" onclick={() => conn.clearDrop()}>{t("conn.allowTraffic")}</button>
     {/if}
   </section>
 
-  {#each subs.list as sub (sub.id)}
-    <section class="sub-card">
+  {#each subs.ordered as sub (sub.id)}
+    <section class="sub-card" class:pinned={sub.pinned}>
       <header class="sub-head">
         <button
           class="chev-toggle"
@@ -162,7 +157,13 @@
         </button>
 
         <div class="sub-info">
-          <div class="sub-title">{sub.name}</div>
+          <div class="sub-title">
+            {#if sub.pinned}
+              <svg class="pin-mark" width="12" height="12" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+                <path d="M9.828.722a.5.5 0 0 1 .354.146l4.95 4.95a.5.5 0 0 1 0 .707c-.48.48-1.072.588-1.503.588-.177 0-.335-.018-.46-.039l-3.134 3.134a5.927 5.927 0 0 1 .16 1.013c.046.702-.032 1.687-.72 2.375a.5.5 0 0 1-.707 0l-2.829-2.828-3.182 3.182c-.195.195-1.219.902-1.414.707-.195-.195.512-1.22.707-1.414l3.182-3.182-2.828-2.829a.5.5 0 0 1 0-.707c.688-.688 1.673-.767 2.375-.72a5.922 5.922 0 0 1 1.013.16l3.134-3.133a2.772 2.772 0 0 1-.04-.461c0-.43.108-1.022.589-1.503a.5.5 0 0 1 .353-.146z" />
+              </svg>
+            {/if}{sub.name}
+          </div>
           {#if sub.updateIntervalHours}
             <div class="sub-meta muted">{t("home.autoUpdate", { h: sub.updateIntervalHours })}</div>
           {/if}
@@ -210,6 +211,13 @@
               </button>
               <button role="menuitem" class="menu-item" onclick={() => openRename(sub)}>
                 {t("menu.rename")}
+              </button>
+              <button
+                role="menuitem"
+                class="menu-item"
+                onclick={() => { subs.togglePin(sub.id); openMenuFor = null; }}
+              >
+                {sub.pinned ? t("menu.unpin") : t("menu.pin")}
               </button>
               <button
                 role="menuitem"
@@ -271,9 +279,9 @@
               </button>
               <span class="srv-ping" aria-label="latency">
                 {#if ping === "pinging"}…
-                {:else if ping === "timeout"}н/д
-                {:else if typeof ping === "number"}{ping}мс
-                {:else}–{/if}
+                {:else if ping === "timeout"}{t("ping.na")}
+                {:else if typeof ping === "number"}{t("ping.ms", { n: ping })}
+                {/if}
               </span>
               <button
                 class="srv-detail"
@@ -309,7 +317,14 @@
       aria-modal="true"
       aria-label="Subscription info"
     >
-      <h2>{infoFor.name}</h2>
+      <header class="modal-head">
+        <h2>{infoFor.name}</h2>
+        <button class="icon-btn" onclick={() => (infoFor = null)} aria-label={t("common.close")}>
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
+          </svg>
+        </button>
+      </header>
       <dl class="info-grid">
         <dt>{t("info.url")}</dt>
         <dd class="mono small">{infoFor.url}</dd>
@@ -341,9 +356,6 @@
       {#if infoFor.description}
         <p class="info-desc">{infoFor.description}</p>
       {/if}
-      <div class="modal-actions">
-        <button class="btn" onclick={() => (infoFor = null)}>{t("common.close")}</button>
-      </div>
     </div>
   </div>
 {/if}
@@ -359,16 +371,20 @@
       aria-modal="true"
       aria-label="Location details"
     >
-      <h2>{detailFor.flag ? detailFor.flag + " " : ""}{detailFor.name}</h2>
+      <header class="modal-head">
+        <h2>{detailFor.flag ? detailFor.flag + " " : ""}{detailFor.name}</h2>
+        <button class="icon-btn" onclick={() => (detailFor = null)} aria-label={t("common.close")}>
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
+          </svg>
+        </button>
+      </header>
       <dl class="info-grid">
         {#each detailRows as [label, value] (label)}
           <dt>{label}</dt>
           <dd class="mono small">{value}</dd>
         {/each}
       </dl>
-      <div class="modal-actions">
-        <button class="btn" onclick={() => (detailFor = null)}>{t("common.close")}</button>
-      </div>
     </div>
   </div>
 {/if}
@@ -436,15 +452,10 @@
   .topbar {
     display: flex;
     align-items: center;
-    justify-content: space-between;
+    /* App name removed — keep the add button on the right. */
+    justify-content: flex-end;
     padding: 14px 16px 6px;
     flex-shrink: 0;
-  }
-  .app-title {
-    margin: 0;
-    font-size: 18px;
-    font-weight: 700;
-    letter-spacing: 0.01em;
   }
   .icon-btn {
     width: 38px;
@@ -460,6 +471,23 @@
   }
   .icon-btn:hover {
     background: var(--bg-elev-2);
+  }
+  .modal-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    margin-bottom: 4px;
+  }
+  /* The header X is the modal's only close affordance — keep it compact. */
+  .modal-head .icon-btn {
+    width: 32px;
+    height: 32px;
+    flex-shrink: 0;
+    color: var(--text-muted);
+  }
+  .modal-head .icon-btn:hover {
+    color: var(--text);
   }
 
   .scroll {
@@ -537,6 +565,12 @@
   }
   .status-text[data-status="connected"] { color: var(--accent); }
   .status-text[data-status="connecting"] { color: var(--accent); }
+  .status-text[data-status="dropped"] { color: var(--danger); }
+  /* Dropped = kill switch holding traffic blocked: ring the power button red. */
+  .power[data-status="dropped"] {
+    border-color: var(--danger);
+    color: var(--danger);
+  }
   .conn-error {
     margin-top: 10px;
     max-width: 340px;
@@ -549,6 +583,16 @@
     padding: 10px 14px;
     line-height: 1.45;
   }
+  .link-btn {
+    margin-top: 8px;
+    background: transparent;
+    border: none;
+    color: var(--text-muted);
+    font-size: 13px;
+    text-decoration: underline;
+    cursor: pointer;
+  }
+  .link-btn:hover { color: var(--text); }
 
 
   /* ---------- subscription card ---------- */
@@ -589,6 +633,15 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  .pin-mark {
+    color: var(--accent);
+    vertical-align: -1px;
+    margin-right: 5px;
+    flex-shrink: 0;
+  }
+  .sub-card.pinned {
+    border-color: var(--border-strong);
   }
   .sub-meta {
     font-size: 11px;

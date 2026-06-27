@@ -1,7 +1,7 @@
 import { browser } from "$app/environment";
 
 export type Theme = "dark" | "light";
-const KEY = "aegisvpn.theme";
+const KEY = "varmlen.theme";
 
 function read(): Theme {
   if (!browser) return "dark";

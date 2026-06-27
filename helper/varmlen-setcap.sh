@@ -1,19 +1,22 @@
 #!/usr/bin/env bash
-# Grant the file capabilities the AegisVPN cores need, then verify them.
+# Grant the file capabilities the Varmlen core + helper need, then verify them.
 # Runs as root via pkexec (one password prompt for the whole batch).
 #
-#   aegis-setcap.sh <sing-box-path> <aegis-probe-path> [old-helper-uninstall.sh]
+#   varmlen-setcap.sh <xray-path> <varmlen-probe-path> [old-helper-uninstall.sh]
 #
-# - sing-box gets cap_net_admin (TUN device, auto_route, auto_redirect nft, SO_MARK)
-# - aegis-probe gets cap_net_admin,cap_net_raw (SO_MARK + SO_BINDTODEVICE, nft killswitch)
+# - xray gets cap_net_admin (its native TUN device + routing).
+# - varmlen-probe gets cap_net_admin,cap_net_raw,cap_dac_override:
+#     cap_net_admin   - SO_MARK, nft killswitch, ip routes/rules, net sysctls
+#     cap_net_raw     - SO_BINDTODEVICE for the tunnel-bypass probes
+#     cap_dac_override- write the root-owned rp_filter sysctl + /run state
 # - if a third arg is given, it's the old root-helper uninstaller: run it so the
 #   migration (remove daemon) + grant-caps happen under a single pkexec prompt.
 #
 # File caps are cleared whenever a binary is replaced (core update), so this is
-# re-run after every download/activate of the active sing-box.
+# re-run after every download/activate of the active xray.
 set -u
 
-SINGBOX="${1:-}"
+XRAY="${1:-}"
 PROBE="${2:-}"
 OLD_UNINSTALL="${3:-}"
 
@@ -43,7 +46,7 @@ if [ -n "$OLD_UNINSTALL" ] && [ -f "$OLD_UNINSTALL" ]; then
   sh "$OLD_UNINSTALL" || echo "legacy uninstall returned non-zero (continuing)" >&2
 fi
 
-cap_set "$SINGBOX" "cap_net_admin+ep"
-cap_set "$PROBE"   "cap_net_admin,cap_net_raw+ep"
+cap_set "$XRAY"  "cap_net_admin+ep"
+cap_set "$PROBE" "cap_net_admin,cap_net_raw,cap_dac_override+ep"
 
 exit "$fail"

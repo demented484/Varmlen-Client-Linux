@@ -16,7 +16,7 @@ function msg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
-/** State + actions for the managed sing-box core: download / activate /
+/** State + actions for the managed xray core: download / activate /
  *  uninstall multiple versions in parallel, with live progress for each.
  *
  *  - `info` reflects what's on disk (which versions, which one is active) and
@@ -67,9 +67,11 @@ class CoreStore {
     }
   }
 
+  /** (Re)fetch the GitHub release list. Always refetches — the user triggers
+   *  this explicitly via the Fetch button and expects fresh results. */
   async loadReleases(): Promise<void> {
-    if (this.releases.length > 0) return;
     this.releasesLoading = true;
+    this.error = null;
     try {
       this.releases = await listCoreReleases(this.kind);
     } catch (e) {
@@ -170,7 +172,6 @@ function stripV(s: string): string {
   return s.startsWith("v") ? s.slice(1) : s;
 }
 
-/** sing-box: TUN + routing + split + DNS. */
-export const core = new CoreStore("singbox");
-/** xray: the XHTTP/Reality transport the sing-box TUN forwards into. */
-export const xrayCore = new CoreStore("xray");
+/** xray — the sole core: native TUN + routing + per-app/site split + DNS +
+ *  vless/reality/xhttp transport. */
+export const core = new CoreStore("xray");

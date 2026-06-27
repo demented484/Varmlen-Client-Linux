@@ -4,12 +4,28 @@
     <meta charset="utf-8" />
     <link rel="icon" href="%sveltekit.assets%/favicon.png" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>AegisVPN</title>
+    <title>Varmlen</title>
     <script>
+      // One-time rebrand: migrate any legacy `aegisvpn.*` localStorage keys to
+      // `varmlen.*`, in place, BEFORE the app bundle (and its stores) load — so
+      // existing subscriptions / settings survive the rename. Idempotent.
+      (function () {
+        try {
+          for (var i = localStorage.length - 1; i >= 0; i--) {
+            var k = localStorage.key(i);
+            if (k && k.indexOf("aegisvpn.") === 0) {
+              var nk = "varmlen." + k.slice("aegisvpn.".length);
+              if (localStorage.getItem(nk) === null)
+                localStorage.setItem(nk, localStorage.getItem(k));
+              localStorage.removeItem(k);
+            }
+          }
+        } catch (e) {}
+      })();
       // Apply persisted theme before paint to avoid FOUC.
       (function () {
         try {
-          var t = localStorage.getItem("aegisvpn.theme");
+          var t = localStorage.getItem("varmlen.theme");
           if (t !== "light") t = "dark";
           document.documentElement.setAttribute("data-theme", t);
           document.documentElement.style.colorScheme = t;

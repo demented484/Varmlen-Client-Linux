@@ -97,8 +97,9 @@ export interface CoreInfo {
   has_update: boolean;
 }
 
-/** Which core: "singbox" (TUN + routing) or "xray" (XHTTP/Reality transport). */
-export type CoreKind = "singbox" | "xray";
+/** The VPN core. xray is the sole core: native TUN + routing + per-app/site
+ *  split + DNS + vless/reality/xhttp transport. */
+export type CoreKind = "xray";
 
 /** Installed/active vs latest core version (queries GitHub releases). */
 export function coreInfo(kind: CoreKind): Promise<CoreInfo> {
@@ -107,7 +108,7 @@ export function coreInfo(kind: CoreKind): Promise<CoreInfo> {
 
 /** Download a specific version (or latest when `version` is null) into the
  *  local cache. Emits `core://progress` events. First install for a kind
- *  auto-activates it; sing-box installs trigger a setcap prompt. */
+ *  auto-activates it; xray installs trigger a setcap prompt (native TUN). */
 export function coreInstall(kind: CoreKind, version: string | null = null): Promise<string> {
   return invoke<string>("core_install", { kind, version });
 }
@@ -182,8 +183,8 @@ export function vpnStatus(): Promise<HelperResponse> {
   return invoke<HelperResponse>("vpn_status");
 }
 
-/** Whether the cores have the network capabilities they need (sing-box has
- *  cap_net_admin). Replaces the old root-helper check. */
+/** Whether xray has the network capability it needs for its native TUN
+ *  (cap_net_admin). Replaces the old root-helper check. */
 export function capsGranted(): Promise<boolean> {
   return invoke<boolean>("caps_granted");
 }
@@ -199,6 +200,12 @@ export function grantCaps(): Promise<void> {
  *  is active. Rejects on DNS/timeout/refused. */
 export function tcpPingHost(host: string, port: number, timeoutMs = 2500): Promise<number> {
   return invoke<number>("tcp_ping_host", { host, port, timeoutMs });
+}
+
+/** Via-proxy RTT in ms: spins a throwaway xray for `server` and times an HTTP
+ *  GET to a 204 endpoint through it. Rejects on timeout / unreachable. */
+export function proxyGetPing(server: VlessServer, timeoutMs = 5000): Promise<number> {
+  return invoke<number>("proxy_get_ping", { server, timeoutMs });
 }
 
 /** One-time migration: read any prior dev-origin localStorage (subs, split,

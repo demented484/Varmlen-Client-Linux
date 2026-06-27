@@ -4,7 +4,7 @@
   import { page } from "$app/state";
   import { NAV } from "$lib/nav";
   import { t } from "$lib/i18n.svelte";
-  import { core, xrayCore } from "$lib/core.svelte";
+  import { core } from "$lib/core.svelte";
   import { conn } from "$lib/conn.svelte";
   import { subs } from "$lib/subs.svelte";
   import { split } from "$lib/split.svelte";
@@ -18,13 +18,13 @@
    *  always do it manually in Settings. */
   async function maybeGrantCaps() {
     if (typeof window === "undefined") return;
-    if (localStorage.getItem("aegisvpn.capsAutoTried") === "1") return;
+    if (localStorage.getItem("varmlen.capsAutoTried") === "1") return;
     try {
       if (await capsGranted()) {
-        localStorage.setItem("aegisvpn.capsAutoTried", "1");
+        localStorage.setItem("varmlen.capsAutoTried", "1");
         return;
       }
-      localStorage.setItem("aegisvpn.capsAutoTried", "1");
+      localStorage.setItem("varmlen.capsAutoTried", "1");
       await grantCaps();
     } catch (e) {
       console.warn("[caps] auto-grant:", e);
@@ -36,7 +36,7 @@
    *  origin's localStorage and reloads so the stores re-init from it. */
   async function migrateLegacyStorage() {
     if (typeof window === "undefined") return;
-    if (localStorage.getItem("aegisvpn.subs") !== null) return; // already seeded
+    if (localStorage.getItem("varmlen.subs") !== null) return; // already seeded
     try {
       const data = await readLegacyStorage();
       const entries = Object.entries(data ?? {});
@@ -64,15 +64,14 @@
   // (auto), then prompt for the privileged helper (once).
   onMount(async () => {
     await migrateLegacyStorage();
-    // Both cores are required for the hybrid: sing-box (TUN) + xray (transport).
+    // xray is the sole core (native TUN + transport).
     await core.autoInit();
-    await xrayCore.autoInit();
-    // Grant caps last (needs sing-box on disk) — also migrates off the old helper.
+    // Grant caps last (needs xray on disk) — also migrates off the old helper.
     await maybeGrantCaps();
   });
 
-  // Reflect the real VPN state on launch: if the helper still runs sing-box
-  // (e.g. the window was just recreated), show "connected" instead of a stale
+  // Reflect the real VPN state on launch: if xray is still running (e.g. the
+  // window was just recreated), show "connected" instead of a stale
   // "disconnected".
   onMount(() => void conn.refresh());
 
