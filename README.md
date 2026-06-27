@@ -13,18 +13,6 @@ Open-source xray-core client with per-app and per-domain split tunneling. Built 
   - per-process rules (`telegram-desktop`, `discord`, …) via xray's native `process` matcher on Linux/Windows
   - rule order is visible in the UI so you can see exactly how xray will resolve the next packet
 
-## Roadmap
-
-- [ ] M0 — Scaffold (Tauri 2 + Svelte 5)
-- [ ] M1 — Parse `vless://` + base64 subscription URLs
-- [ ] M2 — Bundle and spawn xray-core, connect/disconnect from the UI
-- [ ] M3 — Split-tunnel rule editor with live preview of generated route rules
-- [ ] M4 — System tray, autostart, killswitch
-- [ ] M5 — Subscription auto-refresh
-- [ ] M6 — Linux packaging (.deb / .AppImage)
-- [ ] M7 — Android port (Tauri Mobile)
-- [ ] M8 — Windows port
-
 ## Development
 
 ```bash
