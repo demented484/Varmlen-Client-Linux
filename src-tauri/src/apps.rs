@@ -360,14 +360,21 @@ pub fn app_from_file(path: String) -> Option<InstalledApp> {
 /// file manager dialog, with search) and return the chosen path, or null.
 #[tauri::command]
 pub async fn pick_file() -> Option<String> {
-    let mut dialog = rfd::AsyncFileDialog::new().set_title("Select an application");
-    if let Some(home) = std::env::var_os("HOME") {
-        dialog = dialog.set_directory(home);
+    // Desktop: the XDG-portal file picker. Android picks apps a different way
+    // (system package list), so this is a no-op there.
+    #[cfg(desktop)]
+    {
+        let mut dialog = rfd::AsyncFileDialog::new().set_title("Select an application");
+        if let Some(home) = std::env::var_os("HOME") {
+            dialog = dialog.set_directory(home);
+        }
+        return dialog
+            .pick_file()
+            .await
+            .map(|f| f.path().to_string_lossy().to_string());
     }
-    dialog
-        .pick_file()
-        .await
-        .map(|f| f.path().to_string_lossy().to_string())
+    #[cfg(not(desktop))]
+    None
 }
 
 /// Installed desktop apps, de-duplicated by binary name and sorted by name.

@@ -11,3 +11,7 @@ vite.config.ts.timestamp-*
 
 # Local knowledge-graph cache (graphify)
 graphify-out/
+
+# Tauri Android: build-copied resources (Linux binaries copied by desktop
+# bundle.resources) — not source. The build dirs are ignored by gen/android/.gitignore.
+src-tauri/gen/android/app/src/main/assets/
