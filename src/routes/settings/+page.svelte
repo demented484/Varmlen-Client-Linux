@@ -31,6 +31,7 @@
     // Newest entries are at the end — show them.
     await tick();
     if (logEl) logEl.scrollTop = logEl.scrollHeight;
+    updateThumb();
   }
   async function openLog() {
     showLog = true;
@@ -41,6 +42,49 @@
       await clearVpnLog();
     } catch {}
     await refreshLog();
+  }
+
+  // Custom, touch-grabbable scrollbar for the log (the native WebView one is
+  // tiny and janky to drag). The thumb tracks scrollTop and, while dragged,
+  // captures the pointer so it stays grabbed until the finger lifts.
+  let thumbH = $state(0);
+  let thumbY = $state(0);
+  let trackH = $state(0);
+  let dragging = $state(false);
+  let dragStartY = 0;
+  let dragStartScroll = 0;
+  const MIN_THUMB = 44;
+
+  function updateThumb() {
+    const el = logEl;
+    if (!el) return;
+    trackH = el.clientHeight;
+    const ratio = el.scrollHeight > 0 ? el.clientHeight / el.scrollHeight : 1;
+    thumbH = ratio >= 1 ? 0 : Math.max(MIN_THUMB, trackH * ratio);
+    const maxScroll = el.scrollHeight - el.clientHeight;
+    const maxThumb = trackH - thumbH;
+    thumbY = maxScroll > 0 ? (el.scrollTop / maxScroll) * maxThumb : 0;
+  }
+  function onThumbDown(e: PointerEvent) {
+    if (!logEl) return;
+    dragging = true;
+    dragStartY = e.clientY;
+    dragStartScroll = logEl.scrollTop;
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    e.preventDefault();
+  }
+  function onThumbMove(e: PointerEvent) {
+    if (!dragging || !logEl) return;
+    const maxThumb = trackH - thumbH;
+    const maxScroll = logEl.scrollHeight - logEl.clientHeight;
+    if (maxThumb <= 0) return;
+    logEl.scrollTop = dragStartScroll + ((e.clientY - dragStartY) / maxThumb) * maxScroll;
+  }
+  function onThumbUp(e: PointerEvent) {
+    dragging = false;
+    try {
+      (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId);
+    } catch {}
   }
 
   // Autostart lives in ~/.config/autostart (backend is the source of truth);
@@ -594,7 +638,28 @@
           </svg>
         </button>
       </header>
-      <pre class="log-text" bind:this={logEl}>{logText || t("settings.logEmpty")}</pre>
+      <div class="log-wrap">
+        <pre id="vpn-log" class="log-text" bind:this={logEl} onscroll={updateThumb}>{logText || t("settings.logEmpty")}</pre>
+        {#if thumbH > 0}
+          <div class="log-sb">
+            <div
+              class="log-sb-thumb"
+              class:dragging
+              role="scrollbar"
+              aria-orientation="vertical"
+              aria-controls="vpn-log"
+              aria-label="Scroll log"
+              aria-valuenow={trackH > thumbH ? Math.round((thumbY / (trackH - thumbH)) * 100) : 0}
+              tabindex="-1"
+              style="height: {thumbH}px; transform: translateY({thumbY}px)"
+              onpointerdown={onThumbDown}
+              onpointermove={onThumbMove}
+              onpointerup={onThumbUp}
+              onpointercancel={onThumbUp}
+            ></div>
+          </div>
+        {/if}
+      </div>
       <div class="modal-actions">
         <button class="btn" onclick={wipeLog}>{t("settings.logClear")}</button>
         <button class="btn btn-primary" onclick={refreshLog} disabled={logBusy}>
@@ -624,24 +689,16 @@
     justify-content: flex-end;
     gap: 8px;
   }
-  /* Keep a visible scrollbar here even on touch (the app hides them globally). */
-  .log-text::-webkit-scrollbar {
-    width: 8px;
-    height: 8px;
-  }
-  .log-text::-webkit-scrollbar-thumb {
-    background: var(--border-strong);
-    border-radius: 4px;
-    /* A grabbable minimum length even when the log is very long. */
-    min-height: 44px;
-  }
-  .log-text::-webkit-scrollbar-track {
-    background: transparent;
+  .log-wrap {
+    position: relative;
+    flex: 1;
+    min-height: 0;
+    margin: 8px 0;
+    display: flex;
   }
   .log-text {
     flex: 1;
     overflow: auto;
-    margin: 8px 0;
     padding: 10px 12px;
     background: var(--bg-elev-2);
     border: 1px solid var(--border);
@@ -652,6 +709,34 @@
     white-space: pre-wrap;
     word-break: break-word;
     color: var(--text-muted);
+  }
+  /* Hide the native scrollbar — we draw our own grabbable one. */
+  .log-text::-webkit-scrollbar {
+    width: 0;
+    height: 0;
+  }
+  .log-sb {
+    position: absolute;
+    top: 4px;
+    bottom: 4px;
+    right: 3px;
+    width: 10px;
+  }
+  .log-sb-thumb {
+    position: absolute;
+    top: 0;
+    right: 0;
+    width: 10px;
+    border-radius: 5px;
+    background: var(--border-strong);
+    /* So the browser doesn't steal the touch for scrolling — we drive it. */
+    touch-action: none;
+    cursor: grab;
+  }
+  .log-sb-thumb.dragging,
+  .log-sb-thumb:active {
+    background: var(--text-dim);
+    cursor: grabbing;
   }
   .topbar {
     display: flex;

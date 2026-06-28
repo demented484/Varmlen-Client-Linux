@@ -261,19 +261,41 @@ fn label_from(fragment: Option<&str>, host: &str, port: u16) -> String {
     }
 }
 
-/// Parse JSON-form import input into servers. Accepts an xray/v2ray config
-/// (object with an `outbounds` array), a single outbound object, an array of
-/// outbound objects and/or share-link strings, or an object embedding those
-/// under common keys (servers/links/proxies/configs/list).
-pub fn parse_json_subscription(body: &str) -> Vec<VlessServer> {
+/// Parse JSON-form import input into (display name, servers). Accepts an
+/// xray/v2ray config (object with an `outbounds` array), a single outbound
+/// object, an array of outbound objects and/or share-link strings, or an object
+/// embedding those under common keys (servers/links/proxies/configs/list). The
+/// name comes from a top-level `remarks`/`name`/`ps`/`title` field.
+pub fn parse_json_subscription(body: &str) -> (Option<String>, Vec<VlessServer>) {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
-        return Vec::new();
+        return (None, Vec::new());
     };
+    let name = json_str_any(&v, &["remarks", "name", "ps", "title", "Profile-Title"]);
     let mut out = Vec::new();
     collect_json_servers(&v, &mut out, 0);
     let mut seen = std::collections::HashSet::new();
     out.retain(|s| seen.insert(s.id.clone()));
-    out
+    // A single-server config has no per-server label worth showing (the outbound
+    // tag is usually just "proxy"), so use the config's own name for it.
+    if out.len() == 1 {
+        if let Some(n) = &name {
+            out[0].label = n.clone();
+        }
+    }
+    (name, out)
+}
+
+/// First non-empty string value among `keys` on a JSON object.
+fn json_str_any(v: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    for k in keys {
+        if let Some(s) = v.get(k).and_then(|x| x.as_str()) {
+            let t = s.trim();
+            if !t.is_empty() {
+                return Some(t.to_string());
+            }
+        }
+    }
+    None
 }
 
 fn is_proxy_protocol(p: &str) -> bool {

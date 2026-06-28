@@ -287,6 +287,7 @@
         </div>
       </header>
 
+      {#if subs.hasTraffic(sub) || sub.webPageUrl || sub.supportUrl}
       <div class="sub-traffic">
         {#if sub.webPageUrl}
           <button class="round-btn" aria-label="Website" onclick={() => open(sub.webPageUrl)}>
@@ -297,9 +298,11 @@
             </svg>
           </button>
         {/if}
-        <div class="traffic-bar">
-          <span class="traffic-text">{subs.trafficText(sub)}</span>
-        </div>
+        {#if subs.hasTraffic(sub)}
+          <div class="traffic-bar">
+            <span class="traffic-text">{subs.trafficText(sub)}</span>
+          </div>
+        {/if}
         {#if sub.supportUrl}
           <button class="round-btn" aria-label="Telegram" onclick={() => open(sub.supportUrl)}>
             <svg width="23" height="23" viewBox="0 0 128 128" fill="currentColor" aria-hidden="true">
@@ -308,6 +311,7 @@
           </button>
         {/if}
       </div>
+      {/if}
 
       {#if sub.description}
         <div class="description">{sub.description}</div>

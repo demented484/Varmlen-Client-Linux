@@ -147,17 +147,22 @@ function toServerEntry(s: VlessServer): ServerEntry {
   };
 }
 
-function deriveSubName(result: ImportResult, url: string): string {
+/** "1.2.3.4:443" or "host:443" — an endpoint, not a human name. */
+function looksLikeEndpoint(s: string): boolean {
+  return /:\d{2,5}$/.test(s) || /^\d{1,3}(\.\d{1,3}){3}$/.test(s);
+}
+
+/** A display name from the import, or null when nothing human-readable is found
+ *  (the caller then assigns "Configuration N" / "Subscription N"). */
+function deriveSubName(result: ImportResult): string | null {
   if (result.meta.title) return result.meta.title;
   for (const s of result.servers) {
     const left = s.label.split(/[|·•—-]/)[0]?.trim();
-    if (left && left.length > 1 && left.length < 24) return left;
+    if (left && left.length > 1 && left.length < 24 && !looksLikeEndpoint(left)) {
+      return left;
+    }
   }
-  try {
-    return new URL(url).hostname;
-  } catch {
-    return "Subscription";
-  }
+  return null;
 }
 
 // Hydrate from localStorage once when the module first loads, before the
@@ -245,12 +250,29 @@ class SubsStore {
     this.persist();
   }
 
+  /** Whether the provider sent any traffic figures — gates the traffic pill, so
+   *  a bare config (no quota/usage) doesn't show a meaningless "0B". */
+  hasTraffic(sub: Subscription): boolean {
+    return sub.totalBytes > 0 || sub.usedBytes > 0;
+  }
+
   trafficText(sub: Subscription): string {
     const used = formatBytes(sub.usedBytes);
     // No quota (total=0 = unlimited) → show just the bare used figure, not
     // "X/∞" — the infinity denominator is noise when there's no cap.
     if (sub.totalBytes > 0) return `${used}/${formatBytes(sub.totalBytes)}`;
     return used;
+  }
+
+  /** Next "Configuration N" / "Subscription N" for an unnamed import. */
+  nextAutoName(kind: "Configuration" | "Subscription"): string {
+    const re = new RegExp(`^${kind} (\\d+)$`);
+    let max = 0;
+    for (const s of this.list) {
+      const m = s.name.match(re);
+      if (m) max = Math.max(max, parseInt(m[1], 10));
+    }
+    return `${kind} ${max + 1}`;
   }
 
   expiresText(sub: Subscription): string | null {
@@ -271,9 +293,12 @@ class SubsStore {
       const usedBytes =
         (result.meta.upload_bytes ?? 0) + (result.meta.download_bytes ?? 0);
 
+      const isUrl = /^https?:\/\//i.test(trimmed);
       const sub: Subscription = {
         id: crypto.randomUUID(),
-        name: deriveSubName(result, trimmed),
+        name:
+          deriveSubName(result) ??
+          this.nextAutoName(isUrl ? "Subscription" : "Configuration"),
         description: result.description,
         url: trimmed,
         importedAt: new Date().toISOString(),
