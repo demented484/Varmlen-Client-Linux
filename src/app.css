@@ -131,6 +131,18 @@ a {
   background: var(--border);
   border-radius: 3px;
 }
+/* Touch devices (Android): no always-on scrollbar strip. */
+@media (pointer: coarse) {
+  ::-webkit-scrollbar {
+    width: 0;
+    height: 0;
+  }
+  /* The scroll panels left-pad 6px to mirror the desktop scrollbar; even it up. */
+  .scroll,
+  .page {
+    padding-left: 14px;
+  }
+}
 
 /* ---------- common ---------- */
 .btn {

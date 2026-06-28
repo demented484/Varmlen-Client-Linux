@@ -76,6 +76,9 @@ class VpnPlugin(private val activity: Activity) : Plugin(activity) {
         intent.putExtra(VarmlenVpnService.EXTRA_DNS, args.dns)
         intent.putExtra(VarmlenVpnService.EXTRA_APPS, args.apps)
         intent.putExtra(VarmlenVpnService.EXTRA_APPS_ALLOW, args.appsAllow)
-        activity.startForegroundService(intent)
+        // startService (not startForegroundService): we're invoked from the
+        // foreground activity, so this is allowed and avoids the strict
+        // "must call startForeground within 5s" crash on Android 14+.
+        activity.startService(intent)
     }
 }

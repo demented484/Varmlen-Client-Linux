@@ -6,6 +6,7 @@
   import { capsGranted, grantCaps, autostartStatus, setAutostart } from "$lib/api";
   import Dropdown from "$lib/components/Dropdown.svelte";
   import { onMount } from "svelte";
+  import { isAndroid } from "$lib/platform";
 
   // Autostart lives in ~/.config/autostart (backend is the source of truth);
   // sync the toggles from it on open. `minimized` only applies when enabled.
@@ -469,6 +470,9 @@
     </div>
   {/if}
 
+  <!-- Network permissions (file caps via pkexec) are a desktop concept; on
+       Android the VPN consent dialog handles permission per-connect. -->
+  {#if !isAndroid}
   <section>
     <h2>{t("settings.helper")}</h2>
     <div class="list">
@@ -502,6 +506,7 @@
       {/if}
     </div>
   </section>
+  {/if}
 
 </main>
 
