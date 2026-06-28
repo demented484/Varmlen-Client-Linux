@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { placePopup } from "$lib/popup";
+  import { placePopup, portal } from "$lib/popup";
 
   interface Option<V extends string> {
     value: V;
@@ -90,6 +90,7 @@
   {#if open}
     <div
       bind:this={panel}
+      use:portal
       class="panel"
       role="listbox"
       style="top: {pos.top}px; right: {pos.right}px;"

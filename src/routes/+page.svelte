@@ -5,7 +5,7 @@
   import { t } from "$lib/i18n.svelte";
   import { readClipboard } from "$lib/api";
   import { isAndroid } from "$lib/platform";
-  import { placePopup } from "$lib/popup";
+  import { placePopup, portal } from "$lib/popup";
 
   import type { Subscription, ServerEntry } from "$lib/subs.svelte";
 
@@ -261,7 +261,7 @@
             </svg>
           </button>
           {#if openMenuFor === sub.id}
-            <div class="menu" role="menu" style="top: {menuPos.top}px; right: {menuPos.right}px;">
+            <div class="menu" role="menu" use:portal style="top: {menuPos.top}px; right: {menuPos.right}px;">
               <button role="menuitem" class="menu-item" onclick={() => openInfo(sub)}>
                 {t("menu.info")}
               </button>

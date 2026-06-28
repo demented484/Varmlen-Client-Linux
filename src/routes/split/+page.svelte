@@ -2,6 +2,7 @@
   import { split, type Mode } from "$lib/split.svelte";
   import { listInstalledApps, appFromFile, pickFile, type InstalledApp } from "$lib/api";
   import { t } from "$lib/i18n.svelte";
+  import { isAndroid } from "$lib/platform";
   import Dropdown from "$lib/components/Dropdown.svelte";
 
   type Tab = "apps" | "websites";
@@ -247,9 +248,13 @@
         {/if}
       </div>
 
-      <p class="muted small-note">{t("split.pickFileHint")}</p>
+      {#if !isAndroid}
+        <p class="muted small-note">{t("split.pickFileHint")}</p>
+      {/if}
       <div class="modal-actions">
-        <button class="btn" onclick={pickFromFile}>{t("split.chooseFile")}</button>
+        {#if !isAndroid}
+          <button class="btn" onclick={pickFromFile}>{t("split.chooseFile")}</button>
+        {/if}
         <button class="btn btn-primary" onclick={confirmAdd} disabled={selected.size === 0}>
           {t("split.addSelected", { n: selected.size })}
         </button>
@@ -461,7 +466,9 @@
   }
 
   .picker {
-    max-height: 320px;
+    /* Fixed height: the modal keeps its size as the search narrows results,
+       instead of shrinking/jumping. Matching apps fill top-to-bottom + scroll. */
+    height: 52vh;
     overflow-y: auto;
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
