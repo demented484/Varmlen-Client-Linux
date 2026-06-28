@@ -1,14 +1,4 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 640">
-  <!-- Rounded charcoal tile (lightened ~1.5 tones from pure black), transparent corners. -->
-  <rect x="0" y="0" width="640" height="640" rx="140" ry="140" fill="#2b2b2b"/>
-  <!-- White V mark (unchanged geometry). -->
-  <path d="M180 200
-           L320 490
-           L460 200
-           L401 200
-           L320 370
-           L239 200 Z"
-        fill="#fff"/>
-  <!-- Notch cut in the V — matches the tile colour. -->
-  <path d="M320 490 L297 442 L320 394 L343 442 Z" fill="#2b2b2b"/>
+  <rect width="640" height="640" rx="140" ry="140" fill="#2b2b2b"/>
+  <text x="320" y="455" text-anchor="middle" fill="#fff" font-family="DejaVu Sans" font-weight="bold" font-size="420">V</text>
 </svg>
