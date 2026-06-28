@@ -148,7 +148,12 @@
 
   .panel {
     position: fixed;
+    /* Content width (not auto) so it shrinks to its options rather than
+       stretching to the viewport's left edge in Android WebView. */
+    width: max-content;
     min-width: 160px;
+    max-width: calc(100vw - 24px);
+    left: auto;
     background: var(--bg-elev-2);
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);

@@ -632,6 +632,8 @@
   .log-text::-webkit-scrollbar-thumb {
     background: var(--border-strong);
     border-radius: 4px;
+    /* A grabbable minimum length even when the log is very long. */
+    min-height: 44px;
   }
   .log-text::-webkit-scrollbar-track {
     background: transparent;

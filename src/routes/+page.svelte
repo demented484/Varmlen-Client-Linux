@@ -764,7 +764,11 @@
   }
   .menu {
     position: fixed;
-    min-width: 200px;
+    /* Explicit width: a fixed element with right set + width:auto stretches to
+       the left edge in Android WebView instead of shrinking to its content. */
+    width: 240px;
+    max-width: calc(100vw - 24px);
+    left: auto;
     background: var(--bg-elev-2);
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
