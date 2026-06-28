@@ -2,6 +2,8 @@ mod apps;
 mod core;
 #[cfg(target_os = "android")]
 mod mobile_vpn;
+#[cfg(windows)]
+mod win_vpn;
 mod split;
 mod storage;
 mod subscription;

@@ -1,0 +1,13 @@
+{
+  "build": {
+    "beforeBuildCommand": "npm run build && cargo build --release --manifest-path helper/Cargo.toml && bash scripts/fetch-xray.sh"
+  },
+  "bundle": {
+    "resources": {
+      "../helper/target/release/varmlen-probe": "varmlen-probe",
+      "../helper/varmlen-setcap.sh": "varmlen-setcap.sh",
+      "../helper/uninstall.sh": "uninstall.sh",
+      "cores/xray": "xray"
+    }
+  }
+}

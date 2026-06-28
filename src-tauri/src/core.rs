@@ -121,7 +121,7 @@ fn bundled_core_path(app: &AppHandle, kind: CoreKind) -> Option<PathBuf> {
     if kind != CoreKind::Xray {
         return None;
     }
-    let p = app.path().resource_dir().ok()?.join("xray");
+    let p = app.path().resource_dir().ok()?.join(kind.bin_name());
     p.exists().then_some(p)
 }
 
@@ -330,14 +330,12 @@ pub async fn list_core_releases(kind: String) -> Result<Vec<CoreRelease>, String
 /// xray: `Xray-linux-64.zip` (amd64) / `Xray-linux-arm64-v8a.zip`.
 fn asset_matches(kind: CoreKind, name: &str) -> bool {
     match kind {
-        CoreKind::Xray => {
-            // The native-TUN host is Linux only.
-            match std::env::consts::ARCH {
-                "x86_64" => name == "Xray-linux-64.zip",
-                "aarch64" => name == "Xray-linux-arm64-v8a.zip",
-                _ => false,
-            }
-        }
+        CoreKind::Xray => match (std::env::consts::OS, std::env::consts::ARCH) {
+            ("linux", "x86_64") => name == "Xray-linux-64.zip",
+            ("linux", "aarch64") => name == "Xray-linux-arm64-v8a.zip",
+            ("windows", "x86_64") => name == "Xray-windows-64.zip",
+            _ => false,
+        },
     }
 }
 

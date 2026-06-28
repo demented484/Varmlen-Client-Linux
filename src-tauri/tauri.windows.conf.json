@@ -1,0 +1,18 @@
+{
+  "bundle": {
+    "resources": {
+      "cores/xray.exe": "xray.exe",
+      "cores/tun2socks.exe": "tun2socks.exe",
+      "cores/wintun.dll": "wintun.dll"
+    },
+    "windows": {
+      "nsis": {
+        "installMode": "perMachine",
+        "displayLanguageSelector": false
+      },
+      "webviewInstallMode": {
+        "type": "embedBootstrapper"
+      }
+    }
+  }
+}

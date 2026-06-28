@@ -35,14 +35,14 @@ pub struct HelperResponse {
 }
 
 impl HelperResponse {
-    fn connected(pid: u32) -> Self {
+    pub(crate) fn connected(pid: u32) -> Self {
         HelperResponse { ok: true, state: "connected".into(), pid: Some(pid), error: None, rtt_ms: None }
     }
-    fn disconnected() -> Self {
+    pub(crate) fn disconnected() -> Self {
         HelperResponse { ok: true, state: "disconnected".into(), pid: None, error: None, rtt_ms: None }
     }
     /// Tunnel died unexpectedly; the kill switch is holding traffic blocked.
-    fn dropped() -> Self {
+    pub(crate) fn dropped() -> Self {
         HelperResponse { ok: true, state: "dropped".into(), pid: None, error: None, rtt_ms: None }
     }
 }
@@ -92,6 +92,7 @@ static INTENTIONAL_STOP: AtomicBool = AtomicBool::new(false);
 
 /// React to an unexpected xray exit. Kill switch on → keep blocking (the point),
 /// just mark the phase. Off → restore direct connectivity via the helper cleanup.
+#[cfg(target_os = "linux")]
 fn handle_crash(app: &tauri::AppHandle, killswitch: bool) {
     use tauri::Emitter;
     if killswitch {
@@ -108,6 +109,7 @@ fn handle_crash(app: &tauri::AppHandle, killswitch: bool) {
 
 /// Poll the xray child once a second; on an unexpected exit, run `handle_crash`.
 /// Exits quietly when superseded (stale generation) or on an intentional stop.
+#[cfg(target_os = "linux")]
 fn spawn_crash_watcher(app: tauri::AppHandle, killswitch: bool, generation: u64) {
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_millis(1000));
@@ -147,6 +149,7 @@ fn pid_of(slot: &Mutex<Option<Child>>) -> Option<u32> {
 /// SIGTERM a child so it can tear down cleanly (xray closes its native tun fd,
 /// which removes the device), wait up to ~5s, then SIGKILL. The kernel routing
 /// is the helper's (`route-down`), not xray's.
+#[cfg(target_os = "linux")]
 fn terminate_gracefully(child: &mut Child) {
     let pid = child.id() as i32;
     unsafe { libc::kill(pid, libc::SIGTERM); }
@@ -168,19 +171,28 @@ fn terminate_gracefully(child: &mut Child) {
 /// we're quitting) + drop the killswitch + cleanup, so the tunnel never
 /// outlives the process. Idempotent. Called from the RunEvent::Exit handler.
 pub(crate) fn teardown_on_exit(app: &tauri::AppHandle) {
-    INTENTIONAL_STOP.store(true, Ordering::SeqCst);
-    if let Some(probe) = probe_bin(app) {
-        let _ = Command::new(&probe).arg("killswitch-down").status();
+    #[cfg(windows)]
+    {
+        crate::win_vpn::teardown_on_exit(app);
+        return;
     }
-    if let Some(mut c) = xray_child().lock().unwrap().take() {
-        let _ = c.kill();
-        let _ = c.wait();
-    }
-    if let Some(probe) = probe_bin(app) {
-        let _ = Command::new(&probe).arg("cleanup").status();
+    #[cfg(target_os = "linux")]
+    {
+        INTENTIONAL_STOP.store(true, Ordering::SeqCst);
+        if let Some(probe) = probe_bin(app) {
+            let _ = Command::new(&probe).arg("killswitch-down").status();
+        }
+        if let Some(mut c) = xray_child().lock().unwrap().take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+        if let Some(probe) = probe_bin(app) {
+            let _ = Command::new(&probe).arg("cleanup").status();
+        }
     }
 }
 
+#[cfg(target_os = "linux")]
 fn stop_all(app: &tauri::AppHandle) {
     if let Some(probe) = probe_bin(app) {
         let _ = Command::new(&probe).arg("killswitch-down").status();
@@ -197,7 +209,7 @@ fn stop_all(app: &tauri::AppHandle) {
     }
 }
 
-fn last_error_line(stderr: &str) -> String {
+pub(crate) fn last_error_line(stderr: &str) -> String {
     let strip = |s: &str| s.replace(|c: char| c == '\u{1b}', "");
     stderr
         .lines()
@@ -212,6 +224,7 @@ fn last_error_line(stderr: &str) -> String {
 
 /// Locate the bundled `varmlen-probe`. Dev: helper build output. Packaged: the
 /// copy placed in app-data/bin (resource → bin on first run; see grant_caps).
+#[cfg(target_os = "linux")]
 fn probe_bin(app: &tauri::AppHandle) -> Option<PathBuf> {
     use tauri::Manager;
     // Installed copy (what we setcap).
@@ -231,6 +244,7 @@ fn probe_bin(app: &tauri::AppHandle) -> Option<PathBuf> {
 
 /// The varmlen-probe source binary to install/setcap (resource in prod, dev build
 /// output otherwise).
+#[cfg(target_os = "linux")]
 fn probe_source(app: &tauri::AppHandle) -> Option<PathBuf> {
     use tauri::Manager;
     if let Ok(res) = app.path().resource_dir() {
@@ -243,6 +257,7 @@ fn probe_source(app: &tauri::AppHandle) -> Option<PathBuf> {
     dev.exists().then_some(dev)
 }
 
+#[cfg(target_os = "linux")]
 fn setcap_script(app: &tauri::AppHandle) -> Option<PathBuf> {
     use tauri::Manager;
     if let Ok(res) = app.path().resource_dir() {
@@ -255,6 +270,7 @@ fn setcap_script(app: &tauri::AppHandle) -> Option<PathBuf> {
     dev.exists().then_some(dev)
 }
 
+#[cfg(target_os = "linux")]
 fn old_helper_uninstall(app: &tauri::AppHandle) -> Option<PathBuf> {
     use tauri::Manager;
     if let Ok(res) = app.path().resource_dir() {
@@ -286,6 +302,7 @@ fn resolve_ips(host: &str) -> Vec<std::net::IpAddr> {
 // --- caps -------------------------------------------------------------------
 
 /// Does `bin` carry the given capability (substring match on getcap output)?
+#[cfg(target_os = "linux")]
 fn has_cap(bin: &PathBuf, cap: &str) -> bool {
     Command::new("getcap")
         .arg(bin)
@@ -299,6 +316,7 @@ fn has_cap(bin: &PathBuf, cap: &str) -> bool {
 /// (its native TUN needs CAP_NET_ADMIN) + varmlen-probe, optionally removing the
 /// legacy root helper too. Blocking (pkexec shows a password dialog) — call
 /// from spawn_blocking.
+#[cfg(target_os = "linux")]
 pub fn request_setcap_blocking(app: &tauri::AppHandle) -> Result<(), String> {
     let script = setcap_script(app).ok_or("setcap script not found")?;
     let xray = crate::core::binary_path(app, CoreKind::Xray)
@@ -324,6 +342,7 @@ pub fn request_setcap_blocking(app: &tauri::AppHandle) -> Result<(), String> {
 
 /// Copy the bundled varmlen-probe into app-data/bin (idempotent) so it has a
 /// stable path to setcap (resources get replaced on app update, clearing caps).
+#[cfg(target_os = "linux")]
 fn ensure_probe_installed(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     use tauri::Manager;
     let data = app.path().app_data_dir().map_err(|e| format!("app data dir: {e}"))?;
@@ -354,6 +373,7 @@ fn ensure_probe_installed(app: &tauri::AppHandle) -> Result<PathBuf, String> {
 
 // --- connect / disconnect ---------------------------------------------------
 
+#[cfg(target_os = "linux")]
 fn spawn_core(bin: &PathBuf, cfg_path: &PathBuf) -> Result<Child, String> {
     let mut child = Command::new(bin)
         .arg("run")
@@ -391,7 +411,7 @@ fn spawn_core(bin: &PathBuf, cfg_path: &PathBuf) -> Result<Child, String> {
     Ok(child)
 }
 
-fn runtime_dir() -> PathBuf {
+pub(crate) fn runtime_dir() -> PathBuf {
     let base = std::env::var("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| std::env::temp_dir());
@@ -410,7 +430,7 @@ fn runtime_dir() -> PathBuf {
 
 /// Write a config file containing credentials with 0600 perms (the runtime dir
 /// is already 0700; this is belt-and-suspenders).
-fn write_private(path: &PathBuf, content: &str) -> Result<(), String> {
+pub(crate) fn write_private(path: &PathBuf, content: &str) -> Result<(), String> {
     std::fs::write(path, content).map_err(|e| format!("write {}: {e}", path.display()))?;
     #[cfg(unix)]
     {
@@ -456,7 +476,31 @@ pub async fn vpn_connect(
         return Ok(HelperResponse::connected(0));
     }
 
-    #[cfg(not(target_os = "android"))]
+    #[cfg(windows)]
+    {
+        // Windows: xray runs as a local SOCKS proxy and tun2socks bridges a
+        // Wintun adapter to it (the Android model). build_route_rules already
+        // treats Tun2socks as the per-site-only path.
+        let _op = vpn_op_lock().lock().await;
+        let xray_cfg = serde_json::to_string(&build_xray_config(
+            &server, &split, &mode, TunMode::Tun2socks, allow_lan, &level,
+        ))
+        .map_err(|e| e.to_string())?;
+        let validate_cfg = xray_cfg.clone();
+        let server_host = server.host.clone();
+        let proxy_only = mode == "proxy";
+        tokio::task::spawn_blocking(move || -> Result<HelperResponse, String> {
+            let ips = resolve_ips(&server_host);
+            let pid = crate::win_vpn::connect(
+                &app, xray_cfg, validate_cfg, proxy_only, killswitch, allow_lan, ips,
+            )?;
+            Ok(HelperResponse::connected(pid))
+        })
+        .await
+        .map_err(|e| format!("join: {e}"))?
+    }
+
+    #[cfg(target_os = "linux")]
     {
     // Hold the op lock for the whole connect so it can't interleave with another
     // connect/disconnect and orphan a tunnel.
@@ -608,7 +652,7 @@ pub async fn vpn_connect(
 }
 
 /// Validate an xray config with `xray run -test -c <file>` before launch.
-fn validate_xray(bin: &PathBuf, cfg: &PathBuf) -> Result<(), String> {
+pub(crate) fn validate_xray(bin: &PathBuf, cfg: &PathBuf) -> Result<(), String> {
     let out = Command::new(bin)
         .arg("run")
         .arg("-test")
@@ -634,7 +678,13 @@ pub async fn vpn_disconnect(app: tauri::AppHandle) -> Result<HelperResponse, Str
         crate::mobile_vpn::disconnect(&app)?;
         return Ok(HelperResponse::disconnected());
     }
-    #[cfg(not(target_os = "android"))]
+    #[cfg(windows)]
+    {
+        let _op = vpn_op_lock().lock().await;
+        let _ = tokio::task::spawn_blocking(move || crate::win_vpn::disconnect(&app)).await;
+        Ok(HelperResponse::disconnected())
+    }
+    #[cfg(target_os = "linux")]
     {
         let _op = vpn_op_lock().lock().await;
         // A user-initiated stop: silence the crash watcher and drop to
@@ -656,7 +706,12 @@ pub async fn vpn_status(app: tauri::AppHandle) -> Result<HelperResponse, String>
             HelperResponse::disconnected()
         });
     }
-    #[cfg(not(target_os = "android"))]
+    #[cfg(windows)]
+    {
+        let _ = &app;
+        return Ok(crate::win_vpn::status());
+    }
+    #[cfg(target_os = "linux")]
     {
         let _ = &app;
         // The crash watcher owns the "dropped" phase (tunnel died, kill switch
@@ -761,21 +816,38 @@ pub async fn open_notification_settings(app: tauri::AppHandle) -> Result<(), Str
 /// "helper installed" check).
 #[tauri::command]
 pub async fn caps_granted(app: tauri::AppHandle) -> bool {
-    tokio::task::spawn_blocking(move || {
-        crate::core::binary_path(&app, CoreKind::Xray)
-            .map(|b| has_cap(&b, "cap_net_admin"))
-            .unwrap_or(false)
-    })
-    .await
-    .unwrap_or(false)
+    #[cfg(target_os = "linux")]
+    {
+        return tokio::task::spawn_blocking(move || {
+            crate::core::binary_path(&app, CoreKind::Xray)
+                .map(|b| has_cap(&b, "cap_net_admin"))
+                .unwrap_or(false)
+        })
+        .await
+        .unwrap_or(false);
+    }
+    // Windows elevates via the app manifest; Android uses the system VpnService.
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = &app;
+        true
+    }
 }
 
 /// Grant network permissions (setcap via pkexec). Replaces install_helper.
 #[tauri::command]
 pub async fn grant_caps(app: tauri::AppHandle) -> Result<(), String> {
-    tokio::task::spawn_blocking(move || request_setcap_blocking(&app))
-        .await
-        .map_err(|e| format!("join: {e}"))?
+    #[cfg(target_os = "linux")]
+    {
+        return tokio::task::spawn_blocking(move || request_setcap_blocking(&app))
+            .await
+            .map_err(|e| format!("join: {e}"))?;
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = &app;
+        Ok(())
+    }
 }
 
 // --- location ping ----------------------------------------------------------
@@ -806,6 +878,9 @@ fn tcp_ping_local(host: &str, port: u16, timeout: Duration) -> Result<u32, Strin
 pub async fn tcp_ping_host(app: tauri::AppHandle, host: String, port: u16, timeout_ms: Option<u32>) -> Result<u32, String> {
     let ms = timeout_ms.unwrap_or(2500);
     tokio::task::spawn_blocking(move || {
+        // The setcap'd probe (SO_MARK bypass) is Linux-only; elsewhere fall
+        // straight through to a plain source-bound connect.
+        #[cfg(target_os = "linux")]
         if let Some(probe) = probe_bin(&app) {
             let out = Command::new(&probe)
                 .arg("tcp").arg(&host).arg(port.to_string()).arg(ms.to_string())
@@ -818,6 +893,7 @@ pub async fn tcp_ping_host(app: tauri::AppHandle, host: String, port: u16, timeo
                 }
             }
         }
+        let _ = &app;
         tcp_ping_local(&host, port, Duration::from_millis(ms as u64))
     })
     .await

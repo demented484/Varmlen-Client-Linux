@@ -1,0 +1,63 @@
+name: windows-build
+
+on:
+  push:
+    branches: [main, windows-port]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Fetch Windows native binaries
+        shell: pwsh
+        run: |
+          $xray = "26.6.27"
+          $t2s = "v2.6.0"
+          New-Item -ItemType Directory -Force src-tauri/cores | Out-Null
+          # xray.exe + wintun.dll (Xray-core ships wintun.dll in the windows zip)
+          Invoke-WebRequest "https://github.com/XTLS/Xray-core/releases/download/v$xray/Xray-windows-64.zip" -OutFile xray.zip
+          Expand-Archive xray.zip -DestinationPath xray_tmp -Force
+          Copy-Item xray_tmp/xray.exe   src-tauri/cores/xray.exe   -Force
+          Copy-Item xray_tmp/wintun.dll src-tauri/cores/wintun.dll -Force
+          # tun2socks.exe
+          Invoke-WebRequest "https://github.com/xjasonlyu/tun2socks/releases/download/$t2s/tun2socks-windows-amd64.zip" -OutFile t2s.zip
+          Expand-Archive t2s.zip -DestinationPath t2s_tmp -Force
+          Copy-Item (Get-ChildItem t2s_tmp -Recurse -Filter "tun2socks*.exe" | Select-Object -First 1).FullName src-tauri/cores/tun2socks.exe -Force
+          Get-ChildItem src-tauri/cores
+
+      - name: Install npm deps
+        run: npm ci
+
+      - name: Rust unit tests (pure config-generation logic)
+        working-directory: src-tauri
+        run: cargo test --target x86_64-pc-windows-msvc --release
+
+      - name: Build Tauri (NSIS installer)
+        uses: tauri-apps/tauri-action@v0
+        with:
+          args: --target x86_64-pc-windows-msvc
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: Varmlen-windows-nsis
+          path: src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*-setup.exe
+          if-no-files-found: error
