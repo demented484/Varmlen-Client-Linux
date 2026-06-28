@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { placePopup } from "$lib/popup";
+
   interface Option<V extends string> {
     value: V;
     label: string;
@@ -27,7 +29,10 @@
   function toggle() {
     if (!open && trigger) {
       const r = trigger.getBoundingClientRect();
-      pos = { top: r.bottom + 4, right: window.innerWidth - r.right };
+      // Estimate the panel size for the flip decision (~37px per row + padding).
+      const h = options.length * 37 + 8;
+      const w = Math.max(180, r.width);
+      pos = placePopup(r, w, h);
     }
     open = !open;
   }

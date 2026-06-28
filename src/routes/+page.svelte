@@ -5,6 +5,7 @@
   import { t } from "$lib/i18n.svelte";
   import { readClipboard } from "$lib/api";
   import { isAndroid } from "$lib/platform";
+  import { placePopup } from "$lib/popup";
 
   import type { Subscription, ServerEntry } from "$lib/subs.svelte";
 
@@ -26,9 +27,30 @@
       return;
     }
     const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
-    menuPos = { top: r.bottom + 4, right: window.innerWidth - r.right };
+    // 4 items (~36px each) + padding; flip up / clamp so it always fits.
+    menuPos = placePopup(r, 200, 4 * 36 + 8);
     openMenuFor = subId;
   }
+
+  // Close the … menu on scroll / resize / outside-click — without a blocking
+  // backdrop, so the list still scrolls (and the menu hides the instant it does).
+  $effect(() => {
+    if (openMenuFor === null) return;
+    const close = () => (openMenuFor = null);
+    const onDown = (e: Event) => {
+      const t = e.target as Node | null;
+      if (t && (t as Element).closest?.(".menu, .head-btn")) return;
+      openMenuFor = null;
+    };
+    window.addEventListener("scroll", close, true);
+    window.addEventListener("resize", close);
+    document.addEventListener("pointerdown", onDown, true);
+    return () => {
+      window.removeEventListener("scroll", close, true);
+      window.removeEventListener("resize", close);
+      document.removeEventListener("pointerdown", onDown, true);
+    };
+  });
 
   /** The parsed vless:// fields, as label/value rows for the detail modal. */
   const detailRows = $derived.by(() => {
@@ -239,7 +261,6 @@
             </svg>
           </button>
           {#if openMenuFor === sub.id}
-            <div class="menu-backdrop" role="presentation" onclick={() => (openMenuFor = null)}></div>
             <div class="menu" role="menu" style="top: {menuPos.top}px; right: {menuPos.right}px;">
               <button role="menuitem" class="menu-item" onclick={() => openInfo(sub)}>
                 {t("menu.info")}
@@ -750,12 +771,6 @@
     box-shadow: var(--shadow);
     padding: 4px;
     z-index: 200;
-  }
-  .menu-backdrop {
-    position: fixed;
-    inset: 0;
-    z-index: 199;
-    background: transparent;
   }
   .menu-item {
     width: 100%;

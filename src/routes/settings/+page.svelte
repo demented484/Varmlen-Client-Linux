@@ -5,7 +5,7 @@
   import { core } from "$lib/core.svelte";
   import { capsGranted, grantCaps, autostartStatus, setAutostart, vpnLog, clearVpnLog } from "$lib/api";
   import Dropdown from "$lib/components/Dropdown.svelte";
-  import { onMount } from "svelte";
+  import { onMount, tick } from "svelte";
   import { isAndroid } from "$lib/platform";
 
   const logLevelOptions = $derived([
@@ -18,6 +18,7 @@
   let showLog = $state(false);
   let logText = $state("");
   let logBusy = $state(false);
+  let logEl = $state<HTMLElement>();
   async function refreshLog() {
     logBusy = true;
     try {
@@ -27,6 +28,9 @@
     } finally {
       logBusy = false;
     }
+    // Newest entries are at the end — show them.
+    await tick();
+    if (logEl) logEl.scrollTop = logEl.scrollHeight;
   }
   async function openLog() {
     showLog = true;
@@ -590,7 +594,7 @@
           </svg>
         </button>
       </header>
-      <pre class="log-text">{logText || t("settings.logEmpty")}</pre>
+      <pre class="log-text" bind:this={logEl}>{logText || t("settings.logEmpty")}</pre>
       <div class="modal-actions">
         <button class="btn" onclick={wipeLog}>{t("settings.logClear")}</button>
         <button class="btn btn-primary" onclick={refreshLog} disabled={logBusy}>
@@ -619,6 +623,18 @@
     display: flex;
     justify-content: flex-end;
     gap: 8px;
+  }
+  /* Keep a visible scrollbar here even on touch (the app hides them globally). */
+  .log-text::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  .log-text::-webkit-scrollbar-thumb {
+    background: var(--border-strong);
+    border-radius: 4px;
+  }
+  .log-text::-webkit-scrollbar-track {
+    background: transparent;
   }
   .log-text {
     flex: 1;
