@@ -69,18 +69,17 @@ async fn fetch_subscription(url: String) -> Result<ImportResult, String> {
         return Err("empty URL".to_string());
     }
 
-    // Pasted JSON: an xray/v2ray config, a single outbound, or an array.
+    // Pasted JSON: an xray/v2ray config, a single outbound, or an array. The
+    // config's `remarks` names the LOCATION (it's applied to the server label
+    // inside parse_json_subscription), not the subscription — a pasted config
+    // has no subscription title, so the UI labels it "Configuration N".
     if trimmed.starts_with('{') || trimmed.starts_with('[') {
-        let (name, servers) = parse_json_subscription(trimmed);
+        let (_name, servers) = parse_json_subscription(trimmed);
         if servers.is_empty() {
             return Err("no servers found in the JSON".to_string());
         }
-        let meta = SubscriptionMeta {
-            title: name,
-            ..Default::default()
-        };
         return Ok(ImportResult {
-            meta,
+            meta: SubscriptionMeta::default(),
             servers,
             description: None,
         });

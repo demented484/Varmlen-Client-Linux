@@ -82,7 +82,7 @@
   // Live-reconnect when the config changes (location / split / mode / settings)
   // while connected. Reading these here registers them as effect dependencies.
   $effect(() => {
-    void subs.selectedServerId;
+    void subs.selectedKey;
     void settings.vpnMode;
     void settings.killswitch;
     void settings.allowLan;

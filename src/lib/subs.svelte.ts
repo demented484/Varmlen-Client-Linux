@@ -57,6 +57,14 @@ export interface Subscription {
 interface Persisted {
   subs: Subscription[];
   selectedServerId: string | null;
+  /** Stable host:port of the selection — survives a refresh (which reassigns the
+   *  per-entry random ids) so the chosen location stays chosen. */
+  selectedKey: string | null;
+}
+
+/** Stable identity of a server entry (random `id` changes on every parse). */
+function serverKey(srv: ServerEntry): string {
+  return srv.raw ? `${srv.raw.host}:${srv.raw.port}` : srv.id;
 }
 
 const KEY = "varmlen.subs";
@@ -100,23 +108,26 @@ function migrateIds(subs: Subscription[]): { subs: Subscription[]; remapped: Rec
 }
 
 function load(): Persisted {
-  if (!browser) return { subs: [], selectedServerId: null };
+  if (!browser) return { subs: [], selectedServerId: null, selectedKey: null };
   try {
     const raw = localStorage.getItem(KEY);
-    if (!raw) return { subs: [], selectedServerId: null };
+    if (!raw) return { subs: [], selectedServerId: null, selectedKey: null };
     const parsed = JSON.parse(raw) as Partial<Persisted>;
     const rawSubs = Array.isArray(parsed.subs) ? parsed.subs : [];
     const { subs, remapped } = migrateIds(rawSubs);
     let selected: string | null =
       typeof parsed.selectedServerId === "string" ? parsed.selectedServerId : null;
     if (selected && remapped[selected]) selected = remapped[selected];
-    // If the persisted selection points at an id we no longer have, drop it.
+    // If the persisted selection points at an id we no longer have, drop it
+    // (reconcileSelection re-resolves it from selectedKey on construction).
     if (selected && !subs.some((s) => s.servers.some((sv) => sv.id === selected))) {
       selected = null;
     }
-    return { subs, selectedServerId: selected };
+    const selectedKey =
+      typeof parsed.selectedKey === "string" ? parsed.selectedKey : null;
+    return { subs, selectedServerId: selected, selectedKey };
   } catch {
-    return { subs: [], selectedServerId: null };
+    return { subs: [], selectedServerId: null, selectedKey: null };
   }
 }
 
@@ -147,22 +158,12 @@ function toServerEntry(s: VlessServer): ServerEntry {
   };
 }
 
-/** "1.2.3.4:443" or "host:443" — an endpoint, not a human name. */
-function looksLikeEndpoint(s: string): boolean {
-  return /:\d{2,5}$/.test(s) || /^\d{1,3}(\.\d{1,3}){3}$/.test(s);
-}
-
-/** A display name from the import, or null when nothing human-readable is found
- *  (the caller then assigns "Configuration N" / "Subscription N"). */
+/** The subscription's OWN name (Profile-Title / a real title), or null. A
+ *  location/server label is deliberately NOT used here — the subscription name
+ *  is a separate thing; when it's absent the caller assigns "Configuration N" /
+ *  "Subscription N". */
 function deriveSubName(result: ImportResult): string | null {
-  if (result.meta.title) return result.meta.title;
-  for (const s of result.servers) {
-    const left = s.label.split(/[|·•—-]/)[0]?.trim();
-    if (left && left.length > 1 && left.length < 24 && !looksLikeEndpoint(left)) {
-      return left;
-    }
-  }
-  return null;
+  return result.meta.title?.trim() || null;
 }
 
 // Hydrate from localStorage once when the module first loads, before the
@@ -173,10 +174,16 @@ const _initialSubs = load();
 class SubsStore {
   list = $state<Subscription[]>(_initialSubs.subs);
   selectedServerId = $state<string | null>(_initialSubs.selectedServerId);
+  selectedKey = $state<string | null>(_initialSubs.selectedKey);
   importing = $state(false);
 
   private autoRefreshStarted = false;
   private autoRefreshTimer: ReturnType<typeof setInterval> | null = null;
+
+  constructor() {
+    // Re-resolve / auto-pick a location from the persisted state on startup.
+    this.reconcileSelection();
+  }
 
   private persist(): void {
     if (!browser) return;
@@ -185,12 +192,36 @@ class SubsStore {
       JSON.stringify({
         subs: this.list,
         selectedServerId: this.selectedServerId,
+        selectedKey: this.selectedKey,
       }),
     );
   }
 
   selectServer(id: string): void {
     this.selectedServerId = id;
+    const srv = this.list.flatMap((s) => s.servers).find((s) => s.id === id);
+    if (srv) this.selectedKey = serverKey(srv);
+    this.persist();
+  }
+
+  /** Keep a location selected: the per-entry `id` is regenerated on every parse
+   *  (refresh/re-import), so resolve the selection by its stable host:port key,
+   *  and auto-pick the first location when nothing is selected. */
+  reconcileSelection(): void {
+    const all = this.list.flatMap((s) => s.servers);
+    if (all.length === 0) {
+      this.selectedServerId = null;
+      this.selectedKey = null;
+      this.persist();
+      return;
+    }
+    let current = all.find((s) => s.id === this.selectedServerId);
+    if (!current && this.selectedKey) {
+      current = all.find((s) => serverKey(s) === this.selectedKey);
+    }
+    if (!current) current = all[0];
+    this.selectedServerId = current.id;
+    this.selectedKey = serverKey(current);
     this.persist();
   }
 
@@ -225,12 +256,7 @@ class SubsStore {
 
   remove(subId: string): void {
     this.list = this.list.filter((s) => s.id !== subId);
-    if (
-      this.selectedServerId &&
-      !this.list.some((s) => s.servers.some((sv) => sv.id === this.selectedServerId))
-    ) {
-      this.selectedServerId = null;
-    }
+    this.reconcileSelection();
     this.prunePings();
     this.persist();
   }
@@ -313,10 +339,8 @@ class SubsStore {
         pinned: false,
       };
       this.list = [...this.list, sub];
-      if (!this.selectedServerId && servers.length > 0) {
-        this.selectedServerId = servers[0].id;
-      }
-      this.persist();
+      // Auto-select the first location if none is chosen yet.
+      this.reconcileSelection();
     } finally {
       this.importing = false;
     }
@@ -361,7 +385,9 @@ class SubsStore {
             }
           : s,
       );
-      this.persist();
+      // The server IDs were just regenerated — re-resolve the selection from its
+      // stable key so the chosen location stays chosen.
+      this.reconcileSelection();
       // The old server IDs were just dropped (new ones are random) — drop their
       // now-dead ping entries.
       this.prunePings();
