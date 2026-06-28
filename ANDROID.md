@@ -22,8 +22,11 @@ Connect (UI) → vpn_connect (Rust, cfg android) → mobile_vpn::connect
 
 - **xray** runs as the bundled `libxray.so` (Android arm64 binary), exec'd from
   `nativeLibraryDir` — `useLegacyPackaging = true` extracts it.
-- **tun2socks** is hev-socks5-tunnel (`libhev-socks5-tunnel.so`), called through
-  a tiny JNI shim (`jni/tproxy.c` → `libtproxy.so`).
+- **tun2socks** is hev-socks5-tunnel (`libhev-socks5-tunnel.so`), built with
+  `-DPKGNAME=app/varmlen/client` so its **built-in** Android JNI registers
+  `TProxyStartService`/`TProxyStopService` onto `app.varmlen.client.TProxyService`
+  (it spawns hev's work thread with the right signal mask — a hand-rolled
+  `hev_socks5_tunnel_main` call on a JVM thread segfaults).
 - Per-app split maps to package names: selective = `addAllowedApplication`,
   general = `addDisallowedApplication`.
 

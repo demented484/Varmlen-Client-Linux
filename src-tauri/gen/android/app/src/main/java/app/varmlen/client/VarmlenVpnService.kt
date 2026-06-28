@@ -76,7 +76,8 @@ class VarmlenVpnService : VpnService() {
                 }
             }
         }
-        return START_STICKY
+        // NOT_STICKY: never auto-restart (a restart loop made the app unlaunchable).
+        return START_NOT_STICKY
     }
 
     private fun startAll(
@@ -136,7 +137,7 @@ class VarmlenVpnService : VpnService() {
         """.trimIndent()
         val hevFile = File(filesDir, "hev.yaml").apply { writeText(yaml) }
         log("tun2socks starting (native)")
-        TProxy.startTun2socks(hevFile.absolutePath, fd.fd)
+        TProxyService.TProxyStartService(hevFile.absolutePath, fd.fd)
 
         running = true
         log("connected")
@@ -144,7 +145,7 @@ class VarmlenVpnService : VpnService() {
 
     private fun stopAll() {
         running = false
-        try { TProxy.stopTun2socks() } catch (_: Throwable) {}
+        try { TProxyService.TProxyStopService() } catch (_: Throwable) {}
         try { xray?.destroy() } catch (_: Throwable) {}
         xray = null
         try { tun?.close() } catch (_: Throwable) {}

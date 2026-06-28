@@ -5,7 +5,7 @@ export type VpnMode = "tun" | "proxy";
  *  (bypasses the tunnel, works disconnected). `proxy` = an HTTP GET routed
  *  through a throwaway xray per server (via-proxy latency). */
 export type PingMethod = "tcp" | "proxy";
-export type LogLevel = "debug" | "info" | "warning" | "error";
+export type LogLevel = "debug" | "warn" | "error";
 
 interface Persisted {
   vpnMode: VpnMode;
@@ -25,10 +25,10 @@ const DEFAULTS: Persisted = {
   allowLan: true,
   pingMethod: "tcp",
   closeToTray: true,
-  logLevel: "warning",
+  logLevel: "warn",
 };
 
-const LOG_LEVELS: LogLevel[] = ["debug", "info", "warning", "error"];
+const LOG_LEVELS: LogLevel[] = ["debug", "warn", "error"];
 
 function load(): Persisted {
   if (!browser) return DEFAULTS;

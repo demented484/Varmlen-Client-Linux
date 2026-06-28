@@ -10,8 +10,7 @@
 
   const logLevelOptions = $derived([
     { value: "debug", label: "debug" },
-    { value: "info", label: "info" },
-    { value: "warning", label: "warning" },
+    { value: "warn", label: "warn" },
     { value: "error", label: "error" },
   ]);
 

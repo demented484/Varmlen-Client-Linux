@@ -26,11 +26,6 @@ android {
         // We ship arm64 native libs (xray + tun2socks); build the JNI shim for it.
         ndk { abiFilters += listOf("arm64-v8a") }
     }
-    externalNativeBuild {
-        cmake {
-            path = file("src/main/jni/CMakeLists.txt")
-        }
-    }
     // Extract native libs to disk so the bundled xray binary (libxray.so) can be
     // exec'd from nativeLibraryDir.
     packaging {

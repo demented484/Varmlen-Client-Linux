@@ -63,6 +63,9 @@
 
 * {
   box-sizing: border-box;
+  /* No blue tap flash / long-press callout on Android WebView. */
+  -webkit-tap-highlight-color: transparent;
+  -webkit-touch-callout: none;
 }
 
 html,
@@ -137,11 +140,6 @@ a {
     width: 0;
     height: 0;
   }
-  /* The scroll panels left-pad 6px to mirror the desktop scrollbar; even it up. */
-  .scroll,
-  .page {
-    padding-left: 14px;
-  }
 }
 
 /* Android draws edge-to-edge (status bar over the app); shift the top bars down
@@ -157,6 +155,9 @@ a {
 .is-android .page,
 .is-android .scroll {
   top: calc(var(--sat) + 46px) !important;
+  /* Even up the side padding (the panels left-pad 6px to mirror the desktop
+     scrollbar, which is gone here — that pushed everything toward the right). */
+  padding-left: 14px !important;
   /* Extra bottom room so the last item clears the tab bar + gesture nav. */
   padding-bottom: calc(28px + env(safe-area-inset-bottom)) !important;
 }
