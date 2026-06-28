@@ -80,6 +80,20 @@ pub fn clear_log<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+#[derive(serde::Deserialize)]
+struct AppsResp {
+    apps: Vec<crate::apps::InstalledApp>,
+}
+
+/// The launchable packages on the device (for the split-tunnel app picker).
+pub fn list_apps<R: Runtime>(app: &AppHandle<R>) -> Result<Vec<crate::apps::InstalledApp>, String> {
+    let vpn = app.state::<Vpn<R>>();
+    vpn.0
+        .run_mobile_plugin::<AppsResp>("listApps", ())
+        .map(|r| r.apps)
+        .map_err(|e| e.to_string())
+}
+
 pub fn disconnect<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     let vpn = app.state::<Vpn<R>>();
     vpn.0

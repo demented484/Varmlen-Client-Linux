@@ -9,6 +9,7 @@ import app.tauri.annotation.Command
 import app.tauri.annotation.InvokeArg
 import app.tauri.annotation.TauriPlugin
 import app.tauri.plugin.Invoke
+import app.tauri.plugin.JSArray
 import app.tauri.plugin.JSObject
 import app.tauri.plugin.Plugin
 
@@ -81,6 +82,27 @@ class VpnPlugin(private val activity: Activity) : Plugin(activity) {
     fun clearLog(invoke: Invoke) {
         try { java.io.File(activity.filesDir, VarmlenVpnService.LOG_FILE).writeText("") } catch (_: Throwable) {}
         invoke.resolve()
+    }
+
+    /** Launchable apps (the ones a user recognises), for the split-tunnel picker. */
+    @Command
+    fun listApps(invoke: Invoke) {
+        val pm = activity.packageManager
+        val main = Intent(Intent.ACTION_MAIN, null).addCategory(Intent.CATEGORY_LAUNCHER)
+        val arr = JSArray()
+        val seen = HashSet<String>()
+        for (ri in pm.queryIntentActivities(main, 0)) {
+            val pkg = ri.activityInfo?.packageName ?: continue
+            if (pkg == activity.packageName || !seen.add(pkg)) continue
+            val o = JSObject()
+            o.put("id", pkg)
+            o.put("name", ri.loadLabel(pm).toString())
+            o.put("icon", null)
+            arr.put(o)
+        }
+        val ret = JSObject()
+        ret.put("apps", arr)
+        invoke.resolve(ret)
     }
 
     private fun startVpn(args: ConnectArgs) {

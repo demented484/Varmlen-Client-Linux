@@ -85,6 +85,10 @@ class VarmlenVpnService : VpnService() {
         apps: Array<String>, appsAllow: Boolean, logLevel: String
     ) {
         log("startAll socksPort=$socksPort dns=$dns apps=${apps.size} allow=$appsAllow level=$logLevel")
+        // Tear down any previous instance first — a reconnect (e.g. after a split
+        // change) must not stack a second xray on the same port or clobber hev's
+        // single work thread.
+        teardown()
         startForegroundSafe()
 
         // 1) xray as a local SOCKS proxy (the generated config binds 127.0.0.1:socksPort).
@@ -143,13 +147,18 @@ class VarmlenVpnService : VpnService() {
         log("connected")
     }
 
-    private fun stopAll() {
-        running = false
+    /** Stop hev + xray + the tun, but leave the service running (used to restart). */
+    private fun teardown() {
         try { TProxyService.TProxyStopService() } catch (_: Throwable) {}
         try { xray?.destroy() } catch (_: Throwable) {}
         xray = null
         try { tun?.close() } catch (_: Throwable) {}
         tun = null
+    }
+
+    private fun stopAll() {
+        running = false
+        teardown()
         try { stopForeground(STOP_FOREGROUND_REMOVE) } catch (_: Throwable) {}
         stopSelf()
     }

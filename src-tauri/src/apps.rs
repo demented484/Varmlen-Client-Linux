@@ -10,9 +10,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use base64::Engine;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct InstalledApp {
     /// Process / binary name used to match the running app (e.g. "firefox").
     pub id: String,
@@ -377,9 +377,24 @@ pub async fn pick_file() -> Option<String> {
     None
 }
 
-/// Installed desktop apps, de-duplicated by binary name and sorted by name.
+/// Installed apps for the split-tunnel picker. Desktop: parsed `.desktop`
+/// entries (id = binary name). Android: the launchable packages from
+/// PackageManager (id = package name).
 #[tauri::command]
-pub fn list_installed_apps() -> Vec<InstalledApp> {
+pub async fn list_installed_apps(app: tauri::AppHandle) -> Vec<InstalledApp> {
+    #[cfg(target_os = "android")]
+    {
+        return crate::mobile_vpn::list_apps(&app).unwrap_or_default();
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = &app;
+        list_desktop_apps()
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+fn list_desktop_apps() -> Vec<InstalledApp> {
     let icon_index = build_icon_index();
     let mut by_id: BTreeMap<String, InstalledApp> = BTreeMap::new();
     for dir in desktop_dirs() {
