@@ -110,6 +110,34 @@ pub fn xray_paths<R: Runtime>(app: &AppHandle<R>) -> Result<(String, String), St
         .map_err(|e| e.to_string())
 }
 
+#[derive(serde::Deserialize)]
+struct ClipResp {
+    text: String,
+}
+
+/// Read the system clipboard (WebView blocks navigator.clipboard on Android).
+pub fn read_clipboard<R: Runtime>(app: &AppHandle<R>) -> Result<String, String> {
+    let vpn = app.state::<Vpn<R>>();
+    vpn.0
+        .run_mobile_plugin::<ClipResp>("readClipboard", ())
+        .map(|r| r.text)
+        .map_err(|e| e.to_string())
+}
+
+#[derive(Serialize)]
+struct BarStyleArgs {
+    light: bool,
+}
+
+/// Set the system-bar icon colour to match the app theme.
+pub fn set_bar_style<R: Runtime>(app: &AppHandle<R>, light: bool) -> Result<(), String> {
+    let vpn = app.state::<Vpn<R>>();
+    vpn.0
+        .run_mobile_plugin::<serde_json::Value>("setBarStyle", BarStyleArgs { light })
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
 pub fn disconnect<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     let vpn = app.state::<Vpn<R>>();
     vpn.0

@@ -262,6 +262,8 @@ pub fn run() {
             vpn::proxy_get_ping,
             vpn::vpn_log,
             vpn::clear_vpn_log,
+            vpn::read_clipboard,
+            vpn::set_status_bar,
             tray::set_tray_status,
             tray::set_close_to_tray,
             tray::set_autostart,

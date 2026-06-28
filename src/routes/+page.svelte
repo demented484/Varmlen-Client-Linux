@@ -3,6 +3,8 @@
   import { conn } from "$lib/conn.svelte";
   import { subs } from "$lib/subs.svelte";
   import { t } from "$lib/i18n.svelte";
+  import { readClipboard } from "$lib/api";
+  import { isAndroid } from "$lib/platform";
 
   import type { Subscription, ServerEntry } from "$lib/subs.svelte";
 
@@ -108,7 +110,8 @@
     importError = null;
     let text = "";
     try {
-      text = (await navigator.clipboard.readText())?.trim() ?? "";
+      // Android's WebView blocks navigator.clipboard, so read it natively there.
+      text = (isAndroid ? await readClipboard() : await navigator.clipboard.readText())?.trim() ?? "";
     } catch {
       // Clipboard blocked — fall back to manual entry.
       importMode = "manual";

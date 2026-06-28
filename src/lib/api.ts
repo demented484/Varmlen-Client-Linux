@@ -193,6 +193,16 @@ export function vpnLog(): Promise<string> {
   return invoke<string>("vpn_log");
 }
 
+/** Read the system clipboard (Android — desktop uses navigator.clipboard). */
+export function readClipboard(): Promise<string> {
+  return invoke<string>("read_clipboard");
+}
+
+/** Match the Android system-bar icons to the app theme (no-op on desktop). */
+export function setStatusBar(light: boolean): Promise<void> {
+  return invoke<void>("set_status_bar", { light });
+}
+
 export function clearVpnLog(): Promise<void> {
   return invoke<void>("clear_vpn_log");
 }

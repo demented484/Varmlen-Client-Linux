@@ -1,6 +1,8 @@
 package app.varmlen.client
 
 import android.app.Activity
+import android.content.ClipboardManager
+import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.Canvas
@@ -10,6 +12,7 @@ import android.net.VpnService
 import android.util.Base64
 import java.io.ByteArrayOutputStream
 import androidx.activity.result.ActivityResult
+import androidx.core.view.WindowCompat
 import app.tauri.annotation.ActivityCallback
 import app.tauri.annotation.Command
 import app.tauri.annotation.InvokeArg
@@ -18,6 +21,12 @@ import app.tauri.plugin.Invoke
 import app.tauri.plugin.JSArray
 import app.tauri.plugin.JSObject
 import app.tauri.plugin.Plugin
+
+@InvokeArg
+class BarStyleArgs {
+    /** true when the app is in LIGHT theme → dark system-bar icons. */
+    var light: Boolean = false
+}
 
 @InvokeArg
 class ConnectArgs {
@@ -87,6 +96,33 @@ class VpnPlugin(private val activity: Activity) : Plugin(activity) {
     @Command
     fun clearLog(invoke: Invoke) {
         try { java.io.File(activity.filesDir, VarmlenVpnService.LOG_FILE).writeText("") } catch (_: Throwable) {}
+        invoke.resolve()
+    }
+
+    /** Read the system clipboard (Android blocks navigator.clipboard in WebView). */
+    @Command
+    fun readClipboard(invoke: Invoke) {
+        val ret = JSObject()
+        val text = try {
+            val cm = activity.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            cm.primaryClip?.getItemAt(0)?.coerceToText(activity)?.toString() ?: ""
+        } catch (_: Throwable) { "" }
+        ret.put("text", text)
+        invoke.resolve(ret)
+    }
+
+    /** Dark/light system-bar icons to match the app theme. */
+    @Command
+    fun setBarStyle(invoke: Invoke) {
+        val args = invoke.parseArgs(BarStyleArgs::class.java)
+        activity.runOnUiThread {
+            try {
+                val w = activity.window
+                val c = WindowCompat.getInsetsController(w, w.decorView)
+                c.isAppearanceLightStatusBars = args.light
+                c.isAppearanceLightNavigationBars = args.light
+            } catch (_: Throwable) {}
+        }
         invoke.resolve()
     }
 

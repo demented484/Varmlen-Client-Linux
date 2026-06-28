@@ -699,6 +699,34 @@ pub async fn clear_vpn_log(app: tauri::AppHandle) -> Result<(), String> {
     }
 }
 
+/// Read the system clipboard. Android only — desktop uses navigator.clipboard.
+#[tauri::command]
+pub async fn read_clipboard(app: tauri::AppHandle) -> Result<String, String> {
+    #[cfg(target_os = "android")]
+    {
+        return crate::mobile_vpn::read_clipboard(&app);
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = &app;
+        Err("use navigator.clipboard on desktop".to_string())
+    }
+}
+
+/// Match the Android system-bar icon colour to the app theme (light → dark icons).
+#[tauri::command]
+pub async fn set_status_bar(app: tauri::AppHandle, light: bool) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        return crate::mobile_vpn::set_bar_style(&app, light);
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (&app, light);
+        Ok(())
+    }
+}
+
 /// Whether the cores have the capabilities they need (replaces the old
 /// "helper installed" check).
 #[tauri::command]

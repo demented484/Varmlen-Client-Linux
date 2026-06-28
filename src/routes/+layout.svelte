@@ -9,9 +9,10 @@
   import { subs } from "$lib/subs.svelte";
   import { split } from "$lib/split.svelte";
   import { settings } from "$lib/settings.svelte";
-  import { readLegacyStorage, setTrayStatus, setCloseToTray } from "$lib/api";
+  import { readLegacyStorage, setTrayStatus, setCloseToTray, setStatusBar } from "$lib/api";
   import { listen } from "@tauri-apps/api/event";
-  import "$lib/theme.svelte"; // module-level init applies persisted theme
+  import { theme } from "$lib/theme.svelte";
+  import { isAndroid } from "$lib/platform";
 
   /** One-shot migration on first launch in a new origin (e.g. release vs dev
    *  use different WebKit storage). Pulls everything from the previous
@@ -90,6 +91,12 @@
     void split.apps;
     void split.sites;
     conn.onConfigChanged();
+  });
+
+  // Android: match the system-bar icon colour to the theme (light theme → dark
+  // icons, so the clock / battery / wifi stay visible on the white background).
+  $effect(() => {
+    if (isAndroid) setStatusBar(theme.current === "light").catch(() => {});
   });
 </script>
 
