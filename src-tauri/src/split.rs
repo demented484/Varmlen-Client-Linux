@@ -13,14 +13,19 @@
 
 use serde::Deserialize;
 
-/// Split-tunnel selection passed from the UI (only enabled entries).
+/// Split-tunnel selection passed from the UI (only enabled entries). Apps and
+/// sites carry INDEPENDENT modes.
 #[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct SplitInput {
-    /// "selective" | "general". Empty string is treated as "general" so an
-    /// uninitialised input doesn't accidentally cut the user's network.
+    /// Apps mode: "selective" | "general". Empty → "general" so an uninitialised
+    /// input doesn't accidentally cut the user's network.
     #[serde(default)]
-    pub mode: String,
-    /// Process / binary names of enabled apps.
+    pub apps_mode: String,
+    /// Sites mode: "selective" | "general".
+    #[serde(default)]
+    pub sites_mode: String,
+    /// Process / binary names (desktop) or package names (Android) of enabled apps.
     #[serde(default)]
     pub apps: Vec<String>,
     /// Enabled site patterns (e.g. "example.com" or "*.example.com").
@@ -29,9 +34,13 @@ pub struct SplitInput {
 }
 
 impl SplitInput {
-    /// selective = whitelist (only listed entries are tunneled).
-    pub fn is_selective(&self) -> bool {
-        self.mode == "selective"
+    /// selective = whitelist (only listed apps are tunneled).
+    pub fn apps_selective(&self) -> bool {
+        self.apps_mode == "selective"
+    }
+    /// selective = whitelist (only listed sites are tunneled).
+    pub fn sites_selective(&self) -> bool {
+        self.sites_mode == "selective"
     }
 
     /// Enabled, non-empty app/process names.

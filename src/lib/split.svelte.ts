@@ -7,7 +7,7 @@ export interface AppEntry {
   id: string;
   /** Display name. */
   name: string;
-  /** Emoji or short text placeholder until we resolve real icons. */
+  /** Emoji, short text, or a `data:` icon URI. */
   icon: string;
   enabled: boolean;
 }
@@ -18,38 +18,39 @@ export interface SiteEntry {
   enabled: boolean;
 }
 
-interface Bucket {
-  apps: AppEntry[];
-  sites: SiteEntry[];
+interface ModeBuckets<T> {
+  general: T[];
+  selective: T[];
 }
 
-/** Each mode keeps its OWN apps + sites, so switching general↔selective swaps
- *  the whole list. The mode still governs whether the listed entries are the
- *  blacklist (general: listed stay direct) or the whitelist (selective: only
- *  listed are tunneled). */
+/** Apps and sites are INDEPENDENT: each has its own mode and its own per-mode
+ *  lists. Switching a category's mode swaps that category's list; the mode
+ *  governs whether the listed entries are the blacklist (general: listed stay
+ *  direct) or the whitelist (selective: only listed are tunneled). */
 interface Persisted {
-  mode: Mode;
-  general: Bucket;
-  selective: Bucket;
+  appsMode: Mode;
+  sitesMode: Mode;
+  apps: ModeBuckets<AppEntry>;
+  sites: ModeBuckets<SiteEntry>;
 }
 
 const KEY = "varmlen.split";
 
-function emptyBucket(): Bucket {
-  return { apps: [], sites: [] };
-}
-
 function defaults(): Persisted {
   // Default to "general": VPN carries everything, exceptions are direct.
-  return { mode: "general", general: emptyBucket(), selective: emptyBucket() };
+  return {
+    appsMode: "general",
+    sitesMode: "general",
+    apps: { general: [], selective: [] },
+    sites: { general: [], selective: [] },
+  };
 }
 
-function asBucket(x: unknown): Bucket {
-  const o = (x ?? {}) as Record<string, unknown>;
-  return {
-    apps: Array.isArray(o.apps) ? (o.apps as AppEntry[]) : [],
-    sites: Array.isArray(o.sites) ? (o.sites as SiteEntry[]) : [],
-  };
+function asMode(x: unknown): Mode {
+  return x === "selective" ? "selective" : "general";
+}
+function arr<T>(x: unknown): T[] {
+  return Array.isArray(x) ? (x as T[]) : [];
 }
 
 function load(): Persisted {
@@ -57,28 +58,55 @@ function load(): Persisted {
   try {
     const raw = localStorage.getItem(KEY);
     if (!raw) return defaults();
-    const parsed = JSON.parse(raw) as Record<string, unknown>;
-    const mode: Mode = parsed.mode === "selective" ? "selective" : "general";
+    const p = JSON.parse(raw) as Record<string, any>;
 
-    // Current shape: a bucket per mode.
-    if (parsed.general || parsed.selective) {
+    // Current shape: independent apps/sites modes + per-mode buckets.
+    if (p.appsMode !== undefined || p.sitesMode !== undefined) {
       return {
-        mode,
-        general: asBucket(parsed.general),
-        selective: asBucket(parsed.selective),
+        appsMode: asMode(p.appsMode),
+        sitesMode: asMode(p.sitesMode),
+        apps: {
+          general: arr<AppEntry>(p.apps?.general),
+          selective: arr<AppEntry>(p.apps?.selective),
+        },
+        sites: {
+          general: arr<SiteEntry>(p.sites?.general),
+          selective: arr<SiteEntry>(p.sites?.selective),
+        },
       };
     }
 
-    // Prior unified shape: one apps/sites list shared by both modes. Migrate it
-    // into the bucket for the persisted mode; the other mode starts empty.
-    if (Array.isArray(parsed.apps) || Array.isArray(parsed.sites)) {
+    // Prior shape: a single shared mode + buckets of { apps, sites } per mode.
+    // Migrate by splitting each bucket's apps/sites into the two categories;
+    // both categories inherit the old shared mode.
+    if (p.general || p.selective) {
+      const m = asMode(p.mode);
+      return {
+        appsMode: m,
+        sitesMode: m,
+        apps: {
+          general: arr<AppEntry>(p.general?.apps),
+          selective: arr<AppEntry>(p.selective?.apps),
+        },
+        sites: {
+          general: arr<SiteEntry>(p.general?.sites),
+          selective: arr<SiteEntry>(p.selective?.sites),
+        },
+      };
+    }
+
+    // Oldest shape: one flat apps/sites list. Put it in the persisted mode.
+    if (Array.isArray(p.apps) || Array.isArray(p.sites)) {
+      const m = asMode(p.mode);
       const out = defaults();
-      out.mode = mode;
-      out[mode] = asBucket(parsed);
+      out.appsMode = m;
+      out.sitesMode = m;
+      out.apps[m] = arr<AppEntry>(p.apps);
+      out.sites[m] = arr<SiteEntry>(p.sites);
       return out;
     }
 
-    return { ...defaults(), mode };
+    return defaults();
   } catch {
     return defaults();
   }
@@ -87,79 +115,74 @@ function load(): Persisted {
 const _initialSplit = load();
 
 class SplitStore {
-  mode = $state<Mode>(_initialSplit.mode);
-  general = $state<Bucket>(_initialSplit.general);
-  selective = $state<Bucket>(_initialSplit.selective);
+  appsMode = $state<Mode>(_initialSplit.appsMode);
+  sitesMode = $state<Mode>(_initialSplit.sitesMode);
+  appsBuckets = $state<ModeBuckets<AppEntry>>(_initialSplit.apps);
+  sitesBuckets = $state<ModeBuckets<SiteEntry>>(_initialSplit.sites);
 
-  /** The active mode's bucket. */
-  private get bucket(): Bucket {
-    return this.mode === "selective" ? this.selective : this.general;
-  }
-  private setBucket(next: Bucket): void {
-    if (this.mode === "selective") this.selective = next;
-    else this.general = next;
-    this.persist();
-  }
-
-  /** Active-mode apps/sites — what the UI binds to and what's sent to the
-   *  backend. Switching mode swaps these. */
+  /** Active-mode apps — what the UI binds to and what's sent to the backend. */
   get apps(): AppEntry[] {
-    return this.bucket.apps;
+    return this.appsBuckets[this.appsMode];
   }
   get sites(): SiteEntry[] {
-    return this.bucket.sites;
+    return this.sitesBuckets[this.sitesMode];
+  }
+
+  private setApps(next: AppEntry[]): void {
+    this.appsBuckets = { ...this.appsBuckets, [this.appsMode]: next };
+    this.persist();
+  }
+  private setSites(next: SiteEntry[]): void {
+    this.sitesBuckets = { ...this.sitesBuckets, [this.sitesMode]: next };
+    this.persist();
   }
 
   private persist(): void {
     if (!browser) return;
     const payload: Persisted = {
-      mode: this.mode,
-      general: this.general,
-      selective: this.selective,
+      appsMode: this.appsMode,
+      sitesMode: this.sitesMode,
+      apps: this.appsBuckets,
+      sites: this.sitesBuckets,
     };
     localStorage.setItem(KEY, JSON.stringify(payload));
   }
 
-  setMode(m: Mode): void {
-    this.mode = m;
+  setAppsMode(m: Mode): void {
+    this.appsMode = m;
+    this.persist();
+  }
+  setSitesMode(m: Mode): void {
+    this.sitesMode = m;
     this.persist();
   }
 
   toggleApp(id: string): void {
-    this.setBucket({
-      ...this.bucket,
-      apps: this.bucket.apps.map((a) => (a.id === id ? { ...a, enabled: !a.enabled } : a)),
-    });
+    this.setApps(this.apps.map((a) => (a.id === id ? { ...a, enabled: !a.enabled } : a)));
   }
 
   addApp(app: Omit<AppEntry, "enabled">): void {
-    if (this.bucket.apps.some((a) => a.id === app.id)) return;
-    this.setBucket({ ...this.bucket, apps: [...this.bucket.apps, { ...app, enabled: true }] });
+    if (this.apps.some((a) => a.id === app.id)) return;
+    this.setApps([...this.apps, { ...app, enabled: true }]);
   }
 
   removeApp(id: string): void {
-    this.setBucket({ ...this.bucket, apps: this.bucket.apps.filter((a) => a.id !== id) });
+    this.setApps(this.apps.filter((a) => a.id !== id));
   }
 
   addSite(pattern: string): void {
     const v = pattern.trim();
     if (!v) return;
-    if (this.bucket.sites.some((s) => s.pattern === v)) return;
-    this.setBucket({
-      ...this.bucket,
-      sites: [...this.bucket.sites, { id: crypto.randomUUID(), pattern: v, enabled: true }],
-    });
+    if (this.sites.some((s) => s.pattern === v)) return;
+    this.setSites([...this.sites, { id: crypto.randomUUID(), pattern: v, enabled: true }]);
   }
 
   toggleSite(id: string): void {
-    this.setBucket({
-      ...this.bucket,
-      sites: this.bucket.sites.map((s) => (s.id === id ? { ...s, enabled: !s.enabled } : s)),
-    });
+    this.setSites(this.sites.map((s) => (s.id === id ? { ...s, enabled: !s.enabled } : s)));
   }
 
   removeSite(id: string): void {
-    this.setBucket({ ...this.bucket, sites: this.bucket.sites.filter((s) => s.id !== id) });
+    this.setSites(this.sites.filter((s) => s.id !== id));
   }
 }
 

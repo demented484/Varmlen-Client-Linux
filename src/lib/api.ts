@@ -149,9 +149,10 @@ export interface CoreProgress {
 
 /** Enabled split-tunnel selection passed to the connect command. */
 export interface SplitInput {
-  /** "selective" (whitelist: only listed apps+sites via VPN) or
-   *  "general"   (blacklist: all via VPN except listed apps+sites). */
-  mode: string;
+  /** Per-category modes, independent. "selective" = whitelist (only listed go
+   *  via VPN); "general" = blacklist (all via VPN except listed). */
+  appsMode: string;
+  sitesMode: string;
   apps: string[];
   sites: string[];
 }

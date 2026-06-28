@@ -85,7 +85,8 @@
     void settings.vpnMode;
     void settings.killswitch;
     void settings.allowLan;
-    void split.mode;
+    void split.appsMode;
+    void split.sitesMode;
     void split.apps;
     void split.sites;
     conn.onConfigChanged();

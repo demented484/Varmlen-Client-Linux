@@ -78,15 +78,21 @@
     ),
   );
 
+  // The mode card reflects the ACTIVE tab — apps and sites have independent
+  // modes, so switching tabs shows (and edits) that category's mode + count.
+  const activeMode = $derived(tab === "apps" ? split.appsMode : split.sitesMode);
   const enabledCount = $derived(
-    split.apps.filter((a) => a.enabled).length + split.sites.filter((s) => s.enabled).length,
+    tab === "apps"
+      ? split.apps.filter((a) => a.enabled).length
+      : split.sites.filter((s) => s.enabled).length,
   );
-
-  /** Shared mode description — apps + sites are governed by the same mode now,
-   *  so we can show one short blurb that covers both. */
   const modeDescription = $derived(
-    split.mode === "selective" ? t("split.mode.selective") : t("split.mode.general"),
+    activeMode === "selective" ? t("split.mode.selective") : t("split.mode.general"),
   );
+  function setActiveMode(m: Mode): void {
+    if (tab === "apps") split.setAppsMode(m);
+    else split.setSitesMode(m);
+  }
 </script>
 
 {#snippet appIcon(icon: string | null | undefined)}
@@ -115,9 +121,9 @@
         <div class="muted small">{t("split.active", { n: enabledCount })}</div>
       </div>
       <Dropdown
-        value={split.mode}
+        value={activeMode}
         options={modeOptions}
-        onChange={(v) => split.setMode(v as Mode)}
+        onChange={(v) => setActiveMode(v as Mode)}
         ariaLabel={t("split.mode")}
       />
     </div>

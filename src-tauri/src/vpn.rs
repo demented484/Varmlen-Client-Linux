@@ -440,7 +440,10 @@ pub async fn vpn_connect(
             &server, &split, &mode, TunMode::Tun2socks, allow_lan,
         ))
         .map_err(|e| e.to_string())?;
-        let apps_allow = mode == "selective";
+        // apps_allow = whitelist apps (only listed apps enter the tun). This is
+        // the APPS split mode — independent of the sites mode and of `mode`
+        // (which is the tun/proxy selector).
+        let apps_allow = split.apps_selective();
         crate::mobile_vpn::connect(
             &app,
             xray_cfg,
@@ -784,12 +787,26 @@ pub async fn proxy_get_ping(
     timeout_ms: Option<u32>,
 ) -> Result<u32, String> {
     let ms = timeout_ms.unwrap_or(5000) as u64;
-    let xray_bin = crate::core::binary_path(&app, CoreKind::Xray)
-        .map_err(|e| format!("xray core: {e}"))?;
     let port = free_local_port()?;
     let cfg = serde_json::to_string(&crate::xray::build_ping_config(&server, port))
         .map_err(|e| e.to_string())?;
-    let cfg_path = runtime_dir().join(format!("ping-{port}.json"));
+
+    // Android: exec the bundled xray from nativeLibraryDir, config in filesDir.
+    #[cfg(target_os = "android")]
+    let (xray_bin, cfg_path) = {
+        let (bin, dir) = crate::mobile_vpn::xray_paths(&app)?;
+        (
+            std::path::PathBuf::from(bin),
+            std::path::PathBuf::from(dir).join(format!("ping-{port}.json")),
+        )
+    };
+    #[cfg(not(target_os = "android"))]
+    let (xray_bin, cfg_path) = {
+        let bin = crate::core::binary_path(&app, CoreKind::Xray)
+            .map_err(|e| format!("xray core: {e}"))?;
+        (bin, runtime_dir().join(format!("ping-{port}.json")))
+    };
+
     if let Err(e) = write_private(&cfg_path, &cfg) {
         let _ = std::fs::remove_file(&cfg_path);
         return Err(e);

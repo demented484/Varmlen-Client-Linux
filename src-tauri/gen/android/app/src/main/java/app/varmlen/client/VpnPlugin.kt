@@ -2,7 +2,13 @@ package app.varmlen.client
 
 import android.app.Activity
 import android.content.Intent
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.drawable.BitmapDrawable
+import android.graphics.drawable.Drawable
 import android.net.VpnService
+import android.util.Base64
+import java.io.ByteArrayOutputStream
 import androidx.activity.result.ActivityResult
 import app.tauri.annotation.ActivityCallback
 import app.tauri.annotation.Command
@@ -84,6 +90,16 @@ class VpnPlugin(private val activity: Activity) : Plugin(activity) {
         invoke.resolve()
     }
 
+    /** Paths the Rust side needs to run xray for a proxy ping: the bundled
+     *  binary (in nativeLibraryDir) and a writable config dir (filesDir). */
+    @Command
+    fun xrayPaths(invoke: Invoke) {
+        val ret = JSObject()
+        ret.put("bin", java.io.File(activity.applicationInfo.nativeLibraryDir, "libxray.so").absolutePath)
+        ret.put("dir", activity.filesDir.absolutePath)
+        invoke.resolve(ret)
+    }
+
     /** Launchable apps (the ones a user recognises), for the split-tunnel picker. */
     @Command
     fun listApps(invoke: Invoke) {
@@ -97,12 +113,30 @@ class VpnPlugin(private val activity: Activity) : Plugin(activity) {
             val o = JSObject()
             o.put("id", pkg)
             o.put("name", ri.loadLabel(pm).toString())
-            o.put("icon", null)
+            o.put("icon", try { iconDataUri(ri.loadIcon(pm)) } catch (_: Throwable) { null })
             arr.put(o)
         }
         val ret = JSObject()
         ret.put("apps", arr)
         invoke.resolve(ret)
+    }
+
+    /** Rasterise an app icon to a small PNG data URI for the picker. */
+    private fun iconDataUri(d: Drawable?): String? {
+        if (d == null) return null
+        val size = 96
+        val bmp = if (d is BitmapDrawable && d.bitmap != null) {
+            Bitmap.createScaledBitmap(d.bitmap, size, size, true)
+        } else {
+            val b = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+            val c = Canvas(b)
+            d.setBounds(0, 0, size, size)
+            d.draw(c)
+            b
+        }
+        val out = ByteArrayOutputStream()
+        bmp.compress(Bitmap.CompressFormat.PNG, 100, out)
+        return "data:image/png;base64," + Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP)
     }
 
     private fun startVpn(args: ConnectArgs) {

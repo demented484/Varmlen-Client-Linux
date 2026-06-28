@@ -385,13 +385,33 @@ fn build_inbounds(tun: TunMode) -> Vec<Value> {
 /// `process` matcher resolves the owning process (Linux), exactly like sing-box
 /// `process_name`. Every rule needs `"type":"field"` for cross-version safety.
 ///
-/// Mode semantics (full fidelity, matching the old sing-box behaviour):
-///   - selective (whitelist): listed apps/sites -> proxy, default direct.
-///   - general   (blacklist): listed apps/sites -> direct, default proxy.
-fn build_route_rules(split: &SplitInput, allow_lan: bool, inbound_tag: &str) -> Vec<Value> {
-    let selective = split.is_selective();
-    let listed_out = if selective { "proxy" } else { "direct" };
-    let default_out = if selective { "direct" } else { "proxy" };
+/// Mode semantics (apps and sites are INDEPENDENT):
+///   - selective (whitelist): listed entries -> proxy.
+///   - general   (blacklist): listed entries -> direct.
+/// Default outbound:
+///   - Android (tun2socks): the per-app split is the VpnService's job (xray's
+///     process matcher can't match Android packages), so the xray default is
+///     governed by the SITES mode alone.
+///   - Desktop: both are xray rules, so the default tunnels everything unless
+///     BOTH categories are whitelists (then default direct).
+fn build_route_rules(
+    split: &SplitInput,
+    allow_lan: bool,
+    inbound_tag: &str,
+    tun: TunMode,
+) -> Vec<Value> {
+    let apps_selective = split.apps_selective();
+    let sites_selective = split.sites_selective();
+    let android = matches!(tun, TunMode::Tun2socks);
+    let apps_out = if apps_selective { "proxy" } else { "direct" };
+    let sites_out = if sites_selective { "proxy" } else { "direct" };
+    let default_out = if android {
+        if sites_selective { "direct" } else { "proxy" }
+    } else if apps_selective && sites_selective {
+        "direct"
+    } else {
+        "proxy"
+    };
 
     let mut rules = vec![
         // 1. Hijack app DNS (:53) into xray's DNS module.
@@ -403,11 +423,13 @@ fn build_route_rules(split: &SplitInput, allow_lan: bool, inbound_tag: &str) -> 
         rules.push(json!({ "type": "field", "ip": PRIVATE_CIDRS, "outboundTag": "direct" }));
     }
 
-    // 3. Per-app split: native process matcher (bare process names from apps.rs).
-    //    Placed ABOVE the DoH pin so a user app's own traffic to 1.1.1.1 still
-    //    honours its exclusion.
-    for app in split.enabled_apps() {
-        rules.push(json!({ "type": "field", "process": [app], "outboundTag": listed_out }));
+    // 3. Per-app split (desktop only): native process matcher. On Android the
+    //    VpnService gates which apps reach xray at all, so package names here
+    //    wouldn't match anyway.
+    if !android {
+        for app in split.enabled_apps() {
+            rules.push(json!({ "type": "field", "process": [app], "outboundTag": apps_out }));
+        }
     }
 
     // 4. Per-site split. "*.example.com" -> suffix (domain:), "example.com" -> exact (full:).
@@ -422,7 +444,7 @@ fn build_route_rules(split: &SplitInput, allow_lan: bool, inbound_tag: &str) -> 
         })
         .collect();
     if !domains.is_empty() {
-        rules.push(json!({ "type": "field", "domain": domains, "outboundTag": listed_out }));
+        rules.push(json!({ "type": "field", "domain": domains, "outboundTag": sites_out }));
     }
 
     // 5. Force the DNS module's own DoH upstream (1.1.1.1) through the tunnel —
@@ -476,7 +498,7 @@ pub fn build_xray_config(
             { "tag": "dns-out", "protocol": "dns" },
             { "tag": "block", "protocol": "blackhole" }
         ],
-        "routing": { "rules": build_route_rules(split, allow_lan, tun.inbound_tag()) }
+        "routing": { "rules": build_route_rules(split, allow_lan, tun.inbound_tag(), tun) }
     })
 }
 
@@ -693,7 +715,8 @@ mod tests {
     fn general_mode_apps_and_sites_to_direct_default_proxy() {
         let s = parse_proxy_uri("vless://u@1.2.3.4:443?security=reality&pbk=K#X").unwrap();
         let sp = SplitInput {
-            mode: "general".into(),
+            apps_mode: "general".into(),
+            sites_mode: "general".into(),
             apps: vec!["thunderbird".into()],
             sites: vec!["*.ru".into(), "example.com".into()],
             ..Default::default()
@@ -719,7 +742,8 @@ mod tests {
         // AND a domain whitelist, with default direct (no one-TUN narrowing).
         let s = parse_proxy_uri("vless://u@1.2.3.4:443?security=reality&pbk=K#X").unwrap();
         let sp = SplitInput {
-            mode: "selective".into(),
+            apps_mode: "selective".into(),
+            sites_mode: "selective".into(),
             apps: vec!["firefox".into()],
             sites: vec!["example.com".into()],
             ..Default::default()
@@ -735,7 +759,7 @@ mod tests {
     #[test]
     fn selective_sites_only_default_direct() {
         let s = parse_proxy_uri("vless://u@1.2.3.4:443?security=reality&pbk=K#X").unwrap();
-        let sp = SplitInput { mode: "selective".into(), sites: vec!["example.com".into()], ..Default::default() };
+        let sp = SplitInput { apps_mode: "selective".into(), sites_mode: "selective".into(), sites: vec!["example.com".into()], ..Default::default() };
         let cfg = build_xray_config(&s, &sp, "tun", TunMode::XrayNative, true);
         assert_eq!(cfg["routing"]["rules"].as_array().unwrap().last().unwrap()["outboundTag"], "direct");
         assert_eq!(rule_for(&cfg, "domain").unwrap()["outboundTag"], "proxy");
@@ -755,7 +779,8 @@ mod tests {
         )
         .unwrap();
         let sp = SplitInput {
-            mode: "general".into(),
+            apps_mode: "general".into(),
+            sites_mode: "general".into(),
             apps: vec!["firefox".into(), "telegram-desktop".into()],
             sites: vec!["*.ru".into(), "example.com".into()],
         };
@@ -773,7 +798,7 @@ mod tests {
         // An excluded app's own traffic to 1.1.1.1 must hit its process rule
         // before the DoH pin (ip:1.1.1.1 -> proxy), so the exclusion is honoured.
         let s = parse_proxy_uri("vless://u@1.2.3.4:443?security=reality&pbk=K#X").unwrap();
-        let sp = SplitInput { mode: "general".into(), apps: vec!["firefox".into()], ..Default::default() };
+        let sp = SplitInput { apps_mode: "general".into(), sites_mode: "general".into(), apps: vec!["firefox".into()], ..Default::default() };
         let cfg = build_xray_config(&s, &sp, "tun", TunMode::XrayNative, true);
         let rules = cfg["routing"]["rules"].as_array().unwrap();
         let proc_idx = rules.iter().position(|r| r.get("process").is_some()).unwrap();

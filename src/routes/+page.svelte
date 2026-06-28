@@ -460,7 +460,14 @@
       aria-modal="true"
       aria-label="Add subscription"
     >
-      <h2>{t("import.title")}</h2>
+      <header class="modal-head">
+        <h2>{t("import.title")}</h2>
+        <button class="icon-btn" onclick={() => (showImport = false)} aria-label={t("common.close")}>
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
+          </svg>
+        </button>
+      </header>
       {#if importMode === "choose"}
         <p class="muted">{t("import.hint")}</p>
         <div class="import-choice">
@@ -474,9 +481,6 @@
         {#if importError}
           <div class="error">{importError}</div>
         {/if}
-        <div class="modal-actions">
-          <button class="btn btn-ghost" onclick={() => (showImport = false)}>{t("common.cancel")}</button>
-        </div>
       {:else}
         <p class="muted">{t("import.manualHint")}</p>
         <textarea
@@ -489,7 +493,6 @@
           <div class="error">{importError}</div>
         {/if}
         <div class="modal-actions">
-          <button class="btn btn-ghost" onclick={() => (showImport = false)}>{t("common.cancel")}</button>
           <button class="btn btn-primary" onclick={importSubscription} disabled={subs.importing || !subUrl.trim()}>
             {subs.importing ? t("import.importing") : t("import.add")}
           </button>

@@ -94,6 +94,22 @@ pub fn list_apps<R: Runtime>(app: &AppHandle<R>) -> Result<Vec<crate::apps::Inst
         .map_err(|e| e.to_string())
 }
 
+#[derive(serde::Deserialize)]
+struct XrayPaths {
+    bin: String,
+    dir: String,
+}
+
+/// (xray binary path in nativeLibraryDir, a writable config dir) — so the Rust
+/// proxy-ping can run xray on Android too.
+pub fn xray_paths<R: Runtime>(app: &AppHandle<R>) -> Result<(String, String), String> {
+    let vpn = app.state::<Vpn<R>>();
+    vpn.0
+        .run_mobile_plugin::<XrayPaths>("xrayPaths", ())
+        .map(|p| (p.bin, p.dir))
+        .map_err(|e| e.to_string())
+}
+
 pub fn disconnect<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     let vpn = app.state::<Vpn<R>>();
     vpn.0

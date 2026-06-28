@@ -16,7 +16,8 @@ function msg(e: unknown): string {
 /** Current split-tunnel selection (enabled entries for the active mode). */
 function splitInput(): SplitInput {
   return {
-    mode: split.mode,
+    appsMode: split.appsMode,
+    sitesMode: split.sitesMode,
     apps: split.apps.filter((a) => a.enabled).map((a) => a.id),
     sites: split.sites.filter((s) => s.enabled).map((s) => s.pattern),
   };
