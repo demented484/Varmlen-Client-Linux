@@ -48,6 +48,15 @@ const XRAY_DIAL_MARK: u32 = 0x2024;
 /// xray's own marked dials.
 const PHYS_TABLE: &str = "100";
 
+/// Per-app split: traffic from processes the user excluded carries this mark
+/// (set by nft on cgroup membership, since an app can't SO_MARK itself). Routed
+/// via PHYS_TABLE + masqueraded so it bypasses the tun entirely — robust where
+/// xray's tun-inbound `process` matcher can't attribute a connection (UDP games,
+/// Proton/wine). A SEPARATE mark from the xray dial mark so the masquerade never
+/// touches the VPN tunnel's own connection.
+const BYPASS_MARK: u32 = 0x2025;
+const BYPASS_TABLE: &str = "varmlen_bypass";
+
 /// Teardown state (rp_filter / state writes need cap_dac_override).
 const RP_STATE: &str = "/run/varmlen/rp_filter_all.orig";
 const SERVERS_STATE: &str = "/run/varmlen/servers";
@@ -139,6 +148,18 @@ fn run(args: &[String]) -> i32 {
             }
         }
         Some("route-down") => { route_down(); 0 }
+        Some("bypass-up") => {
+            // bypass-up <cgroup-path>
+            let Some(path) = args.get(1) else {
+                eprintln!("usage: varmlen-probe bypass-up <cgroup-path>");
+                return 2;
+            };
+            match bypass_up(path) {
+                Ok(()) => 0,
+                Err(e) => { eprintln!("{e}"); 1 }
+            }
+        }
+        Some("bypass-down") => { bypass_down(); 0 }
         Some("cleanup") => { remove_killswitch(); route_down(); delete_tun(); 0 }
         _ => {
             eprintln!("usage: varmlen-probe <tcp|icmp|killswitch-up|killswitch-down|route-up|route-down|cleanup> ...");
@@ -268,8 +289,10 @@ fn apply_killswitch(server_ips: &[std::net::IpAddr], allow_lan: bool) -> Result<
     r.push_str("    fib daddr type local counter accept\n");
     r.push_str("    meta mark & 0x0000ffff == 0x2023 counter accept\n");
     r.push_str("    meta mark & 0x0000ffff == 0x2024 counter accept\n");
+    r.push_str("    meta mark & 0x0000ffff == 0x2025 counter accept\n");
     r.push_str("    ct mark & 0x0000ffff == 0x2023 counter accept\n");
     r.push_str("    ct mark & 0x0000ffff == 0x2024 counter accept\n");
+    r.push_str("    ct mark & 0x0000ffff == 0x2025 counter accept\n");
     r.push_str("    ip daddr 1.1.1.1 udp dport 53 counter accept\n");
     r.push_str("    ip daddr 1.1.1.1 tcp dport 53 counter accept\n");
     r.push_str("    ip daddr 1.1.1.1 tcp dport 443 counter accept\n");
@@ -303,6 +326,57 @@ fn nft_apply(ruleset: &str) -> Result<(), String> {
 
 fn remove_killswitch() {
     let _ = Command::new("nft").arg("delete").arg("table").arg("inet").arg(KS_TABLE)
+        .stderr(Stdio::null()).status();
+}
+
+/// Per-app split bypass: tag traffic from the given (user-owned, cgroup-v2)
+/// cgroup with BYPASS_MARK so it egresses the physical NIC (route_up adds the
+/// fwmark rule) and masquerade it (the app picked the tun source at connect, so
+/// the marked re-route alone leaves replies unroutable). `cgroup_path` is the
+/// path relative to the cgroup-v2 root, no leading slash.
+fn bypass_up(cgroup_path: &str) -> Result<(), String> {
+    // This string is interpolated into an nft ruleset — allow only cgroup-path
+    // characters so it can't break out of the quoted token.
+    if cgroup_path.is_empty()
+        || cgroup_path.len() > 512
+        || !cgroup_path
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-' | b'@'))
+    {
+        return Err("invalid cgroup path".into());
+    }
+    let level = cgroup_path.split('/').filter(|s| !s.is_empty()).count();
+    if level == 0 {
+        return Err("empty cgroup path".into());
+    }
+    let iface = pick_physical_iface().ok_or("no physical interface")?;
+    if !iface.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')) {
+        return Err("bad interface name".into());
+    }
+    let ruleset = format!(
+        "add table inet {tbl}\n\
+         delete table inet {tbl}\n\
+         table inet {tbl} {{\n\
+         \tchain mangle {{\n\
+         \t\ttype route hook output priority mangle; policy accept;\n\
+         \t\tsocket cgroupv2 level {level} \"{path}\" meta mark set {mark:#x}\n\
+         \t}}\n\
+         \tchain nat {{\n\
+         \t\ttype nat hook postrouting priority srcnat; policy accept;\n\
+         \t\tmeta mark {mark:#x} oifname \"{iface}\" masquerade\n\
+         \t}}\n\
+         }}\n",
+        tbl = BYPASS_TABLE,
+        level = level,
+        path = cgroup_path,
+        mark = BYPASS_MARK,
+        iface = iface,
+    );
+    nft_apply(&ruleset)
+}
+
+fn bypass_down() {
+    let _ = Command::new("nft").arg("delete").arg("table").arg("inet").arg(BYPASS_TABLE)
         .stderr(Stdio::null()).status();
 }
 
@@ -455,6 +529,8 @@ fn route_up(servers: &[std::net::IpAddr]) -> Result<(), String> {
         def.push(PHYS_TABLE);
         ip_req(&def)?;
         add_rule_fwmark(XRAY_DIAL_MARK, PHYS_TABLE)?;
+        // Same physical bypass for per-app excluded traffic (nft tags it 0x2025).
+        add_rule_fwmark(BYPASS_MARK, PHYS_TABLE)?;
 
         // 4. anti-loop FIRST: pin each server IP to the physical path (more
         //    specific than 0/1) so xray's dial escapes the tun even if SO_MARK
@@ -526,15 +602,20 @@ fn route_down() {
         let _ = std::fs::remove_file(SERVERS6_STATE);
     }
 
-    // 2. remove the dial-mark policy rule (loop: a crash may have stacked dups).
-    let m = format!("{XRAY_DIAL_MARK:#x}");
-    for _ in 0..4 {
-        let ok = Command::new("ip").args(["rule", "del", "fwmark", &m])
-            .stderr(Stdio::null()).status().map(|s| s.success()).unwrap_or(false);
-        if !ok {
-            break;
+    // 2. remove the dial-mark + bypass-mark policy rules (loop: a crash may have
+    //    stacked dups).
+    for mark in [XRAY_DIAL_MARK, BYPASS_MARK] {
+        let m = format!("{mark:#x}");
+        for _ in 0..4 {
+            let ok = Command::new("ip").args(["rule", "del", "fwmark", &m])
+                .stderr(Stdio::null()).status().map(|s| s.success()).unwrap_or(false);
+            if !ok {
+                break;
+            }
         }
     }
+    // The per-app bypass nft table (mangle + masquerade), if up.
+    bypass_down();
 
     // 3. flush the physical bypass table.
     ip_quiet(&["route", "flush", "table", PHYS_TABLE]);

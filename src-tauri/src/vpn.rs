@@ -212,7 +212,7 @@ fn last_error_line(stderr: &str) -> String {
 
 /// Locate the bundled `varmlen-probe`. Dev: helper build output. Packaged: the
 /// copy placed in app-data/bin (resource → bin on first run; see grant_caps).
-fn probe_bin(app: &tauri::AppHandle) -> Option<PathBuf> {
+pub(crate) fn probe_bin(app: &tauri::AppHandle) -> Option<PathBuf> {
     use tauri::Manager;
     // Installed copy (what we setcap).
     if let Ok(data) = app.path().app_data_dir() {
@@ -485,15 +485,41 @@ pub async fn vpn_connect(
     ))
     .map_err(|e| e.to_string())?;
     let server_host = server.host.clone();
+    // Apps the user EXCLUDED from the VPN (general apps mode). These get a
+    // cgroup-based physical bypass (robust where xray's process matcher can't
+    // attribute a connection — games / Proton). Empty in selective mode or proxy
+    // mode, which disables the bypass.
+    let excluded: Vec<String> = if mode != "proxy" && !split.apps_selective() {
+        split.enabled_apps()
+    } else {
+        Vec::new()
+    };
 
     tokio::task::spawn_blocking(move || -> Result<HelperResponse, String> {
         // Mark the upcoming teardown intentional so any prior crash-watcher exits
         // without firing; cleared once we're successfully connected again.
         INTENTIONAL_STOP.store(true, Ordering::SeqCst);
-        stop_all(&app);
-        // stop_all just lifted any kill switch / routes, so we're no longer in a
-        // "dropped" (blocked) phase — clear it so a *failed* reconnect can't leave
-        // vpn_status falsely reporting blocked.
+        // On a RECONNECT (config change while still connected) with the kill
+        // switch ON, KEEP the nft drop up across the teardown+rebuild. Otherwise
+        // the brief window between dropping the switch and bringing the new tunnel
+        // up lets traffic fall back to the physical route = real-IP leak. xray's
+        // own dial to the server is allowed through the switch via its bypass
+        // mark, so the tunnel still rebuilds while user traffic stays blocked.
+        // Just terminate the old xray (its tun fd closes → device gone) and drop
+        // its routes; the switch is re-applied (idempotent) once the new tun is up.
+        // A fresh connect has no prior switch, so this is a clean no-op there.
+        if killswitch && mode != "proxy" {
+            if let Some(mut c) = xray_child().lock().unwrap().take() {
+                terminate_gracefully(&mut c);
+            }
+            if let Some(probe) = probe_bin(&app) {
+                let _ = Command::new(&probe).arg("route-down").status();
+            }
+        } else {
+            stop_all(&app);
+        }
+        // No longer in a "dropped" (blocked) phase — clear it so a *failed*
+        // reconnect can't leave vpn_status falsely reporting blocked.
         set_phase("disconnected");
 
         let xray_bin = crate::core::binary_path(&app, CoreKind::Xray)
@@ -599,6 +625,9 @@ pub async fn vpn_connect(
         INTENTIONAL_STOP.store(false, Ordering::SeqCst);
         set_phase("connected");
         spawn_crash_watcher(app.clone(), killswitch, generation);
+        // Per-app cgroup bypass for excluded apps (supersedes a prior scanner;
+        // a no-op + disables the bypass when nothing is excluded).
+        crate::split_bypass::setup(&app, excluded);
 
         Ok(HelperResponse::connected(pid))
     })
@@ -640,6 +669,7 @@ pub async fn vpn_disconnect(app: tauri::AppHandle) -> Result<HelperResponse, Str
         // A user-initiated stop: silence the crash watcher and drop to
         // disconnected (also lifts a "dropped" kill switch, restoring traffic).
         INTENTIONAL_STOP.store(true, Ordering::SeqCst);
+        crate::split_bypass::teardown(&app);
         let _ = tokio::task::spawn_blocking(move || stop_all(&app)).await;
         set_phase("disconnected");
         Ok(HelperResponse::disconnected())

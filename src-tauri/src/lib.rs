@@ -3,6 +3,8 @@ mod core;
 #[cfg(target_os = "android")]
 mod mobile_vpn;
 mod split;
+#[cfg(target_os = "linux")]
+mod split_bypass;
 mod storage;
 mod subscription;
 mod tray;
