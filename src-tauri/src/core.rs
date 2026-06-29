@@ -549,8 +549,11 @@ pub async fn core_install(app: AppHandle, kind: String, version: Option<String>)
     // File capabilities are cleared whenever the binary is (re)written, so the
     // active xray must be re-capped after any download of the active tag.
     if became_active && kind == CoreKind::Xray {
-        let app2 = app.clone();
-        let _ = tokio::task::spawn_blocking(move || crate::vpn::request_setcap_blocking(&app2)).await;
+        #[cfg(target_os = "linux")]
+        {
+            let app2 = app.clone();
+            let _ = tokio::task::spawn_blocking(move || crate::vpn::request_setcap_blocking(&app2)).await;
+        }
     }
     Ok(tag)
 }
@@ -566,8 +569,11 @@ pub async fn core_activate(app: AppHandle, kind: String, tag: String) -> Result<
     }
     write_active(&app, kind, &tag)?;
     if kind == CoreKind::Xray {
-        let app2 = app.clone();
-        let _ = tokio::task::spawn_blocking(move || crate::vpn::request_setcap_blocking(&app2)).await;
+        #[cfg(target_os = "linux")]
+        {
+            let app2 = app.clone();
+            let _ = tokio::task::spawn_blocking(move || crate::vpn::request_setcap_blocking(&app2)).await;
+        }
     }
     Ok(())
 }
