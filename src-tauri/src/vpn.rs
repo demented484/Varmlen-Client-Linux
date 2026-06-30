@@ -578,10 +578,21 @@ pub async fn vpn_connect(
             stop_all(&app);
             return Err("varmlen-probe helper not found".into());
         };
+        // Arm the per-app bypass in the SAME helper call that lays the routing:
+        // route-up moves already-running excluded apps onto the physical path
+        // BEFORE it flips the default into the tun, so their live connections are
+        // never captured by the VPN — not even momentarily.
+        let bypass_rel = crate::split_bypass::prepare(&excluded);
         let mut up = Command::new(&probe);
         up.arg("route-up");
         for ip in &server_ips {
             up.arg("--server").arg(ip.to_string());
+        }
+        if let Some(rel) = &bypass_rel {
+            up.arg("--bypass-cgroup").arg(rel);
+            for a in &excluded {
+                up.arg("--bypass-app").arg(a);
+            }
         }
         match up.output() {
             Ok(o) if o.status.success() => {}

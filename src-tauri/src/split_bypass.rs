@@ -59,6 +59,24 @@ fn kill_watcher() {
     }
 }
 
+/// Create the bypass cgroup (idempotent) and return its cgroup-v2-relative path,
+/// to hand to the helper's `route-up --bypass-cgroup`. Doing the initial move
+/// inside route-up — the same step that lays the routing — is what lets the
+/// helper put already-running excluded apps onto the physical path BEFORE the
+/// default route enters the tun, so their live connections are never captured by
+/// the VPN. Returns None when nothing is excluded or the system isn't cgroup-v2.
+pub fn prepare(excluded: &[String]) -> Option<String> {
+    if excluded.is_empty() {
+        return None;
+    }
+    let dir = cgroup_dir()?;
+    let rel = cgroup_rel(&dir)?;
+    if std::fs::create_dir_all(&dir).is_err() {
+        return None;
+    }
+    Some(rel)
+}
+
 /// Begin bypassing the given excluded apps. No-op when the list is empty or the
 /// system isn't cgroup-v2. Supersedes any prior watcher.
 pub fn setup(app: &AppHandle, excluded: Vec<String>) {
@@ -72,8 +90,10 @@ pub fn setup(app: &AppHandle, excluded: Vec<String>) {
         return;
     }
     let Some(probe) = crate::vpn::probe_bin(app) else { return };
-    // Tag this cgroup's traffic (CAP_NET_ADMIN); idempotent re-apply.
-    let _ = std::process::Command::new(&probe).arg("bypass-up").arg(&rel).status();
+    // The nft tag + the initial move of already-running excluded apps are done by
+    // route-up (BEFORE it flips the default into the tun, with the correct egress
+    // iface), so we don't re-apply bypass-up here. We only need the ongoing
+    // watcher (below) to move apps the user launches AFTER connect.
     // Replace any prior watcher with one for the current exclusion list.
     kill_watcher();
     let child = std::process::Command::new(&probe)

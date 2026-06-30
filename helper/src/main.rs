@@ -70,6 +70,9 @@ const PROC_EVENT_COMM: u32 = 0x0000_0200;
 const RP_STATE: &str = "/run/varmlen/rp_filter_all.orig";
 const SERVERS_STATE: &str = "/run/varmlen/servers";
 const SERVERS6_STATE: &str = "/run/varmlen/servers6";
+/// Remote peers of already-running excluded apps, pinned to the physical path at
+/// route-up (a cgroup move can't re-tag a live socket); removed at route-down.
+const BYPASS_PINS_STATE: &str = "/run/varmlen/bypass_pins";
 
 fn main() {
     // Harden the environment BEFORE any privileged child spawn. This binary
@@ -139,19 +142,38 @@ fn run(args: &[String]) -> i32 {
         }
         Some("killswitch-down") => { remove_killswitch(); 0 }
         Some("route-up") => {
-            // route-up [--server <ip>]...
+            // route-up [--server <ip>]... [--bypass-cgroup <rel>] [--bypass-app <id>]...
             let mut servers = Vec::new();
+            let mut bypass_cgroup: Option<String> = None;
+            let mut bypass_apps: Vec<String> = Vec::new();
             let mut i = 1;
             while i < args.len() {
-                if args[i] == "--server" {
-                    if let Some(ip) = args.get(i + 1).and_then(|s| s.parse::<std::net::IpAddr>().ok()) {
-                        servers.push(ip);
+                match args[i].as_str() {
+                    "--server" => {
+                        if let Some(ip) =
+                            args.get(i + 1).and_then(|s| s.parse::<std::net::IpAddr>().ok())
+                        {
+                            servers.push(ip);
+                        }
+                        i += 1;
                     }
-                    i += 1;
+                    "--bypass-cgroup" => {
+                        if let Some(c) = args.get(i + 1) {
+                            bypass_cgroup = Some(c.clone());
+                        }
+                        i += 1;
+                    }
+                    "--bypass-app" => {
+                        if let Some(a) = args.get(i + 1) {
+                            bypass_apps.push(a.clone());
+                        }
+                        i += 1;
+                    }
+                    _ => {}
                 }
                 i += 1;
             }
-            match route_up(&servers) {
+            match route_up(&servers, bypass_cgroup.as_deref(), &bypass_apps) {
                 Ok(()) => 0,
                 Err(e) => { eprintln!("{e}"); 1 }
             }
@@ -163,7 +185,7 @@ fn run(args: &[String]) -> i32 {
                 eprintln!("usage: varmlen-probe bypass-up <cgroup-path>");
                 return 2;
             };
-            match bypass_up(path) {
+            match bypass_up(path, None) {
                 Ok(()) => 0,
                 Err(e) => { eprintln!("{e}"); 1 }
             }
@@ -352,7 +374,7 @@ fn remove_killswitch() {
 /// fwmark rule) and masquerade it (the app picked the tun source at connect, so
 /// the marked re-route alone leaves replies unroutable). `cgroup_path` is the
 /// path relative to the cgroup-v2 root, no leading slash.
-fn bypass_up(cgroup_path: &str) -> Result<(), String> {
+fn bypass_up(cgroup_path: &str, iface_override: Option<&str>) -> Result<(), String> {
     // This string is interpolated into an nft ruleset — allow only cgroup-path
     // characters so it can't break out of the quoted token.
     if cgroup_path.is_empty()
@@ -367,8 +389,18 @@ fn bypass_up(cgroup_path: &str) -> Result<(), String> {
     if level == 0 {
         return Err("empty cgroup path".into());
     }
-    let iface = pick_physical_iface().ok_or("no physical interface")?;
-    if !iface.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')) {
+    // The masquerade oifname MUST be the same device the bypass table (100)
+    // egresses on — i.e. the physical default route's dev — or a marked packet
+    // leaves an iface the masquerade rule doesn't match and keeps its martian tun
+    // source. route_up passes that dev; the standalone command falls back to a
+    // best-guess physical iface.
+    let iface = match iface_override {
+        Some(i) => i.to_string(),
+        None => pick_physical_iface().ok_or("no physical interface")?,
+    };
+    if iface.is_empty()
+        || !iface.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    {
         return Err("bad interface name".into());
     }
     let ruleset = format!(
@@ -418,8 +450,8 @@ fn id_matches(id: &str, comm: &str, exe: &str, exe_base: &str) -> bool {
     comm == id || exe_base == id || exe == id
 }
 
-/// Move `pid` into the bypass cgroup if its name/exe matches an excluded id.
-fn bypass_move_if_match(procs: &str, pid: u32, excluded: &[String]) {
+/// Whether `pid`'s name/exe matches any excluded id.
+fn pid_matches_excluded(pid: u32, excluded: &[String]) -> bool {
     let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
     let comm = comm.trim();
     let exe = std::fs::read_link(format!("/proc/{pid}/exe")).ok();
@@ -429,8 +461,192 @@ fn bypass_move_if_match(procs: &str, pid: u32, excluded: &[String]) {
         .and_then(|p| p.file_name())
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
-    if excluded.iter().any(|id| id_matches(id, comm, &exe_str, &exe_base)) {
+    excluded.iter().any(|id| id_matches(id, comm, &exe_str, &exe_base))
+}
+
+/// Move `pid` into the bypass cgroup if its name/exe matches an excluded id.
+fn bypass_move_if_match(procs: &str, pid: u32, excluded: &[String]) {
+    if pid_matches_excluded(pid, excluded) {
         let _ = std::fs::write(procs, pid.to_string());
+    }
+}
+
+/// `/proc/net/*` prints an address as the host-order value of its `__be32`
+/// word(s); on little-endian that is the network bytes in memory order, i.e. the
+/// value's little-endian bytes. (Verified: `DCA79A95` → 149.154.167.220.)
+fn hex_to_ipv4(hex: &str) -> Option<std::net::Ipv4Addr> {
+    if hex.len() != 8 {
+        return None;
+    }
+    Some(std::net::Ipv4Addr::from(u32::from_str_radix(hex, 16).ok()?.to_le_bytes()))
+}
+
+fn hex_to_ipv6(hex: &str) -> Option<std::net::Ipv6Addr> {
+    if hex.len() != 32 {
+        return None;
+    }
+    let mut bytes = [0u8; 16];
+    for w in 0..4 {
+        let word = u32::from_str_radix(&hex[w * 8..w * 8 + 8], 16).ok()?;
+        bytes[w * 4..w * 4 + 4].copy_from_slice(&word.to_le_bytes());
+    }
+    Some(std::net::Ipv6Addr::from(bytes))
+}
+
+/// Pin the CURRENT remote peers of every already-running excluded app to the
+/// physical path (a `/32`/`/128` route, more specific than the tun's `/1`), so a
+/// live flow on a socket that already existed at connect stays on the real IP.
+///
+/// Why this is needed in addition to the cgroup tag: `socket cgroupv2` classifies
+/// by the socket's CREATION-time cgroup, which the kernel never updates when a
+/// running task is moved between cgroups — so moving an in-match game into the
+/// bypass cgroup tags none of its open sockets, and the flip into the tun would
+/// otherwise swallow that flow. The pre-existing socket already holds the real
+/// physical source, so a destination route alone (no masquerade) keeps it intact.
+/// Snapshot only: new connections are covered by the cgroup tag. Best-effort.
+fn pin_existing_excluded_flows(
+    excluded: &[String],
+    gw: &Option<String>,
+    iface: &str,
+    v6: &Option<(String, String)>,
+) {
+    // Socket inodes owned by currently-running excluded processes.
+    let mut inodes = std::collections::HashSet::new();
+    if let Ok(entries) = std::fs::read_dir("/proc") {
+        for e in entries.flatten() {
+            let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
+                continue;
+            };
+            if !pid_matches_excluded(pid, excluded) {
+                continue;
+            }
+            if let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) {
+                for fd in fds.flatten() {
+                    if let Ok(t) = std::fs::read_link(fd.path()) {
+                        if let Some(ino) = t
+                            .to_str()
+                            .and_then(|s| s.strip_prefix("socket:["))
+                            .and_then(|s| s.strip_suffix(']'))
+                        {
+                            inodes.insert(ino.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if inodes.is_empty() {
+        return;
+    }
+    // Map those sockets to their remote peers (col 1 = local_address, col 2 =
+    // rem_address, col 9 = inode in /proc/net/{tcp,udp,...}).
+    //   - TCP / connect()ed UDP: pin the remote peer to physical by /32 route.
+    //   - UNCONNECTED UDP (rem port 0): the Source/CS2 netcode uses one bound
+    //     sendto/recvfrom socket with NO remote in /proc/net/udp, so there is no
+    //     peer to route to. Mark its outgoing packets by BOUND LOCAL PORT instead
+    //     (nft, below) so the live game flow stays physical too. (Reading the peer
+    //     from conntrack is unreliable here — on a fresh connect the flow may not
+    //     be tracked yet.)
+    let mut peers4 = std::collections::BTreeSet::new();
+    let mut peers6 = std::collections::BTreeSet::new();
+    let mut udp_sports: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
+    for (path, is6) in [
+        ("/proc/net/tcp", false),
+        ("/proc/net/udp", false),
+        ("/proc/net/tcp6", true),
+        ("/proc/net/udp6", true),
+    ] {
+        let is_udp = path.contains("udp");
+        let Ok(content) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        for line in content.lines().skip(1) {
+            let cols: Vec<&str> = line.split_whitespace().collect();
+            if cols.len() < 10 || !inodes.contains(cols[9]) {
+                continue;
+            }
+            let Some((ip_hex, port_hex)) = cols[2].split_once(':') else {
+                continue;
+            };
+            if u16::from_str_radix(port_hex, 16).unwrap_or(0) == 0 {
+                // No remote peer. For UDP that means an unconnected socket — keep
+                // its bound local port physical by source-port mark. (TCP with no
+                // peer is a listener: nothing to send, skip.)
+                if is_udp {
+                    if let Some((_, lport_hex)) = cols[1].split_once(':') {
+                        if let Ok(lp) = u16::from_str_radix(lport_hex, 16) {
+                            if lp != 0 {
+                                udp_sports.insert(lp);
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+            if is6 {
+                if let Some(ip) = hex_to_ipv6(ip_hex) {
+                    if !ip.is_loopback() && !ip.is_unspecified() {
+                        peers6.insert(ip);
+                    }
+                }
+            } else if let Some(ip) = hex_to_ipv4(ip_hex) {
+                if !ip.is_loopback() && !ip.is_unspecified() {
+                    peers4.insert(ip);
+                }
+            }
+        }
+    }
+
+    // Record EVERY peer in the teardown state FIRST, then add the routes — so a
+    // mid-add crash/kill can't leave a route the state file doesn't list (which
+    // route_down would then fail to remove, leaking it to a later app).
+    let mut state = String::new();
+    for ip in &peers4 {
+        state.push_str(&format!("{ip}\n"));
+    }
+    if v6.is_some() {
+        for ip in &peers6 {
+            state.push_str(&format!("{ip}\n"));
+        }
+    }
+    write_state(BYPASS_PINS_STATE, &state);
+
+    // NOTE: a /32 pin is destination-only — ALL host traffic to that IP egresses
+    // physical for the session. Correct for the excluded app; for a SHARED peer
+    // IP it would also divert a non-excluded app's traffic to that IP. Fine for
+    // games (dedicated server IPs), the intended use of the per-app bypass.
+    for ip in &peers4 {
+        let dst = format!("{ip}/32");
+        let mut r: Vec<&str> = vec!["route", "replace", &dst];
+        if let Some(g) = gw.as_deref() {
+            r.push("via");
+            r.push(g);
+        }
+        r.push("dev");
+        r.push(iface);
+        ip_quiet(&r);
+    }
+    if let Some((g6, if6)) = v6.as_ref() {
+        for ip in &peers6 {
+            ip_quiet(&["-6", "route", "replace", &format!("{ip}/128"), "via", g6, "dev", if6]);
+        }
+    }
+
+    // Source-port marks for the unconnected-UDP game sockets. Added to the bypass
+    // table's mangle chain (same 0x2025 mark → physical via PHYS_TABLE + the
+    // masquerade, which is a no-op for an already-real source); removed wholesale
+    // when route_down deletes the table. Marks any UDP from this local port — over-
+    // reach is bounded to that exact port number, narrower than a shared-IP pin.
+    let mark = format!("{BYPASS_MARK:#x}");
+    for lp in &udp_sports {
+        let port = lp.to_string();
+        let _ = Command::new("nft")
+            .args([
+                "add", "rule", "inet", BYPASS_TABLE, "mangle", "udp", "sport", &port, "meta",
+                "mark", "set", &mark,
+            ])
+            .stderr(Stdio::null())
+            .status();
     }
 }
 
@@ -663,7 +879,11 @@ fn add_rule_fwmark(mark: u32, table: &str) -> Result<(), String> {
 /// `route_down` on any error. Mode-independent — the per-app/site split is
 /// entirely xray's job (native `process`/`domain` routing); the helper only
 /// gets traffic into the tun and keeps xray's own dials out of it.
-fn route_up(servers: &[std::net::IpAddr]) -> Result<(), String> {
+fn route_up(
+    servers: &[std::net::IpAddr],
+    bypass_cgroup: Option<&str>,
+    bypass_apps: &[String],
+) -> Result<(), String> {
     let (gw, iface) = detect_default_route()?;
 
     let result = (|| -> Result<(), String> {
@@ -710,6 +930,31 @@ fn route_up(servers: &[std::net::IpAddr]) -> Result<(), String> {
         }
         write_state(SERVERS_STATE, &server_lines);
 
+        // v6 default, needed both for the per-app v6 pins (4b) and the v6
+        // blackhole exceptions (step 6).
+        let v6 = detect_default_route6();
+
+        // 4b. Arm the per-app bypass NOW, BEFORE the default flips into the tun
+        //     (step 5), via TWO mechanisms with different coverage:
+        //       - bypass_up tags the cgroup so NEW connections from excluded apps
+        //         egress physical (masquerade rewrites their tun-picked source);
+        //         bypass_sweep moves the running excluded processes in.
+        //       - pin_existing_excluded_flows pins each running excluded app's
+        //         CURRENT remote peers to the physical path, because a cgroup move
+        //         can't re-tag an already-open socket (sk_cgrp_data is fixed at
+        //         creation) — without this a live game flow is swallowed by the
+        //         tun at the flip.
+        //     FATAL on tag failure: a running excluded app must never be silently
+        //     flipped into the tun. route_up's caller rolls back via route_down.
+        if let Some(cg) = bypass_cgroup {
+            bypass_up(cg, Some(&iface)).map_err(|e| {
+                format!("per-app bypass setup failed ({e}); turn off app exclusions to connect without it")
+            })?;
+            let procs = format!("/sys/fs/cgroup/{}/cgroup.procs", cg.trim_start_matches('/'));
+            bypass_sweep(&procs, bypass_apps);
+            pin_existing_excluded_flows(bypass_apps, &gw, &iface, &v6);
+        }
+
         // 5. default into the tun (0/1 + 128/1 are more specific than the
         //    existing physical default, which stays as fallback). Everything
         //    enters the tun; xray's routing decides proxy vs direct per app/site.
@@ -721,7 +966,6 @@ fn route_up(servers: &[std::net::IpAddr]) -> Result<(), String> {
         //    NIC. Blackhole v6 with /1 routes (more specific than the physical
         //    ::/0 default, left intact for clean teardown). A v6 server dial, if
         //    any, gets a /128 bypass first (longest-prefix wins over the /1).
-        let v6 = detect_default_route6();
         let mut s6 = String::new();
         for s in servers {
             if let std::net::IpAddr::V6(addr) = s {
@@ -775,6 +1019,18 @@ fn route_down() {
     // The per-app bypass nft table (mangle + masquerade), if up.
     bypass_down();
 
+    // The per-app existing-flow pins (excluded apps' remote peers).
+    if let Ok(list) = std::fs::read_to_string(BYPASS_PINS_STATE) {
+        for ip in list.lines().map(|l| l.trim()).filter(|l| !l.is_empty()) {
+            if ip.contains(':') {
+                ip_quiet(&["-6", "route", "del", &format!("{ip}/128")]);
+            } else {
+                ip_quiet(&["route", "del", &format!("{ip}/32")]);
+            }
+        }
+        let _ = std::fs::remove_file(BYPASS_PINS_STATE);
+    }
+
     // 3. flush the physical bypass table.
     ip_quiet(&["route", "flush", "table", PHYS_TABLE]);
 
@@ -793,5 +1049,38 @@ fn route_down() {
             let _ = write_file(RP_ALL, v);
         }
         let _ = std::fs::remove_file(RP_STATE);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{hex_to_ipv4, hex_to_ipv6};
+
+    #[test]
+    fn ipv4_from_proc_net_hex() {
+        // /proc/net/tcp dumps the address as the host value of its __be32 → the
+        // value's little-endian bytes are the dotted octets. (Verified live.)
+        let v4 = |s: &str| s.parse::<std::net::Ipv4Addr>().unwrap();
+        assert_eq!(hex_to_ipv4("DCA79A95").unwrap(), v4("149.154.167.220"));
+        assert_eq!(hex_to_ipv4("0100007F").unwrap(), v4("127.0.0.1"));
+        assert_eq!(hex_to_ipv4("0A2B5C5B").unwrap(), v4("91.92.43.10"));
+        assert_eq!(hex_to_ipv4("00000000").unwrap(), v4("0.0.0.0"));
+        assert!(hex_to_ipv4("XYZ").is_none());
+        assert!(hex_to_ipv4("DCA79A9").is_none()); // wrong length
+    }
+
+    #[test]
+    fn ipv6_from_proc_net_hex() {
+        // Each 8-hex group is one host-order __be32 word; its LE bytes are the
+        // network bytes. 2001:db8::1 → "B80D0120" "00000000" "00000000" "01000000".
+        assert_eq!(
+            hex_to_ipv6("B80D0120000000000000000001000000").unwrap(),
+            "2001:db8::1".parse::<std::net::Ipv6Addr>().unwrap()
+        );
+        assert_eq!(
+            hex_to_ipv6("00000000000000000000000001000000").unwrap(),
+            "::1".parse::<std::net::Ipv6Addr>().unwrap()
+        );
+        assert!(hex_to_ipv6("00").is_none());
     }
 }
