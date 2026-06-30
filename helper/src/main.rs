@@ -57,6 +57,15 @@ const PHYS_TABLE: &str = "100";
 const BYPASS_MARK: u32 = 0x2025;
 const BYPASS_TABLE: &str = "varmlen_bypass";
 
+// Kernel process-event connector (netlink) — lets the bypass watcher react to a
+// process exec / comm-change the instant it happens, instead of polling /proc.
+const NETLINK_CONNECTOR: i32 = 11;
+const CN_IDX_PROC: u32 = 1;
+const CN_VAL_PROC: u32 = 1;
+const PROC_CN_MCAST_LISTEN: u32 = 1;
+const PROC_EVENT_EXEC: u32 = 0x0000_0002;
+const PROC_EVENT_COMM: u32 = 0x0000_0200;
+
 /// Teardown state (rp_filter / state writes need cap_dac_override).
 const RP_STATE: &str = "/run/varmlen/rp_filter_all.orig";
 const SERVERS_STATE: &str = "/run/varmlen/servers";
@@ -160,6 +169,15 @@ fn run(args: &[String]) -> i32 {
             }
         }
         Some("bypass-down") => { bypass_down(); 0 }
+        Some("bypass-watch") => {
+            // bypass-watch <cgroup-path> <excluded-id>...  (runs until killed)
+            let Some(path) = args.get(1) else {
+                eprintln!("usage: varmlen-probe bypass-watch <cgroup-path> <id>...");
+                return 2;
+            };
+            let excluded: Vec<String> = args[2..].to_vec();
+            bypass_watch(path, &excluded)
+        }
         Some("cleanup") => { remove_killswitch(); route_down(); delete_tun(); 0 }
         _ => {
             eprintln!("usage: varmlen-probe <tcp|icmp|killswitch-up|killswitch-down|route-up|route-down|cleanup> ...");
@@ -378,6 +396,122 @@ fn bypass_up(cgroup_path: &str) -> Result<(), String> {
 fn bypass_down() {
     let _ = Command::new("nft").arg("delete").arg("table").arg("inet").arg(BYPASS_TABLE)
         .stderr(Stdio::null()).status();
+}
+
+// --- per-app bypass watcher (event-driven) ---------------------------------
+
+fn cg_valid(rel: &str) -> bool {
+    !rel.is_empty()
+        && rel.len() <= 512
+        && rel.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-' | b'@'))
+}
+
+fn id_matches(id: &str, comm: &str, exe: &str, exe_base: &str) -> bool {
+    if id.is_empty() {
+        return false;
+    }
+    // Trailing slash = a folder: match any process whose executable lives under
+    // it (a whole Steam library at once, native + Proton).
+    if id.ends_with('/') {
+        return !exe.is_empty() && exe.starts_with(id);
+    }
+    comm == id || exe_base == id || exe == id
+}
+
+/// Move `pid` into the bypass cgroup if its name/exe matches an excluded id.
+fn bypass_move_if_match(procs: &str, pid: u32, excluded: &[String]) {
+    let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
+    let comm = comm.trim();
+    let exe = std::fs::read_link(format!("/proc/{pid}/exe")).ok();
+    let exe_str = exe.as_ref().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+    let exe_base = exe
+        .as_ref()
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if excluded.iter().any(|id| id_matches(id, comm, &exe_str, &exe_base)) {
+        let _ = std::fs::write(procs, pid.to_string());
+    }
+}
+
+fn bypass_sweep(procs: &str, excluded: &[String]) {
+    if let Ok(entries) = std::fs::read_dir("/proc") {
+        for e in entries.flatten() {
+            if let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) {
+                bypass_move_if_match(procs, pid, excluded);
+            }
+        }
+    }
+}
+
+/// Long-running (until killed by the GUI) watcher: subscribe to the kernel proc
+/// connector and, on every exec / comm-change, move a matching process into the
+/// bypass cgroup immediately. An initial sweep catches already-running matches.
+fn bypass_watch(cgroup_rel: &str, excluded: &[String]) -> i32 {
+    if !cg_valid(cgroup_rel) {
+        eprintln!("invalid cgroup path");
+        return 2;
+    }
+    // Die with our parent (the GUI) so a watcher is never orphaned.
+    unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong, 0, 0, 0) };
+    let procs = format!("/sys/fs/cgroup/{}/cgroup.procs", cgroup_rel.trim_start_matches('/'));
+
+    bypass_sweep(&procs, excluded);
+
+    let fd = unsafe { libc::socket(libc::AF_NETLINK, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, NETLINK_CONNECTOR) };
+    if fd < 0 {
+        eprintln!("netlink socket: {}", std::io::Error::last_os_error());
+        return 1;
+    }
+    let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+    addr.nl_family = libc::AF_NETLINK as u16;
+    addr.nl_groups = CN_IDX_PROC;
+    let alen = std::mem::size_of::<libc::sockaddr_nl>() as u32;
+    if unsafe { libc::bind(fd, &addr as *const _ as *const libc::sockaddr, alen) } < 0 {
+        eprintln!("netlink bind: {}", std::io::Error::last_os_error());
+        unsafe { libc::close(fd) };
+        return 1;
+    }
+    // Subscribe: nlmsghdr(16) + cn_msg(20) + op(4).
+    let mut listen = vec![0u8; 40];
+    listen[0..4].copy_from_slice(&40u32.to_ne_bytes());
+    listen[4..6].copy_from_slice(&3u16.to_ne_bytes()); // NLMSG_DONE
+    listen[12..16].copy_from_slice(&std::process::id().to_ne_bytes());
+    listen[16..20].copy_from_slice(&CN_IDX_PROC.to_ne_bytes());
+    listen[20..24].copy_from_slice(&CN_VAL_PROC.to_ne_bytes());
+    listen[32..34].copy_from_slice(&4u16.to_ne_bytes()); // cn_msg.len
+    listen[36..40].copy_from_slice(&PROC_CN_MCAST_LISTEN.to_ne_bytes());
+    if unsafe { libc::send(fd, listen.as_ptr() as *const _, listen.len(), 0) } < 0 {
+        eprintln!("netlink send: {}", std::io::Error::last_os_error());
+        unsafe { libc::close(fd) };
+        return 1;
+    }
+
+    // proc_event layout in the datagram: nlmsghdr(16) + cn_msg(20) → `what` at
+    // 36, exec/comm process_tgid at 56.
+    let mut buf = [0u8; 4096];
+    loop {
+        let n = unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut _, buf.len(), 0) };
+        if n < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            break;
+        }
+        if (n as usize) < 60 {
+            continue;
+        }
+        let what = u32::from_ne_bytes([buf[36], buf[37], buf[38], buf[39]]);
+        if what == PROC_EVENT_EXEC || what == PROC_EVENT_COMM {
+            let tgid = u32::from_ne_bytes([buf[56], buf[57], buf[58], buf[59]]);
+            if tgid != 0 {
+                bypass_move_if_match(&procs, tgid, excluded);
+            }
+        }
+    }
+    unsafe { libc::close(fd) };
+    0
 }
 
 fn delete_tun() {
