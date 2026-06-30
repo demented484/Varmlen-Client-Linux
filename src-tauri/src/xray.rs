@@ -407,7 +407,11 @@ fn build_route_rules(
     let sites_out = if sites_selective { "proxy" } else { "direct" };
     let default_out = if android {
         if sites_selective { "direct" } else { "proxy" }
-    } else if apps_selective && sites_selective {
+    } else if apps_selective {
+        // Selective apps mode = ONLY the listed apps use the VPN; everything else
+        // (e.g. a game that isn't in the list) stays DIRECT. The apps choice owns
+        // the default. (Previously this defaulted to "proxy" unless the sites mode
+        // was ALSO selective, so non-listed apps wrongly went through the VPN.)
         "direct"
     } else {
         "proxy"
