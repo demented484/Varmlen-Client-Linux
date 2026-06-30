@@ -452,8 +452,11 @@ fn bypass_watch(cgroup_rel: &str, excluded: &[String]) -> i32 {
         eprintln!("invalid cgroup path");
         return 2;
     }
-    // Die with our parent (the GUI) so a watcher is never orphaned.
-    unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong, 0, 0, 0) };
+    // Exit if the spawning GUI goes away (checked on each recv timeout). NOTE:
+    // PR_SET_PDEATHSIG is wrong here — it fires on the parent THREAD's death, and
+    // the GUI spawns us from a short-lived tokio worker, which would kill us
+    // almost immediately.
+    let gui_pid = unsafe { libc::getppid() };
     let procs = format!("/sys/fs/cgroup/{}/cgroup.procs", cgroup_rel.trim_start_matches('/'));
 
     bypass_sweep(&procs, excluded);
@@ -471,6 +474,17 @@ fn bypass_watch(cgroup_rel: &str, excluded: &[String]) -> i32 {
         eprintln!("netlink bind: {}", std::io::Error::last_os_error());
         unsafe { libc::close(fd) };
         return 1;
+    }
+    // Wake recv every 2s so we can notice the GUI exiting and stop.
+    let tv = libc::timeval { tv_sec: 2, tv_usec: 0 };
+    unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVTIMEO,
+            &tv as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+        );
     }
     // Subscribe: nlmsghdr(16) + cn_msg(20) + op(4).
     let mut listen = vec![0u8; 40];
@@ -494,10 +508,20 @@ fn bypass_watch(cgroup_rel: &str, excluded: &[String]) -> i32 {
         let n = unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut _, buf.len(), 0) };
         if n < 0 {
             let e = std::io::Error::last_os_error();
-            if e.kind() == std::io::ErrorKind::Interrupted {
-                continue;
+            match e.kind() {
+                std::io::ErrorKind::Interrupted => continue,
+                // recv timed out: stop if the GUI (our original parent) is gone.
+                std::io::ErrorKind::WouldBlock => {
+                    if unsafe { libc::getppid() } != gui_pid {
+                        break;
+                    }
+                    continue;
+                }
+                _ => {
+                    eprintln!("bypass-watch recv: {e}");
+                    break;
+                }
             }
-            break;
         }
         if (n as usize) < 60 {
             continue;
