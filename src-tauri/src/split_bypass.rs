@@ -106,11 +106,17 @@ pub fn setup(app: &AppHandle, excluded: Vec<String>) {
     }
 }
 
-/// Stop the watcher and drop the helper's tagging. The cgroup itself is left in
+/// Stop the watcher and drop the helper's tagging (incl. the cgroup socket-mark
+/// BPF program — hence the cgroup path argument). The cgroup itself is left in
 /// place (its members harmlessly stay until they exit); a fresh `setup` reuses it.
 pub fn teardown(app: &AppHandle) {
     kill_watcher();
     if let Some(probe) = crate::vpn::probe_bin(app) {
-        let _ = std::process::Command::new(&probe).arg("bypass-down").status();
+        let mut cmd = std::process::Command::new(&probe);
+        cmd.arg("bypass-down");
+        if let Some(rel) = cgroup_dir().and_then(|d| cgroup_rel(&d)) {
+            cmd.arg(rel);
+        }
+        let _ = cmd.status();
     }
 }

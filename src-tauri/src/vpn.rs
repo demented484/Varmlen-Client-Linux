@@ -181,6 +181,33 @@ pub(crate) fn teardown_on_exit(app: &tauri::AppHandle) {
     }
 }
 
+/// How `vpn_connect` tears down the previous state before rebuilding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Teardown {
+    /// Keep a blocking nft table up across the whole teardown+rebuild so user
+    /// traffic can never fall back to the physical route mid-switch (a real-IP
+    /// leak). `transitional: true` = the user's kill switch is OFF and the
+    /// block exists only for the switch — it MUST be dropped once the new
+    /// tunnel is up, or on failure (fail-open: the user didn't opt into
+    /// blocking).
+    HoldBlock { transitional: bool },
+    /// Full teardown (killswitch-down + route-down): no live tunnel to
+    /// protect and no kill switch to preserve.
+    StopAll,
+}
+
+/// Decide the teardown for a connect. `tunnel_up` = the tun data plane is
+/// currently carrying traffic (i.e. this is a reconnect / location switch).
+/// The kill switch case holds the block even when the tunnel is already gone
+/// (e.g. reconnecting out of a "dropped" phase must not unblock traffic).
+fn plan_teardown(mode: &str, killswitch: bool, tunnel_up: bool) -> Teardown {
+    if mode != "proxy" && (killswitch || tunnel_up) {
+        Teardown::HoldBlock { transitional: !killswitch && tunnel_up }
+    } else {
+        Teardown::StopAll
+    }
+}
+
 fn stop_all(app: &tauri::AppHandle) {
     if let Some(probe) = probe_bin(app) {
         let _ = Command::new(&probe).arg("killswitch-down").status();
@@ -322,6 +349,20 @@ pub fn request_setcap_blocking(app: &tauri::AppHandle) -> Result<(), String> {
     }
 }
 
+/// Whether the installed probe copy is missing or stale relative to the
+/// bundled/dev source (cheap size check — the same freshness test
+/// `ensure_probe_installed` uses). A stale probe means a helper update hasn't
+/// been installed+setcap'd yet, so its fixes aren't active.
+fn probe_needs_install(app: &tauri::AppHandle) -> bool {
+    use tauri::Manager;
+    let Ok(data) = app.path().app_data_dir() else { return false };
+    let Some(src) = probe_source(app) else { return false };
+    let dest = data.join("bin").join("varmlen-probe");
+    !dest.exists()
+        || std::fs::metadata(&dest).map(|m| m.len()).ok()
+            != std::fs::metadata(&src).map(|m| m.len()).ok()
+}
+
 /// Copy the bundled varmlen-probe into app-data/bin (idempotent) so it has a
 /// stable path to setcap (resources get replaced on app update, clearing caps).
 fn ensure_probe_installed(app: &tauri::AppHandle) -> Result<PathBuf, String> {
@@ -331,10 +372,7 @@ fn ensure_probe_installed(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     std::fs::create_dir_all(&bin_dir).map_err(|e| format!("create bin dir: {e}"))?;
     let dest = bin_dir.join("varmlen-probe");
     let src = probe_source(app).ok_or("bundled varmlen-probe not found")?;
-    // Only copy if missing or different size (cheap freshness check).
-    let need = !dest.exists()
-        || std::fs::metadata(&dest).map(|m| m.len()).ok()
-            != std::fs::metadata(&src).map(|m| m.len()).ok();
+    let need = probe_needs_install(app);
     if need {
         // Install atomically: copy to a temp file, then rename over `dest`. An
         // in-place copy fails with ETXTBSY ("text file busy") whenever a probe
@@ -499,29 +537,56 @@ pub async fn vpn_connect(
         // Mark the upcoming teardown intentional so any prior crash-watcher exits
         // without firing; cleared once we're successfully connected again.
         INTENTIONAL_STOP.store(true, Ordering::SeqCst);
-        // On a RECONNECT (config change while still connected) with the kill
-        // switch ON, KEEP the nft drop up across the teardown+rebuild. Otherwise
-        // the brief window between dropping the switch and bringing the new tunnel
-        // up lets traffic fall back to the physical route = real-IP leak. xray's
-        // own dial to the server is allowed through the switch via its bypass
-        // mark, so the tunnel still rebuilds while user traffic stays blocked.
-        // Just terminate the old xray (its tun fd closes → device gone) and drop
-        // its routes; the switch is re-applied (idempotent) once the new tun is up.
-        // A fresh connect has no prior switch, so this is a clean no-op there.
-        if killswitch && mode != "proxy" {
-            if let Some(mut c) = xray_child().lock().unwrap().take() {
-                terminate_gracefully(&mut c);
+        // On a RECONNECT (config change while the tun still carries traffic),
+        // a blocking nft table must stay up across the whole teardown+rebuild —
+        // otherwise the window between route-down and the new route-up lets
+        // traffic fall back to the physical route = real-IP leak. With the kill
+        // switch ON the existing table simply stays; with it OFF we raise a
+        // TRANSITIONAL block (same table) for the duration of the switch and
+        // drop it once the new tunnel is up or the reconnect failed. xray's own
+        // dial to the server passes the block via its dial mark, so the tunnel
+        // rebuilds while user traffic stays held. Just terminate the old xray
+        // (its tun fd closes → device gone) and drop its routes; the user's
+        // kill switch (if on) is re-applied (idempotent) once the new tun is up.
+        let tunnel_up = pid_of(xray_child()).is_some()
+            && std::path::Path::new(&format!("/sys/class/net/{}", crate::xray::TUN_NAME)).exists();
+        let plan = plan_teardown(&mode, killswitch, tunnel_up);
+        match plan {
+            Teardown::HoldBlock { transitional } => {
+                if transitional {
+                    // No table is up yet (kill switch off) — raise it BEFORE the
+                    // teardown. Best-effort: if it fails we're no worse off than
+                    // the old unprotected switch.
+                    if let Some(probe) = probe_bin(&app) {
+                        let mut ks = Command::new(&probe);
+                        ks.arg("killswitch-up");
+                        if allow_lan {
+                            ks.arg("--allow-lan");
+                        }
+                        for ip in resolve_ips(&server_host) {
+                            ks.arg(ip.to_string());
+                        }
+                        let _ = ks.status();
+                    }
+                }
+                if let Some(mut c) = xray_child().lock().unwrap().take() {
+                    terminate_gracefully(&mut c);
+                }
+                // --keep-bypass: leave the per-app bypass table (cgroup tag +
+                // flow pins + masquerade) up across the gap, so an excluded
+                // app's live flows stay marked → keep passing the block and
+                // egressing the physical NIC. The next route-up rebuilds it.
+                if let Some(probe) = probe_bin(&app) {
+                    let _ = Command::new(&probe).arg("route-down").arg("--keep-bypass").status();
+                }
             }
-            if let Some(probe) = probe_bin(&app) {
-                let _ = Command::new(&probe).arg("route-down").status();
-            }
-        } else {
-            stop_all(&app);
+            Teardown::StopAll => stop_all(&app),
         }
         // No longer in a "dropped" (blocked) phase — clear it so a *failed*
         // reconnect can't leave vpn_status falsely reporting blocked.
         set_phase("disconnected");
 
+        let result = (|| -> Result<HelperResponse, String> {
         let xray_bin = crate::core::binary_path(&app, CoreKind::Xray)
             .map_err(|e| format!("xray core: {e} — install it in Settings → VPN core"))?;
         let rt = runtime_dir();
@@ -545,10 +610,14 @@ pub async fn vpn_connect(
             return Ok(HelperResponse::connected(pid));
         }
 
-        // TUN mode: xray owns the native tun and needs CAP_NET_ADMIN. If the
-        // permissions aren't granted yet, prompt for them now (pkexec) — on the
-        // first connect — instead of nagging at launch.
-        if !has_cap(&xray_bin, "cap_net_admin") {
+        // TUN mode: xray owns the native tun and needs CAP_NET_ADMIN, and the
+        // routing/killswitch/bypass go through the setcap'd probe. If the
+        // permissions aren't granted yet — or a helper update hasn't been
+        // installed+setcap'd (stale probe = its fixes are inactive) — prompt
+        // now (pkexec), on connect, instead of nagging at launch.
+        let probe_ready = !probe_needs_install(&app)
+            && probe_bin(&app).map(|p| has_cap(&p, "cap_net_admin")).unwrap_or(false);
+        if !has_cap(&xray_bin, "cap_net_admin") || !probe_ready {
             request_setcap_blocking(&app)
                 .map_err(|e| format!("granting network permissions: {e}"))?;
             if !has_cap(&xray_bin, "cap_net_admin") {
@@ -583,6 +652,16 @@ pub async fn vpn_connect(
         // BEFORE it flips the default into the tun, so their live connections are
         // never captured by the VPN — not even momentarily.
         let bypass_rel = crate::split_bypass::prepare(&excluded);
+        if !excluded.is_empty() && bypass_rel.is_none() {
+            // Never connect with exclusions silently inert: the user believes
+            // those apps bypass the VPN. Same fail-hard stance as route-up's.
+            stop_all(&app);
+            return Err(
+                "per-app exclusions can't be set up (cgroup v2 unavailable) — \
+                 turn off app exclusions to connect without them"
+                    .into(),
+            );
+        }
         let mut up = Command::new(&probe);
         up.arg("route-up");
         for ip in &server_ips {
@@ -641,6 +720,18 @@ pub async fn vpn_connect(
         crate::split_bypass::setup(&app, excluded);
 
         Ok(HelperResponse::connected(pid))
+        })();
+
+        // Drop the TRANSITIONAL block in every outcome: on success the new
+        // tunnel now carries traffic; on failure fail-open — the user didn't
+        // enable the kill switch. Idempotent with the killswitch-down that
+        // stop_all already ran on some error paths.
+        if matches!(plan, Teardown::HoldBlock { transitional: true }) {
+            if let Some(probe) = probe_bin(&app) {
+                let _ = Command::new(&probe).arg("killswitch-down").status();
+            }
+        }
+        result
     })
     .await
     .map_err(|e| format!("join: {e}"))?
@@ -806,6 +897,10 @@ pub async fn caps_granted(app: tauri::AppHandle) -> bool {
         crate::core::binary_path(&app, CoreKind::Xray)
             .map(|b| has_cap(&b, "cap_net_admin"))
             .unwrap_or(false)
+            // A stale/uncapped probe counts as "not granted": routing, the
+            // kill switch and the per-app bypass all run through it.
+            && !probe_needs_install(&app)
+            && probe_bin(&app).map(|p| has_cap(&p, "cap_net_admin")).unwrap_or(false)
     })
     .await
     .unwrap_or(false)
@@ -873,6 +968,39 @@ fn free_local_port() -> Result<u16, String> {
         .and_then(|l| l.local_addr())
         .map(|a| a.port())
         .map_err(|e| format!("alloc port: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{plan_teardown, Teardown};
+
+    #[test]
+    fn proxy_mode_always_stops_all() {
+        assert_eq!(plan_teardown("proxy", true, true), Teardown::StopAll);
+        assert_eq!(plan_teardown("proxy", false, true), Teardown::StopAll);
+        assert_eq!(plan_teardown("proxy", false, false), Teardown::StopAll);
+    }
+
+    #[test]
+    fn killswitch_on_always_holds_block() {
+        // Includes reconnecting out of a "dropped" phase (tunnel already gone):
+        // the block must never be lifted mid-switch.
+        assert_eq!(plan_teardown("tun", true, true), Teardown::HoldBlock { transitional: false });
+        assert_eq!(plan_teardown("tun", true, false), Teardown::HoldBlock { transitional: false });
+    }
+
+    #[test]
+    fn killswitch_off_reconnect_gets_transitional_block() {
+        // The reported real-IP leak: switching locations WITHOUT the kill
+        // switch must still hold traffic blocked across the rebuild.
+        assert_eq!(plan_teardown("tun", false, true), Teardown::HoldBlock { transitional: true });
+    }
+
+    #[test]
+    fn killswitch_off_fresh_connect_stops_all() {
+        // Nothing was tunneled before, so there is nothing to protect.
+        assert_eq!(plan_teardown("tun", false, false), Teardown::StopAll);
+    }
 }
 
 /// Per-server via-proxy latency: spin a throwaway xray (the server as the only

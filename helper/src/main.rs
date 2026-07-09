@@ -29,8 +29,9 @@
 //!   varmlen-probe icmp <host> <timeout_ms>             -> prints RTT ms
 //!   varmlen-probe killswitch-up [--allow-lan] <ip>...  -> applies nft table
 //!   varmlen-probe killswitch-down
-//!   varmlen-probe route-up [--server <ip>]...
-//!   varmlen-probe route-down
+//!   varmlen-probe route-up [--server <ip>]... [--bypass-cgroup <rel>] [--bypass-app <id>]...
+//!   varmlen-probe route-down [--keep-bypass]
+//!   varmlen-probe bypass-up <cgroup-rel> | bypass-down | bypass-watch <cgroup-rel> <id>...
 //!   varmlen-probe cleanup
 
 use std::process::{Command, Stdio};
@@ -70,8 +71,8 @@ const PROC_EVENT_COMM: u32 = 0x0000_0200;
 const RP_STATE: &str = "/run/varmlen/rp_filter_all.orig";
 const SERVERS_STATE: &str = "/run/varmlen/servers";
 const SERVERS6_STATE: &str = "/run/varmlen/servers6";
-/// Remote peers of already-running excluded apps, pinned to the physical path at
-/// route-up (a cgroup move can't re-tag a live socket); removed at route-down.
+/// LEGACY (cleanup only): an older dev build pinned excluded apps' peers with
+/// /32 routes recorded here. Pins are nft mark rules in the bypass table now.
 const BYPASS_PINS_STATE: &str = "/run/varmlen/bypass_pins";
 
 fn main() {
@@ -178,7 +179,13 @@ fn run(args: &[String]) -> i32 {
                 Err(e) => { eprintln!("{e}"); 1 }
             }
         }
-        Some("route-down") => { route_down(); 0 }
+        Some("route-down") => {
+            // --keep-bypass: reconnect path — leave the per-app bypass table up
+            // so excluded apps' marked flows survive the gap.
+            let keep = args[1..].iter().any(|a| a == "--keep-bypass");
+            route_down(keep);
+            0
+        }
         Some("bypass-up") => {
             // bypass-up <cgroup-path>
             let Some(path) = args.get(1) else {
@@ -190,7 +197,9 @@ fn run(args: &[String]) -> i32 {
                 Err(e) => { eprintln!("{e}"); 1 }
             }
         }
-        Some("bypass-down") => { bypass_down(); 0 }
+        // bypass-down [cgroup-rel] — the optional path also detaches the
+        // socket-mark BPF program from that cgroup.
+        Some("bypass-down") => { bypass_down(args.get(1).map(String::as_str)); 0 }
         Some("bypass-watch") => {
             // bypass-watch <cgroup-path> <excluded-id>...  (runs until killed)
             let Some(path) = args.get(1) else {
@@ -200,7 +209,7 @@ fn run(args: &[String]) -> i32 {
             let excluded: Vec<String> = args[2..].to_vec();
             bypass_watch(path, &excluded)
         }
-        Some("cleanup") => { remove_killswitch(); route_down(); delete_tun(); 0 }
+        Some("cleanup") => { remove_killswitch(); route_down(false); delete_tun(); 0 }
         _ => {
             eprintln!("usage: varmlen-probe <tcp|icmp|killswitch-up|killswitch-down|route-up|route-down|cleanup> ...");
             2
@@ -313,10 +322,10 @@ fn icmp_ping(host: &str, timeout_ms: u32) -> Result<u32, String> {
 
 // --- killswitch ------------------------------------------------------------
 
-/// Build + apply the killswitch ruleset: drop all output except loopback, the
-/// tunnel, xray's own marked dials (0x2024), the proxy server, DNS bootstrap,
-/// and (optionally) LAN. Atomic via a single `nft -f` transaction.
-fn apply_killswitch(server_ips: &[std::net::IpAddr], allow_lan: bool) -> Result<(), String> {
+/// Build the killswitch ruleset: drop all output except loopback, the tunnel,
+/// xray's own marked dials (0x2024), the per-app bypass (0x2025), the proxy
+/// server, DNS bootstrap, and (optionally) LAN.
+fn killswitch_ruleset(server_ips: &[std::net::IpAddr], allow_lan: bool) -> String {
     let mut r = String::new();
     r.push_str(&format!("add table inet {KS_TABLE}\n"));
     r.push_str(&format!("delete table inet {KS_TABLE}\n"));
@@ -325,7 +334,13 @@ fn apply_killswitch(server_ips: &[std::net::IpAddr], allow_lan: bool) -> Result<
     r.push_str("    type filter hook output priority 0; policy drop;\n");
     r.push_str("    oifname \"lo\" counter accept\n");
     r.push_str(&format!("    oifname \"{TUN_IFACE}\" counter accept\n"));
-    r.push_str("    ct state established,related counter accept\n");
+    // REPLY direction only: keeps inbound services (SSH etc.) working. A bare
+    // `established,related` accept let OUTBOUND pre-VPN flows resume on the
+    // physical NIC the instant the tun vanished mid-reconnect — QUIC sessions
+    // migrate addresses seamlessly, flashing the real IP even with the kill
+    // switch on. Sanctioned outbound flows all carry marks (tun / 0x2024 dial /
+    // 0x2025 bypass) and never need this rule.
+    r.push_str("    ct state established,related ct direction reply counter accept\n");
     r.push_str("    fib daddr type local counter accept\n");
     r.push_str("    meta mark & 0x0000ffff == 0x2023 counter accept\n");
     r.push_str("    meta mark & 0x0000ffff == 0x2024 counter accept\n");
@@ -349,8 +364,12 @@ fn apply_killswitch(server_ips: &[std::net::IpAddr], allow_lan: bool) -> Result<
     r.push_str("    limit rate 30/second log prefix \"varmlen_ks_drop \" level info\n");
     r.push_str("    counter drop\n");
     r.push_str("  }\n}\n");
+    r
+}
 
-    nft_apply(&r)
+/// Apply the killswitch atomically via a single `nft -f` transaction.
+fn apply_killswitch(server_ips: &[std::net::IpAddr], allow_lan: bool) -> Result<(), String> {
+    nft_apply(&killswitch_ruleset(server_ips, allow_lan))
 }
 
 /// Pipe a ruleset into `nft -f -` (atomic transaction).
@@ -422,12 +441,126 @@ fn bypass_up(cgroup_path: &str, iface_override: Option<&str>) -> Result<(), Stri
         mark = BYPASS_MARK,
         iface = iface,
     );
-    nft_apply(&ruleset)
+    nft_apply(&ruleset)?;
+    // Mark sockets at CREATION via cgroup BPF (best-effort): they then connect
+    // with the physical route + REAL source, so the app's flows survive VPN
+    // disconnect. The nft packet-mark + masquerade above stay as the fallback
+    // (old kernels / no cap_bpf) and as a no-op safety net otherwise.
+    if let Err(e) = bypass_bpf(cgroup_path, true) {
+        eprintln!("bypass: cgroup socket-mark BPF unavailable ({e}); masquerade fallback only");
+    }
+    Ok(())
 }
 
-fn bypass_down() {
+/// Tear the bypass tagging down. `cgroup_rel`, when known, also detaches the
+/// cgroup socket-mark BPF program (without it the program stays attached but is
+/// inert once the mark rules are gone, and the next attach replaces it).
+fn bypass_down(cgroup_rel: Option<&str>) {
     let _ = Command::new("nft").arg("delete").arg("table").arg("inet").arg(BYPASS_TABLE)
         .stderr(Stdio::null()).status();
+    if let Some(rel) = cgroup_rel {
+        if cg_valid(rel) {
+            let _ = bypass_bpf(rel, false);
+        }
+    }
+}
+
+// --- cgroup BPF: mark sockets at creation -----------------------------------
+//
+// The nft `socket cgroupv2` tag marks PACKETS, after the socket already picked
+// its source via the main table (the tun address) — that's why the masquerade
+// exists, and why such flows die the moment the VPN disconnects and the tun
+// address vanishes. A BPF_PROG_TYPE_CGROUP_SOCK program attached to the bypass
+// cgroup instead sets sk_mark AT SOCKET CREATION: connect()'s route lookup then
+// resolves via PHYS_TABLE straight to the physical NIC and the REAL source
+// address. Masquerade becomes a no-op, and the app's connections survive both
+// VPN connect and disconnect. Requires CAP_BPF (kernel >= 5.8); best-effort —
+// without it the packet-mark + masquerade path still applies.
+
+const BPF_PROG_LOAD: libc::c_int = 5;
+const BPF_PROG_ATTACH: libc::c_int = 8;
+const BPF_PROG_DETACH: libc::c_int = 9;
+const BPF_PROG_TYPE_CGROUP_SOCK: u32 = 9;
+const BPF_CGROUP_INET_SOCK_CREATE: u32 = 2;
+
+/// One BPF instruction: {code u8, dst:4|src:4, off s16, imm s32}.
+fn bpf_insn(code: u8, dst: u8, src: u8, off: i16, imm: i32) -> [u8; 8] {
+    let mut b = [0u8; 8];
+    b[0] = code;
+    b[1] = (src << 4) | (dst & 0x0f);
+    b[2..4].copy_from_slice(&off.to_ne_bytes());
+    b[4..8].copy_from_slice(&imm.to_ne_bytes());
+    b
+}
+
+/// The socket-mark program:  ctx->mark = BYPASS_MARK; return 1 (allow).
+/// `mark` sits at offset 16 of `struct bpf_sock` (bound_dev_if, family, type,
+/// protocol, mark) and is writable from cgroup/sock programs.
+fn bypass_sock_prog() -> Vec<u8> {
+    let mut p = Vec::with_capacity(4 * 8);
+    p.extend_from_slice(&bpf_insn(0xb4, 2, 0, 0, BYPASS_MARK as i32)); // w2 = mark
+    p.extend_from_slice(&bpf_insn(0x63, 1, 2, 16, 0)); // *(u32*)(r1+16) = w2
+    p.extend_from_slice(&bpf_insn(0xb4, 0, 0, 0, 1)); // w0 = 1 (allow socket)
+    p.extend_from_slice(&bpf_insn(0x95, 0, 0, 0, 0)); // exit
+    p
+}
+
+fn put_u32(buf: &mut [u8], off: usize, v: u32) {
+    buf[off..off + 4].copy_from_slice(&v.to_ne_bytes());
+}
+fn put_u64(buf: &mut [u8], off: usize, v: u64) {
+    buf[off..off + 8].copy_from_slice(&v.to_ne_bytes());
+}
+
+fn bpf_call(cmd: libc::c_int, attr: &mut [u8]) -> Result<i64, String> {
+    let rc = unsafe { libc::syscall(libc::SYS_bpf, cmd, attr.as_mut_ptr(), attr.len()) };
+    if rc < 0 {
+        Err(std::io::Error::last_os_error().to_string())
+    } else {
+        Ok(rc)
+    }
+}
+
+/// Attach (or detach) the socket-mark program to the bypass cgroup.
+/// Attach flags 0 = exclusive per (cgroup, attach-type); re-attaching simply
+/// REPLACES a previous instance, so this is idempotent across reconnects.
+fn bypass_bpf(cgroup_rel: &str, attach: bool) -> Result<(), String> {
+    let dir = format!("/sys/fs/cgroup/{}", cgroup_rel.trim_start_matches('/'));
+    let cdir = std::ffi::CString::new(dir).map_err(|_| "bad path")?;
+    let cg = unsafe { libc::open(cdir.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY) };
+    if cg < 0 {
+        return Err(format!("open cgroup: {}", std::io::Error::last_os_error()));
+    }
+    let res = (|| {
+        if !attach {
+            // union bpf_attr (detach): target_fd @0, attach_bpf_fd @4, type @8.
+            let mut attr = vec![0u8; 16];
+            put_u32(&mut attr, 0, cg as u32);
+            put_u32(&mut attr, 8, BPF_CGROUP_INET_SOCK_CREATE);
+            return bpf_call(BPF_PROG_DETACH, &mut attr).map(|_| ());
+        }
+        // union bpf_attr (prog load): prog_type @0, insn_cnt @4, insns @8,
+        // license @16, expected_attach_type @68.
+        let insns = bypass_sock_prog();
+        let license = b"Dual MIT/GPL\0";
+        let mut attr = vec![0u8; 128];
+        put_u32(&mut attr, 0, BPF_PROG_TYPE_CGROUP_SOCK);
+        put_u32(&mut attr, 4, (insns.len() / 8) as u32);
+        put_u64(&mut attr, 8, insns.as_ptr() as u64);
+        put_u64(&mut attr, 16, license.as_ptr() as u64);
+        put_u32(&mut attr, 68, BPF_CGROUP_INET_SOCK_CREATE);
+        let prog = bpf_call(BPF_PROG_LOAD, &mut attr).map_err(|e| format!("prog load: {e}"))? as i32;
+        // union bpf_attr (attach): target_fd @0, attach_bpf_fd @4, type @8, flags @12.
+        let mut attr = vec![0u8; 16];
+        put_u32(&mut attr, 0, cg as u32);
+        put_u32(&mut attr, 4, prog as u32);
+        put_u32(&mut attr, 8, BPF_CGROUP_INET_SOCK_CREATE);
+        let r = bpf_call(BPF_PROG_ATTACH, &mut attr).map(|_| ()).map_err(|e| format!("attach: {e}"));
+        unsafe { libc::close(prog) }; // the attachment holds its own reference
+        r
+    })();
+    unsafe { libc::close(cg) };
+    res
 }
 
 // --- per-app bypass watcher (event-driven) ---------------------------------
@@ -438,7 +571,10 @@ fn cg_valid(rel: &str) -> bool {
         && rel.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-' | b'@'))
 }
 
-fn id_matches(id: &str, comm: &str, exe: &str, exe_base: &str) -> bool {
+/// comm is truncated by the kernel to TASK_COMM_LEN - 1 bytes.
+const COMM_MAX: usize = 15;
+
+fn id_matches(id: &str, comm: &str, exe: &str, exe_base: &str, arg0_base: &str) -> bool {
     if id.is_empty() {
         return false;
     }
@@ -447,10 +583,33 @@ fn id_matches(id: &str, comm: &str, exe: &str, exe_base: &str) -> bool {
     if id.ends_with('/') {
         return !exe.is_empty() && exe.starts_with(id);
     }
-    comm == id || exe_base == id || exe == id
+    // Case-insensitive: Windows filenames (Proton games) are case-insensitive,
+    // and wine may report a different case in cmdline than the file the user
+    // picked. arg0 covers wine/Proton, whose /proc/pid/exe is the preloader.
+    if comm.eq_ignore_ascii_case(id)
+        || exe_base.eq_ignore_ascii_case(id)
+        || exe == id
+        || (!arg0_base.is_empty() && arg0_base.eq_ignore_ascii_case(id))
+    {
+        return true;
+    }
+    // comm is truncated to 15 bytes, so an id longer than that (e.g.
+    // "Cyberpunk2077.exe" → comm "Cyberpunk2077.e") must match by prefix.
+    id.len() > COMM_MAX
+        && comm.len() == COMM_MAX
+        && id.as_bytes()[..COMM_MAX].eq_ignore_ascii_case(comm.as_bytes())
 }
 
-/// Whether `pid`'s name/exe matches any excluded id.
+/// Basename of cmdline's argv[0]. Handles both unix and Windows separators —
+/// under wine/Proton argv[0] is the game's Windows path ("Z:\...\Game.exe")
+/// while /proc/pid/exe points at the wine preloader.
+fn arg0_basename(cmdline: &[u8]) -> String {
+    let first = cmdline.split(|&c| c == 0).next().unwrap_or(&[]);
+    let s = String::from_utf8_lossy(first);
+    s.rsplit(['/', '\\']).next().unwrap_or("").to_string()
+}
+
+/// Whether `pid`'s name/exe/argv[0] matches any excluded id.
 fn pid_matches_excluded(pid: u32, excluded: &[String]) -> bool {
     let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
     let comm = comm.trim();
@@ -461,7 +620,10 @@ fn pid_matches_excluded(pid: u32, excluded: &[String]) -> bool {
         .and_then(|p| p.file_name())
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
-    excluded.iter().any(|id| id_matches(id, comm, &exe_str, &exe_base))
+    let arg0 = std::fs::read(format!("/proc/{pid}/cmdline"))
+        .map(|b| arg0_basename(&b))
+        .unwrap_or_default();
+    excluded.iter().any(|id| id_matches(id, comm, &exe_str, &exe_base, &arg0))
 }
 
 /// Move `pid` into the bypass cgroup if its name/exe matches an excluded id.
@@ -493,23 +655,57 @@ fn hex_to_ipv6(hex: &str) -> Option<std::net::Ipv6Addr> {
     Some(std::net::Ipv6Addr::from(bytes))
 }
 
-/// Pin the CURRENT remote peers of every already-running excluded app to the
-/// physical path (a `/32`/`/128` route, more specific than the tun's `/1`), so a
-/// live flow on a socket that already existed at connect stays on the real IP.
+/// nft batch pinning existing flows to the physical path via BYPASS_MARK:
+/// destination rules for known peers, source-port rules for unconnected-UDP
+/// game sockets. Appended to the bypass table's mangle chain, so the mark both
+/// routes them out the physical NIC (fwmark rule → PHYS_TABLE) and passes the
+/// killswitch — which no longer accepts outbound `established` flows, so a
+/// bare destination ROUTE pin would get its packets dropped there.
+fn pin_rules_batch(
+    peers4: &std::collections::BTreeSet<std::net::Ipv4Addr>,
+    peers6: &std::collections::BTreeSet<std::net::Ipv6Addr>,
+    udp_sports: &std::collections::BTreeSet<u16>,
+) -> String {
+    let mark = format!("{BYPASS_MARK:#x}");
+    let mut b = String::new();
+    // NOTE: a daddr pin is destination-only — ALL host traffic to that IP goes
+    // physical for the session. Correct for the excluded app; for a SHARED peer
+    // IP it would also divert a non-excluded app's traffic there. Fine for
+    // games (dedicated server IPs), the intended use of the per-app bypass.
+    for ip in peers4 {
+        b.push_str(&format!(
+            "add rule inet {BYPASS_TABLE} mangle ip daddr {ip} meta mark set {mark}\n"
+        ));
+    }
+    for ip in peers6 {
+        b.push_str(&format!(
+            "add rule inet {BYPASS_TABLE} mangle ip6 daddr {ip} meta mark set {mark}\n"
+        ));
+    }
+    // Marks any UDP from this local port — over-reach is bounded to that exact
+    // port number, narrower than a shared-IP pin.
+    for p in udp_sports {
+        b.push_str(&format!(
+            "add rule inet {BYPASS_TABLE} mangle udp sport {p} meta mark set {mark}\n"
+        ));
+    }
+    b
+}
+
+/// Pin the CURRENT flows of every already-running excluded app to the physical
+/// path, by tagging them with BYPASS_MARK in the bypass table (nft rules by
+/// remote peer / by bound UDP source port).
 ///
 /// Why this is needed in addition to the cgroup tag: `socket cgroupv2` classifies
 /// by the socket's CREATION-time cgroup, which the kernel never updates when a
 /// running task is moved between cgroups — so moving an in-match game into the
 /// bypass cgroup tags none of its open sockets, and the flip into the tun would
 /// otherwise swallow that flow. The pre-existing socket already holds the real
-/// physical source, so a destination route alone (no masquerade) keeps it intact.
-/// Snapshot only: new connections are covered by the cgroup tag. Best-effort.
-fn pin_existing_excluded_flows(
-    excluded: &[String],
-    gw: &Option<String>,
-    iface: &str,
-    v6: &Option<(String, String)>,
-) {
+/// physical source, so the masquerade is a no-op for it. The pins live in the
+/// bypass nft table and die with it (route-down / bypass-down) — no extra
+/// teardown state. Snapshot only: new connections are covered by the cgroup
+/// tag. Best-effort. MUST run after `bypass_up` (the table/chain must exist).
+fn pin_existing_excluded_flows(excluded: &[String]) {
     // Socket inodes owned by currently-running excluded processes.
     let mut inodes = std::collections::HashSet::new();
     if let Ok(entries) = std::fs::read_dir("/proc") {
@@ -597,56 +793,10 @@ fn pin_existing_excluded_flows(
         }
     }
 
-    // Record EVERY peer in the teardown state FIRST, then add the routes — so a
-    // mid-add crash/kill can't leave a route the state file doesn't list (which
-    // route_down would then fail to remove, leaking it to a later app).
-    let mut state = String::new();
-    for ip in &peers4 {
-        state.push_str(&format!("{ip}\n"));
-    }
-    if v6.is_some() {
-        for ip in &peers6 {
-            state.push_str(&format!("{ip}\n"));
-        }
-    }
-    write_state(BYPASS_PINS_STATE, &state);
-
-    // NOTE: a /32 pin is destination-only — ALL host traffic to that IP egresses
-    // physical for the session. Correct for the excluded app; for a SHARED peer
-    // IP it would also divert a non-excluded app's traffic to that IP. Fine for
-    // games (dedicated server IPs), the intended use of the per-app bypass.
-    for ip in &peers4 {
-        let dst = format!("{ip}/32");
-        let mut r: Vec<&str> = vec!["route", "replace", &dst];
-        if let Some(g) = gw.as_deref() {
-            r.push("via");
-            r.push(g);
-        }
-        r.push("dev");
-        r.push(iface);
-        ip_quiet(&r);
-    }
-    if let Some((g6, if6)) = v6.as_ref() {
-        for ip in &peers6 {
-            ip_quiet(&["-6", "route", "replace", &format!("{ip}/128"), "via", g6, "dev", if6]);
-        }
-    }
-
-    // Source-port marks for the unconnected-UDP game sockets. Added to the bypass
-    // table's mangle chain (same 0x2025 mark → physical via PHYS_TABLE + the
-    // masquerade, which is a no-op for an already-real source); removed wholesale
-    // when route_down deletes the table. Marks any UDP from this local port — over-
-    // reach is bounded to that exact port number, narrower than a shared-IP pin.
-    let mark = format!("{BYPASS_MARK:#x}");
-    for lp in &udp_sports {
-        let port = lp.to_string();
-        let _ = Command::new("nft")
-            .args([
-                "add", "rule", "inet", BYPASS_TABLE, "mangle", "udp", "sport", &port, "meta",
-                "mark", "set", &mark,
-            ])
-            .stderr(Stdio::null())
-            .status();
+    // One atomic nft batch into the (already created) bypass table.
+    let batch = pin_rules_batch(&peers4, &peers6, &udp_sports);
+    if !batch.is_empty() {
+        let _ = nft_apply(&batch);
     }
 }
 
@@ -868,11 +1018,12 @@ fn set_rp_filter_loose() -> Result<(), String> {
     write_file(RP_ALL, "2")
 }
 
-/// Add an `ip rule fwmark <mark> lookup <table>` idempotently.
-fn add_rule_fwmark(mark: u32, table: &str) -> Result<(), String> {
+/// Add an `ip [-6] rule fwmark <mark> lookup <table>` idempotently.
+fn add_rule_fwmark(v6: bool, mark: u32, table: &str) -> Result<(), String> {
     let m = format!("{mark:#x}");
-    ip_quiet(&["rule", "del", "fwmark", &m, "lookup", table]);
-    ip_req(&["rule", "add", "fwmark", &m, "lookup", table])
+    let fam = if v6 { "-6" } else { "-4" };
+    ip_quiet(&[fam, "rule", "del", "fwmark", &m, "lookup", table]);
+    ip_req(&[fam, "rule", "add", "fwmark", &m, "lookup", table])
 }
 
 /// Lay the routing xray's native tun needs. Atomic-ish: rolls back via
@@ -906,9 +1057,32 @@ fn route_up(
         def.push("table");
         def.push(PHYS_TABLE);
         ip_req(&def)?;
-        add_rule_fwmark(XRAY_DIAL_MARK, PHYS_TABLE)?;
+        // LAN/link-local must NOT hit this table's default (it would bounce
+        // local traffic off the gateway): `throw` falls back to the main table,
+        // whose subnet routes handle it. Matters for marked-at-creation sockets
+        // of excluded apps talking to LAN peers.
+        for net in [
+            "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16",
+            "100.64.0.0/10", "224.0.0.0/4", "255.255.255.255/32",
+        ] {
+            ip_req(&["route", "replace", "throw", net, "table", PHYS_TABLE])?;
+        }
+        add_rule_fwmark(false, XRAY_DIAL_MARK, PHYS_TABLE)?;
         // Same physical bypass for per-app excluded traffic (nft tags it 0x2025).
-        add_rule_fwmark(BYPASS_MARK, PHYS_TABLE)?;
+        add_rule_fwmark(false, BYPASS_MARK, PHYS_TABLE)?;
+
+        // v6 default + fwmark rules too (when the host has v6): marked flows —
+        // notably the v6 pins of a running excluded app — must egress the
+        // physical NIC, not fall into the main table's v6 blackhole (step 6).
+        let v6 = detect_default_route6();
+        if let Some((g6, if6)) = v6.as_ref() {
+            ip_req(&["-6", "route", "replace", "default", "via", g6, "dev", if6, "table", PHYS_TABLE])?;
+            for net in ["fe80::/10", "fc00::/7", "ff00::/8"] {
+                ip_req(&["-6", "route", "replace", "throw", net, "table", PHYS_TABLE])?;
+            }
+            add_rule_fwmark(true, XRAY_DIAL_MARK, PHYS_TABLE)?;
+            add_rule_fwmark(true, BYPASS_MARK, PHYS_TABLE)?;
+        }
 
         // 4. anti-loop FIRST: pin each server IP to the physical path (more
         //    specific than 0/1) so xray's dial escapes the tun even if SO_MARK
@@ -930,20 +1104,16 @@ fn route_up(
         }
         write_state(SERVERS_STATE, &server_lines);
 
-        // v6 default, needed both for the per-app v6 pins (4b) and the v6
-        // blackhole exceptions (step 6).
-        let v6 = detect_default_route6();
-
         // 4b. Arm the per-app bypass NOW, BEFORE the default flips into the tun
         //     (step 5), via TWO mechanisms with different coverage:
         //       - bypass_up tags the cgroup so NEW connections from excluded apps
         //         egress physical (masquerade rewrites their tun-picked source);
         //         bypass_sweep moves the running excluded processes in.
-        //       - pin_existing_excluded_flows pins each running excluded app's
-        //         CURRENT remote peers to the physical path, because a cgroup move
-        //         can't re-tag an already-open socket (sk_cgrp_data is fixed at
-        //         creation) — without this a live game flow is swallowed by the
-        //         tun at the flip.
+        //       - pin_existing_excluded_flows marks each running excluded app's
+        //         CURRENT flows (by peer / by UDP source port), because a cgroup
+        //         move can't re-tag an already-open socket (sk_cgrp_data is fixed
+        //         at creation) — without this a live game flow is swallowed by
+        //         the tun at the flip.
         //     FATAL on tag failure: a running excluded app must never be silently
         //     flipped into the tun. route_up's caller rolls back via route_down.
         if let Some(cg) = bypass_cgroup {
@@ -952,7 +1122,7 @@ fn route_up(
             })?;
             let procs = format!("/sys/fs/cgroup/{}/cgroup.procs", cg.trim_start_matches('/'));
             bypass_sweep(&procs, bypass_apps);
-            pin_existing_excluded_flows(bypass_apps, &gw, &iface, &v6);
+            pin_existing_excluded_flows(bypass_apps);
         }
 
         // 5. default into the tun (0/1 + 128/1 are more specific than the
@@ -982,14 +1152,19 @@ fn route_up(
     })();
 
     if result.is_err() {
-        route_down();
+        route_down(false);
     }
     result
 }
 
 /// Tear the tun routing down. Idempotent and best-effort; restores physical
 /// reachability FIRST so a partial failure never black-holes the box.
-fn route_down() {
+///
+/// `keep_bypass`: leave the per-app bypass nft table (cgroup tag + masquerade +
+/// existing-flow pins) in place — used across a RECONNECT so an excluded app's
+/// live flows keep their 0x2025 mark through the gap (the killswitch accepts
+/// only marked/reply traffic, and the next route-up recreates the table anyway).
+fn route_down(keep_bypass: bool) {
     // 1. drop the tun default overrides → physical default is reachable again.
     ip_quiet(&["route", "del", "0.0.0.0/1", "dev", TUN_IFACE]);
     ip_quiet(&["route", "del", "128.0.0.0/1", "dev", TUN_IFACE]);
@@ -1004,35 +1179,44 @@ fn route_down() {
         let _ = std::fs::remove_file(SERVERS6_STATE);
     }
 
-    // 2. remove the dial-mark + bypass-mark policy rules (loop: a crash may have
-    //    stacked dups).
+    // 2. remove the dial-mark + bypass-mark policy rules, both families (loop:
+    //    a crash may have stacked dups). Marked packets then fall through to
+    //    the main table's physical default — still the right egress.
     for mark in [XRAY_DIAL_MARK, BYPASS_MARK] {
         let m = format!("{mark:#x}");
-        for _ in 0..4 {
-            let ok = Command::new("ip").args(["rule", "del", "fwmark", &m])
-                .stderr(Stdio::null()).status().map(|s| s.success()).unwrap_or(false);
-            if !ok {
-                break;
+        for fam in ["-4", "-6"] {
+            for _ in 0..4 {
+                let ok = Command::new("ip").args([fam, "rule", "del", "fwmark", &m])
+                    .stderr(Stdio::null()).status().map(|s| s.success()).unwrap_or(false);
+                if !ok {
+                    break;
+                }
             }
         }
     }
-    // The per-app bypass nft table (mangle + masquerade), if up.
-    bypass_down();
+    if !keep_bypass {
+        // The per-app bypass nft table (mangle marks + pins + masquerade), if
+        // up. (The cgroup BPF program, when the GUI doesn't detach it via
+        // `bypass-down <rel>`, stays attached but is inert without the rules —
+        // the next bypass-up replaces it.)
+        bypass_down(None);
 
-    // The per-app existing-flow pins (excluded apps' remote peers).
-    if let Ok(list) = std::fs::read_to_string(BYPASS_PINS_STATE) {
-        for ip in list.lines().map(|l| l.trim()).filter(|l| !l.is_empty()) {
-            if ip.contains(':') {
-                ip_quiet(&["-6", "route", "del", &format!("{ip}/128")]);
-            } else {
-                ip_quiet(&["route", "del", &format!("{ip}/32")]);
+        // Legacy: dst-route pins written by an older dev build's state file.
+        if let Ok(list) = std::fs::read_to_string(BYPASS_PINS_STATE) {
+            for ip in list.lines().map(|l| l.trim()).filter(|l| !l.is_empty()) {
+                if ip.contains(':') {
+                    ip_quiet(&["-6", "route", "del", &format!("{ip}/128")]);
+                } else {
+                    ip_quiet(&["route", "del", &format!("{ip}/32")]);
+                }
             }
+            let _ = std::fs::remove_file(BYPASS_PINS_STATE);
         }
-        let _ = std::fs::remove_file(BYPASS_PINS_STATE);
     }
 
-    // 3. flush the physical bypass table.
+    // 3. flush the physical bypass table (both families).
     ip_quiet(&["route", "flush", "table", PHYS_TABLE]);
+    ip_quiet(&["-6", "route", "flush", "table", PHYS_TABLE]);
 
     // 4. remove the anti-loop server /32 routes recorded at route-up.
     if let Ok(list) = std::fs::read_to_string(SERVERS_STATE) {
@@ -1054,7 +1238,163 @@ fn route_down() {
 
 #[cfg(test)]
 mod tests {
-    use super::{hex_to_ipv4, hex_to_ipv6};
+    use super::{
+        arg0_basename, hex_to_ipv4, hex_to_ipv6, id_matches, killswitch_ruleset, pin_rules_batch,
+    };
+
+    #[test]
+    fn killswitch_does_not_accept_outbound_established() {
+        // The reconnect real-IP leak: a bare `ct state established,related
+        // accept` lets PRE-VPN outbound flows (e.g. a browser's QUIC session,
+        // which migrates addresses seamlessly) resume on the physical NIC the
+        // moment the tun goes away mid-reconnect. Established must be accepted
+        // only in the REPLY direction (inbound services like SSH keep working).
+        let r = killswitch_ruleset(&[], false);
+        assert!(
+            r.contains("ct state established,related ct direction reply counter accept"),
+            "established accept must be narrowed to ct direction reply:\n{r}"
+        );
+        assert!(
+            !r.contains("ct state established,related counter accept"),
+            "bare established accept must be gone:\n{r}"
+        );
+    }
+
+    #[test]
+    fn killswitch_keeps_marks_servers_and_policy() {
+        let ips = vec!["1.2.3.4".parse().unwrap(), "2001:db8::5".parse().unwrap()];
+        let r = killswitch_ruleset(&ips, true);
+        assert!(r.contains("policy drop"));
+        assert!(r.contains("meta mark & 0x0000ffff == 0x2024 counter accept"));
+        assert!(r.contains("meta mark & 0x0000ffff == 0x2025 counter accept"));
+        assert!(r.contains("ip daddr 1.2.3.4 counter accept"));
+        assert!(r.contains("ip6 daddr 2001:db8::5 counter accept"));
+        assert!(r.contains("10.0.0.0/8")); // allow-lan block present
+        let r2 = killswitch_ruleset(&ips, false);
+        assert!(!r2.contains("10.0.0.0/8"));
+    }
+
+    #[test]
+    fn pin_rules_mark_peers_and_udp_sports() {
+        // Existing-flow pins must ride the 0x2025 mark (bypass table), NOT bare
+        // /32 routes: the mark both routes them physical (fwmark rule) and lets
+        // them pass the killswitch now that outbound established is dropped.
+        let peers4 = ["91.92.43.10".parse().unwrap()].into_iter().collect();
+        let peers6 = ["2001:db8::7".parse().unwrap()].into_iter().collect();
+        let sports = [27015u16].into_iter().collect();
+        let batch = pin_rules_batch(&peers4, &peers6, &sports);
+        assert!(batch.contains("add rule inet varmlen_bypass mangle ip daddr 91.92.43.10 meta mark set 0x2025"));
+        assert!(batch.contains("add rule inet varmlen_bypass mangle ip6 daddr 2001:db8::7 meta mark set 0x2025"));
+        assert!(batch.contains("add rule inet varmlen_bypass mangle udp sport 27015 meta mark set 0x2025"));
+    }
+
+    #[test]
+    fn sock_prog_shape() {
+        // ctx->mark = 0x2025; return 1 — exactly 4 insns, mark at bpf_sock+16.
+        let p = super::bypass_sock_prog();
+        assert_eq!(p.len(), 4 * 8);
+        assert_eq!(p[0], 0xb4); // ALU32 MOV imm
+        assert_eq!(p[1], 0x02); // dst w2
+        assert_eq!(&p[4..8], &0x2025i32.to_ne_bytes());
+        assert_eq!(p[8], 0x63); // STX word
+        assert_eq!(p[9], 0x21); // src r2 -> dst r1
+        assert_eq!(&p[10..12], &16i16.to_ne_bytes()); // offsetof(bpf_sock, mark)
+        assert_eq!(p[16], 0xb4); // w0 = 1 (allow)
+        assert_eq!(&p[20..24], &1i32.to_ne_bytes());
+        assert_eq!(p[24], 0x95); // exit
+    }
+
+    #[test]
+    fn pin_rules_empty_when_nothing_to_pin() {
+        let batch = pin_rules_batch(
+            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeSet::new(),
+        );
+        assert!(batch.is_empty());
+    }
+
+    #[test]
+    fn id_matches_plain_names() {
+        // Browsers / native apps: comm or exe basename equals the id.
+        assert!(id_matches("firefox", "firefox", "/usr/lib/firefox/firefox", "firefox", ""));
+        assert!(id_matches("cs2", "cs2", "/home/u/steam/cs2/cs2", "cs2", "cs2"));
+        assert!(!id_matches("firefox", "chrome", "/opt/chrome/chrome", "chrome", "chrome"));
+        assert!(!id_matches("", "firefox", "/usr/bin/firefox", "firefox", "firefox"));
+    }
+
+    #[test]
+    fn id_matches_truncated_comm() {
+        // The kernel truncates comm to 15 bytes (TASK_COMM_LEN - 1). A Proton
+        // game "Cyberpunk2077.exe" shows comm "Cyberpunk2077.e" and its
+        // /proc/pid/exe is the wine preloader — the truncated comm must match.
+        assert!(id_matches(
+            "Cyberpunk2077.exe",
+            "Cyberpunk2077.e",
+            "/usr/lib/wine/wine64-preloader",
+            "wine64-preloader",
+            ""
+        ));
+        // But a 15-byte comm that is NOT a prefix of the id must not match.
+        assert!(!id_matches(
+            "Cyberpunk2077.exe",
+            "SomeOtherGame.e",
+            "/usr/lib/wine/wine64-preloader",
+            "wine64-preloader",
+            ""
+        ));
+        // And a short comm (not truncated) must not prefix-match a longer id.
+        assert!(!id_matches("firefox-esr", "firefox", "", "", ""));
+    }
+
+    #[test]
+    fn id_matches_wine_arg0() {
+        // Proton/wine: cmdline[0] is the Windows path of the real game exe;
+        // exe points at wine. The arg0 basename must match, case-insensitively
+        // (Windows filenames are case-insensitive).
+        assert!(id_matches(
+            "TslGame.exe",
+            "TslGame.exe",
+            "/usr/lib/wine/wine64-preloader",
+            "wine64-preloader",
+            "TslGame.exe"
+        ));
+        assert!(id_matches(
+            "game.exe",
+            "wine64",
+            "/usr/lib/wine/wine64",
+            "wine64",
+            "Game.exe"
+        ));
+    }
+
+    #[test]
+    fn id_matches_folder_prefix() {
+        // Trailing slash = folder id: any exe under it matches.
+        assert!(id_matches(
+            "/home/u/.steam/steamapps/common/",
+            "eldenring",
+            "/home/u/.steam/steamapps/common/ELDEN RING/eldenring",
+            "eldenring",
+            ""
+        ));
+        assert!(!id_matches(
+            "/home/u/.steam/steamapps/common/",
+            "firefox",
+            "/usr/lib/firefox/firefox",
+            "firefox",
+            ""
+        ));
+    }
+
+    #[test]
+    fn arg0_basename_handles_unix_and_windows_paths() {
+        assert_eq!(arg0_basename(b"/usr/bin/firefox\0-new-tab\0"), "firefox");
+        assert_eq!(arg0_basename(b"Z:\\Games\\PUBG\\TslGame.exe\0-windowed\0"), "TslGame.exe");
+        assert_eq!(arg0_basename(b"C:/Games/Game.exe\0"), "Game.exe");
+        assert_eq!(arg0_basename(b"game.exe\0"), "game.exe");
+        assert_eq!(arg0_basename(b""), "");
+    }
 
     #[test]
     fn ipv4_from_proc_net_hex() {
