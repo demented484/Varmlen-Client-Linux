@@ -1,0 +1,10 @@
+[package]
+name = "leakcheck"
+version = "0.1.0"
+edition = "2021"
+description = "Varmlen diagnostics: continuously watch your public IP + RTT over TCP (HTTP) and UDP (DNS) to verify split tunneling and catch reconnect leaks"
+license = "MIT"
+
+[profile.release]
+strip = true
+lto = true
