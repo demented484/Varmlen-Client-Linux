@@ -14,8 +14,9 @@
 //!   - `killswitch-down`remove it
 //!   - `route-up`       lay the routing xray's native tun needs: default route
 //!                      into the tun, a physical bypass table + ip rule for
-//!                      xray's own marked dials, the anti-loop server route, and
-//!                      loose rp_filter
+//!                      xray's own marked dials, the anti-loop server route,
+//!                      loose rp_filter, and system DNS routed through the tun
+//!                      (a direct /etc/resolv.conf takeover — no D-Bus/polkit)
 //!   - `route-down`     tear that routing down (idempotent)
 //!   - `cleanup`        crash-recovery superset (killswitch + routing + stray TUN)
 //!
@@ -357,6 +358,14 @@ fn killswitch_ruleset(server_ips: &[std::net::IpAddr], allow_lan: bool) -> Strin
             std::net::IpAddr::V6(v6) => r.push_str(&format!("    ip6 daddr {v6} counter accept\n")),
         }
     }
+    // Defense in depth: never let DNS (port 53) reach a LAN peer, even with
+    // `allow_lan` — that's the anti-leak invariant (configure_dns routes all
+    // system DNS through the tun to 1.1.1.1; this is the backstop if it ever
+    // doesn't). BEFORE the allow_lan accept block below so it wins on a match.
+    r.push_str("    udp dport 53 ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 100.64.0.0/10 } counter drop\n");
+    r.push_str("    tcp dport 53 ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 100.64.0.0/10 } counter drop\n");
+    r.push_str("    udp dport 53 ip6 daddr { fe80::/10, fc00::/7 } counter drop\n");
+    r.push_str("    tcp dport 53 ip6 daddr { fe80::/10, fc00::/7 } counter drop\n");
     if allow_lan {
         r.push_str("    ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 100.64.0.0/10 } counter accept\n");
         r.push_str("    ip6 daddr { fe80::/10, fc00::/7 } counter accept\n");
@@ -1007,6 +1016,81 @@ fn ensure_tun() -> Result<(), String> {
     ip_req(&["link", "set", TUN_IFACE, "up"])
 }
 
+// --- DNS anti-leak -----------------------------------------------------------
+//
+// xray's tun-in inbound hijacks any DNS (port 53) packet that actually ARRIVES
+// on the tun and answers it via DoH through the tunnel (see xray.rs's routing
+// rule). But the OS resolver decides which interface/server to query BEFORE
+// any of that: systemd-resolved keeps using the physical link's DHCP-handed
+// DNS server unless told otherwise, and even the tun's 0.0.0.0/1 catch-all
+// route loses to the physical link's pre-existing, more specific LAN-subnet
+// route for that server's IP (longest-prefix-match) — so DNS queries silently
+// leave through the physical NIC, wholly bypassing xray, no matter the
+// killswitch/allow_lan setting. This must be fixed by making the OS resolver
+// itself route DNS through the tun.
+
+const DNS_UPSTREAM: &str = "1.1.1.1";
+const RESOLV_CONF: &str = "/etc/resolv.conf";
+/// One-line record of what /etc/resolv.conf was before we took it over, so
+/// teardown can restore it exactly: `SYMLINK:<raw target>`, `FILE:<content>`,
+/// or `NONE` (didn't exist).
+const RESOLV_CONF_BACKUP: &str = "/run/varmlen/resolv_conf.orig";
+
+/// Route all system DNS through the tun by taking over /etc/resolv.conf
+/// directly (needs cap_dac_override, already carried for the /run state
+/// writes) — no D-Bus/resolvectl involved.
+///
+/// An earlier version used resolved's SetLinkDNS/SetLinkDomains D-Bus calls.
+/// Those are guarded by polkit's `auth_admin` action (no `_keep`), which
+/// demands an interactive password EVERY call regardless of our CAP_NET_ADMIN
+/// — three prompts on every single connect (revert + dns + domain). A file
+/// write has none of that friction, matching every other privileged write
+/// this helper already does with zero prompts (rp_filter, /run state).
+///
+/// On a systemd-resolved host /etc/resolv.conf is normally a SYMLINK to
+/// resolved's own stub file (127.0.0.53). We detach that symlink — leaving
+/// resolved's stub file and resolved itself untouched — and put a plain file
+/// naming our upstream in its place. glibc's classic resolver (the `dns` NSS
+/// module; this only fully covers hosts where `hosts:` in nsswitch.conf does
+/// NOT use `nss-resolve`, which talks to resolved directly instead of reading
+/// this file — checked: this project targets that common case) reads
+/// /etc/resolv.conf's CONTENT the same way whether it's a symlink or a plain
+/// file, so detaching it works exactly like editing it would, without ever
+/// touching resolved.
+///
+/// FATAL on failure (e.g. an unwritable /etc): a VPN that can't secure DNS
+/// must refuse to report "connected", never leak silently.
+fn configure_dns() -> Result<(), String> {
+    let path = std::path::Path::new(RESOLV_CONF);
+    let backup = if let Ok(target) = std::fs::read_link(path) {
+        format!("SYMLINK:{}", target.to_string_lossy())
+    } else if let Ok(content) = std::fs::read_to_string(path) {
+        format!("FILE:{content}")
+    } else {
+        "NONE".to_string()
+    };
+    write_state(RESOLV_CONF_BACKUP, &backup);
+    // Remove whatever's there (symlink or file) FIRST — fs::write would
+    // otherwise follow a symlink and clobber resolved's stub file's content
+    // instead of detaching /etc/resolv.conf from it.
+    let _ = std::fs::remove_file(path);
+    write_file(RESOLV_CONF, &format!("nameserver {DNS_UPSTREAM}\n"))
+}
+
+/// Restore whatever /etc/resolv.conf pointed to/contained before
+/// `configure_dns`. Best-effort + idempotent (a missing backup is a no-op).
+fn teardown_dns() {
+    let Ok(backup) = std::fs::read_to_string(RESOLV_CONF_BACKUP) else { return };
+    let _ = std::fs::remove_file(RESOLV_CONF);
+    if let Some(target) = backup.strip_prefix("SYMLINK:") {
+        let _ = std::os::unix::fs::symlink(target, RESOLV_CONF);
+    } else if let Some(content) = backup.strip_prefix("FILE:") {
+        let _ = write_file(RESOLV_CONF, content);
+    }
+    // "NONE": leave it absent, matching the original state.
+    let _ = std::fs::remove_file(RESOLV_CONF_BACKUP);
+}
+
 const RP_ALL: &str = "/proc/sys/net/ipv4/conf/all/rp_filter";
 
 /// Loosen reverse-path filtering (RPF) so the asymmetric bypass replies on the
@@ -1040,6 +1124,12 @@ fn route_up(
     let result = (|| -> Result<(), String> {
         // 1. tun device (xray usually created it already; ensure addr + up).
         ensure_tun()?;
+
+        // 1b. DNS anti-leak: route system DNS through the tun BEFORE anything
+        //     else, so a failure here rolls back cleanly via route_down and the
+        //     connect never reports "connected" with plaintext DNS still going
+        //     to the physical resolver. See the DNS anti-leak comment above.
+        configure_dns()?;
 
         // 2. loosen RPF so the asymmetric bypass replies aren't dropped.
         set_rp_filter_loose()?;
@@ -1234,6 +1324,9 @@ fn route_down(keep_bypass: bool) {
         }
         let _ = std::fs::remove_file(RP_STATE);
     }
+
+    // 6. restore /etc/resolv.conf to what it was before.
+    teardown_dns();
 }
 
 #[cfg(test)]
@@ -1269,9 +1362,31 @@ mod tests {
         assert!(r.contains("meta mark & 0x0000ffff == 0x2025 counter accept"));
         assert!(r.contains("ip daddr 1.2.3.4 counter accept"));
         assert!(r.contains("ip6 daddr 2001:db8::5 counter accept"));
-        assert!(r.contains("10.0.0.0/8")); // allow-lan block present
+        assert!(r.contains("ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 100.64.0.0/10 } counter accept")); // allow-lan block present
         let r2 = killswitch_ruleset(&ips, false);
-        assert!(!r2.contains("10.0.0.0/8"));
+        assert!(!r2.contains("ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 100.64.0.0/10 } counter accept"));
+    }
+
+    #[test]
+    fn killswitch_blocks_dns_to_lan_even_with_allow_lan() {
+        // The DNS leak this fixes: allow_lan previously let port-53 packets to
+        // the router through unconditionally. This must hold regardless of the
+        // flag — it's the backstop for configure_dns, not gated by it.
+        for allow_lan in [true, false] {
+            let r = killswitch_ruleset(&[], allow_lan);
+            assert!(
+                r.contains("udp dport 53 ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 100.64.0.0/10 } counter drop"),
+                "allow_lan={allow_lan}:\n{r}"
+            );
+            assert!(r.contains("tcp dport 53 ip daddr { 10.0.0.0/8"), "allow_lan={allow_lan}:\n{r}");
+            assert!(r.contains("udp dport 53 ip6 daddr { fe80::/10, fc00::/7 } counter drop"));
+            // The drop must appear BEFORE any LAN accept block so it wins the match.
+            if allow_lan {
+                let drop_pos = r.find("udp dport 53 ip daddr {").unwrap();
+                let accept_pos = r.find("ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 100.64.0.0/10 } counter accept").unwrap();
+                assert!(drop_pos < accept_pos, "dns-drop must precede the lan-accept block");
+            }
+        }
     }
 
     #[test]
