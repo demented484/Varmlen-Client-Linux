@@ -2,6 +2,16 @@
 
 ## 0.2.0
 
+### Corrected Linux reissue
+
+- Removed the fixed loopback DNS listener and its collision-prone port.
+- Marked classic DNS traffic into a dedicated `varmlen0` policy route while
+  keeping local stub resolvers reachable and blocking direct DNS/DoT fallback.
+- Added independent recovery for the DNS policy route.
+- Bumped the daemon protocol so the withdrawn port-based build is rejected
+  before a connect command. Systems where that daemon is still running need one
+  reboot after installing this corrected package.
+
 ### Security
 
 - Replaced GUI-owned privileged networking with an authenticated, root-owned
