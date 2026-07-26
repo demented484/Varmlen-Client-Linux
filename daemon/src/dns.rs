@@ -1,40 +1,13 @@
 use async_trait::async_trait;
-use tokio::net::{TcpStream, UdpSocket};
+use tokio::net::UdpSocket;
 use tokio::time::{timeout, Duration};
 
-use crate::nft::{apply_ruleset, remove_dns_table, render_dns_rules, DnsNftPlan};
+use crate::nft::{apply_ruleset, remove_dns_table, render_dns_rules};
 use crate::protocol::{DaemonError, DaemonErrorCode};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DnsPlan {
-    local_port: u16,
-}
-
-impl DnsPlan {
-    pub fn new(local_port: u16) -> Self {
-        Self { local_port }
-    }
-
-    pub fn local_port(&self) -> u16 {
-        self.local_port
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DnsLease {
-    port: u16,
-}
-
-impl DnsLease {
-    pub fn port(&self) -> u16 {
-        self.port
-    }
-}
 
 #[async_trait]
 pub trait DnsBackend {
-    async fn apply(&mut self, plan: &DnsPlan) -> Result<(), DaemonError>;
-    async fn listener_is_ready(&mut self, port: u16) -> Result<bool, DaemonError>;
+    async fn apply(&mut self) -> Result<(), DaemonError>;
     async fn probe_through_tunnel(&mut self) -> Result<bool, DaemonError>;
     async fn remove(&mut self) -> Result<(), DaemonError>;
 }
@@ -43,40 +16,23 @@ pub struct DnsGuard<B> {
     backend: B,
 }
 
-pub struct SystemDnsBackend {
-    local_port: u16,
-}
+pub struct SystemDnsBackend;
 
 impl SystemDnsBackend {
-    pub fn new(local_port: u16) -> Self {
-        Self { local_port }
+    pub fn new() -> Self {
+        Self
     }
 }
 
 #[async_trait]
 impl DnsBackend for SystemDnsBackend {
-    async fn apply(&mut self, plan: &DnsPlan) -> Result<(), DaemonError> {
-        if plan.local_port() != self.local_port {
-            return Err(DaemonError::new(
-                DaemonErrorCode::DnsInstallFailed,
-                "DNS backend port does not match the requested plan",
-            ));
-        }
-        let rules = render_dns_rules(&DnsNftPlan::new(self.local_port));
+    async fn apply(&mut self) -> Result<(), DaemonError> {
+        let rules = render_dns_rules();
         apply_ruleset(&rules).await
     }
 
-    async fn listener_is_ready(&mut self, port: u16) -> Result<bool, DaemonError> {
-        Ok(timeout(
-            Duration::from_secs(2),
-            TcpStream::connect(("127.0.0.1", port)),
-        )
-        .await
-        .is_ok_and(|result| result.is_ok()))
-    }
-
     async fn probe_through_tunnel(&mut self) -> Result<bool, DaemonError> {
-        let socket = UdpSocket::bind(("127.0.0.1", 0)).await.map_err(|error| {
+        let socket = UdpSocket::bind(("0.0.0.0", 0)).await.map_err(|error| {
             DaemonError::new(
                 DaemonErrorCode::DnsVerificationFailed,
                 format!("could not bind DNS probe socket: {error}"),
@@ -85,7 +41,7 @@ impl DnsBackend for SystemDnsBackend {
         let transaction_id = (std::process::id() as u16) ^ 0x564d;
         let query = build_dns_query(transaction_id, "mullvad.net")?;
         socket
-            .send_to(&query, ("127.0.0.1", self.local_port))
+            .send_to(&query, ("1.1.1.1", 53))
             .await
             .map_err(|error| {
                 DaemonError::new(
@@ -161,24 +117,23 @@ impl<B: DnsBackend> DnsGuard<B> {
         &self.backend
     }
 
-    pub async fn install(&mut self, plan: DnsPlan) -> Result<DnsLease, DaemonError> {
-        self.backend.apply(&plan).await?;
-        let listener_ready = self.backend.listener_is_ready(plan.local_port()).await?;
-        let probe_ok = if listener_ready {
-            self.backend.probe_through_tunnel().await?
-        } else {
-            false
-        };
-        if !listener_ready || !probe_ok {
-            let _ = self.backend.remove().await;
+    pub async fn install(&mut self) -> Result<(), DaemonError> {
+        self.backend.apply().await?;
+        let probe = self.backend.probe_through_tunnel().await;
+        if !matches!(&probe, Ok(true)) {
+            let cleanup = self.backend.remove().await;
+            if let Err(error) = probe {
+                return Err(error);
+            }
+            if let Err(error) = cleanup {
+                return Err(error);
+            }
             return Err(DaemonError::new(
                 DaemonErrorCode::DnsVerificationFailed,
                 "DNS interception could not be verified",
             ));
         }
-        Ok(DnsLease {
-            port: plan.local_port(),
-        })
+        Ok(())
     }
 }
 
@@ -187,29 +142,31 @@ mod tests {
     use async_trait::async_trait;
 
     use super::{build_dns_query, validate_dns_response};
-    use super::{DnsBackend, DnsGuard, DnsPlan};
+    use super::{DnsBackend, DnsGuard};
     use crate::protocol::{DaemonError, DaemonErrorCode};
 
     #[derive(Default)]
     struct FakeDnsBackend {
-        listener_up: bool,
         probe_ok: bool,
+        probe_error: bool,
         installed: bool,
         removed: bool,
     }
 
     #[async_trait]
     impl DnsBackend for FakeDnsBackend {
-        async fn apply(&mut self, _plan: &DnsPlan) -> Result<(), DaemonError> {
+        async fn apply(&mut self) -> Result<(), DaemonError> {
             self.installed = true;
             Ok(())
         }
 
-        async fn listener_is_ready(&mut self, _port: u16) -> Result<bool, DaemonError> {
-            Ok(self.listener_up)
-        }
-
         async fn probe_through_tunnel(&mut self) -> Result<bool, DaemonError> {
+            if self.probe_error {
+                return Err(DaemonError::new(
+                    DaemonErrorCode::DnsVerificationFailed,
+                    "injected DNS probe failure",
+                ));
+            }
             Ok(self.probe_ok)
         }
 
@@ -221,44 +178,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn listener_failure_rolls_back_and_fails_closed() {
+    async fn verified_tunnel_dns_activates_policy() {
         let backend = FakeDnsBackend {
-            listener_up: false,
             probe_ok: true,
             ..Default::default()
         };
         let mut guard = DnsGuard::new(backend);
-        let error = guard.install(DnsPlan::new(5353)).await.unwrap_err();
-        assert_eq!(error.code, DaemonErrorCode::DnsVerificationFailed);
-        assert!(guard.backend().removed);
-        assert!(!guard.backend().installed);
+        guard.install().await.unwrap();
+        assert!(guard.backend().installed);
+        assert!(!guard.backend().removed);
     }
 
     #[tokio::test]
     async fn upstream_probe_failure_rolls_back_and_fails_closed() {
         let backend = FakeDnsBackend {
-            listener_up: true,
             probe_ok: false,
             ..Default::default()
         };
         let mut guard = DnsGuard::new(backend);
-        let error = guard.install(DnsPlan::new(5353)).await.unwrap_err();
+        let error = guard.install().await.unwrap_err();
         assert_eq!(error.code, DaemonErrorCode::DnsVerificationFailed);
         assert!(guard.backend().removed);
     }
 
     #[tokio::test]
-    async fn verified_dns_returns_active_lease() {
+    async fn probe_error_rolls_back_dns_policy() {
         let backend = FakeDnsBackend {
-            listener_up: true,
-            probe_ok: true,
+            probe_error: true,
             ..Default::default()
         };
         let mut guard = DnsGuard::new(backend);
-        let lease = guard.install(DnsPlan::new(5353)).await.unwrap();
-        assert_eq!(lease.port(), 5353);
-        assert!(guard.backend().installed);
-        assert!(!guard.backend().removed);
+        let error = guard.install().await.unwrap_err();
+        assert_eq!(error.code, DaemonErrorCode::DnsVerificationFailed);
+        assert!(guard.backend().removed);
+        assert!(!guard.backend().installed);
     }
 
     #[test]

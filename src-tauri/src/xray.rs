@@ -731,10 +731,7 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .find(|rule| {
-                rule["inboundTag"][0] == "tun-in"
-                    && rule["port"].as_u64() == Some(53)
-            })
+            .find(|rule| rule["inboundTag"][0] == "tun-in" && rule["port"].as_u64() == Some(53))
             .expect("TUN DNS routing rule");
         assert_eq!(dns_hijack["outboundTag"], "dns-out");
         // DoH upstream pinned to proxy.

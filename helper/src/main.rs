@@ -41,6 +41,8 @@ const TUN_ADDR: &str = "172.19.0.1/30";
 /// xray's own dials (proxy + direct outbounds) carry this mark via SO_MARK /
 /// `sockopt.mark` so they bypass the tun (anti-loop). Accepted by the killswitch.
 const XRAY_DIAL_MARK: u32 = 0x2024;
+const DNS_MARK: &str = "0x2023";
+const DNS_TABLE: &str = "101";
 
 /// Custom routing table that egresses via the physical gateway — the bypass for
 /// xray's own marked dials.
@@ -1172,6 +1174,42 @@ fn add_rule_fwmark(v6: bool, mark: u32, table: &str) -> Result<(), String> {
     ip_req(&[fam, "rule", "add", "fwmark", &m, "lookup", table])
 }
 
+fn dns_policy_setup_commands() -> Vec<Vec<&'static str>> {
+    vec![
+        vec![
+            "route", "replace", "default", "dev", TUN_IFACE, "table", DNS_TABLE,
+        ],
+        vec![
+            "rule", "del", "priority", "90", "fwmark", DNS_MARK, "lookup", DNS_TABLE,
+        ],
+        vec![
+            "rule", "add", "priority", "90", "fwmark", DNS_MARK, "lookup", DNS_TABLE,
+        ],
+    ]
+}
+
+fn dns_policy_teardown_commands() -> Vec<Vec<&'static str>> {
+    vec![
+        vec![
+            "rule", "del", "priority", "90", "fwmark", DNS_MARK, "lookup", DNS_TABLE,
+        ],
+        vec!["route", "flush", "table", DNS_TABLE],
+    ]
+}
+
+fn install_dns_policy_route() -> Result<(), String> {
+    let commands = dns_policy_setup_commands();
+    ip_req(&commands[0])?;
+    ip_quiet(&commands[1]);
+    ip_req(&commands[2])
+}
+
+fn remove_dns_policy_route() {
+    for command in dns_policy_teardown_commands() {
+        ip_quiet(&command);
+    }
+}
+
 /// Lay the routing xray's native tun needs. Atomic-ish: rolls back via
 /// `route_down` on any error. Mode-independent — the per-app/site split is
 /// entirely xray's job (native `process`/`domain` routing); the helper only
@@ -1186,6 +1224,7 @@ fn route_up(
     let result = (|| -> Result<(), String> {
         // 1. tun device (xray usually created it already; ensure addr + up).
         ensure_tun()?;
+        install_dns_policy_route()?;
 
         // 2. loosen RPF so the asymmetric bypass replies aren't dropped.
         set_rp_filter_loose()?;
@@ -1330,6 +1369,7 @@ fn route_down(keep_bypass: bool) {
     // 1. drop the tun default overrides → physical default is reachable again.
     ip_quiet(&["route", "del", "0.0.0.0/1", "dev", TUN_IFACE]);
     ip_quiet(&["route", "del", "128.0.0.0/1", "dev", TUN_IFACE]);
+    remove_dns_policy_route();
 
     // 1b. drop the IPv6 blackholes + any v6 server bypass routes.
     ip_quiet(&["-6", "route", "del", "::/1"]);
@@ -1405,8 +1445,28 @@ fn route_down(keep_bypass: bool) {
 #[cfg(test)]
 mod tests {
     use super::{
-        arg0_basename, hex_to_ipv4, hex_to_ipv6, id_matches, killswitch_ruleset, pin_rules_batch,
+        arg0_basename, dns_policy_setup_commands, dns_policy_teardown_commands, hex_to_ipv4,
+        hex_to_ipv6, id_matches, killswitch_ruleset, pin_rules_batch,
     };
+
+    #[test]
+    fn dns_mark_has_a_dedicated_tun_policy_route() {
+        assert_eq!(
+            dns_policy_setup_commands(),
+            vec![
+                vec!["route", "replace", "default", "dev", "varmlen0", "table", "101",],
+                vec!["rule", "del", "priority", "90", "fwmark", "0x2023", "lookup", "101",],
+                vec!["rule", "add", "priority", "90", "fwmark", "0x2023", "lookup", "101",],
+            ]
+        );
+        assert_eq!(
+            dns_policy_teardown_commands(),
+            vec![
+                vec!["rule", "del", "priority", "90", "fwmark", "0x2023", "lookup", "101",],
+                vec!["route", "flush", "table", "101"],
+            ]
+        );
+    }
 
     #[test]
     fn killswitch_does_not_accept_outbound_established() {

@@ -110,6 +110,25 @@ impl SystemCleanupBackend {
     }
 }
 
+fn route_resources(rules_text: &str, routes_text: &str) -> BTreeSet<Resource> {
+    let mut resources = BTreeSet::new();
+    if rules_text.contains("0x2023") || rules_text.contains("0x00002023") {
+        resources.insert(Resource::RouteTable("101".into()));
+    }
+    if rules_text.contains("0x2024")
+        || rules_text.contains("0x00002024")
+        || rules_text.contains("0x2025")
+        || rules_text.contains("0x00002025")
+        || routes_text.contains("0.0.0.0/1")
+        || routes_text.contains("128.0.0.0/1")
+        || routes_text.contains("blackhole ::/1")
+        || routes_text.contains("blackhole 8000::/1")
+    {
+        resources.insert(Resource::RouteTable("100".into()));
+    }
+    resources
+}
+
 #[async_trait]
 impl CleanupBackend for SystemCleanupBackend {
     async fn inspect(&mut self) -> Result<BTreeSet<Resource>, String> {
@@ -152,17 +171,7 @@ impl CleanupBackend for SystemCleanupBackend {
             String::from_utf8_lossy(&routes_v4.stdout),
             String::from_utf8_lossy(&routes_v6.stdout)
         );
-        if rules_text.contains("0x2024")
-            || rules_text.contains("0x00002024")
-            || rules_text.contains("0x2025")
-            || rules_text.contains("0x00002025")
-            || routes_text.contains("0.0.0.0/1")
-            || routes_text.contains("128.0.0.0/1")
-            || routes_text.contains("blackhole ::/1")
-            || routes_text.contains("blackhole 8000::/1")
-        {
-            resources.insert(Resource::RouteTable("100".into()));
-        }
+        resources.extend(route_resources(&rules_text, &routes_text));
         for table in ["varmlen_dns", "varmlen_split", "varmlen_ks"] {
             if Self::nft_table_exists(table).await {
                 resources.insert(Resource::NftTable(table.into()));
@@ -184,13 +193,16 @@ impl CleanupBackend for SystemCleanupBackend {
             Resource::TunInterface(interface) if interface == "varmlen0" => {
                 command_success("ip", &["link", "delete", "dev", interface]).await
             }
-            Resource::RouteTable(table) if table == "100" => {
-                let _ = command_success(
-                    "/usr/libexec/varmlen/varmlen-net",
-                    &["cleanup"],
-                )
-                .await;
-                for mark in ["0x2024", "0x2025"] {
+            Resource::RouteTable(table) if matches!(table.as_str(), "100" | "101") => {
+                if table == "100" {
+                    let _ = command_success("/usr/libexec/varmlen/varmlen-net", &["cleanup"]).await;
+                }
+                let marks: &[&str] = if table == "100" {
+                    &["0x2024", "0x2025"]
+                } else {
+                    &["0x2023"]
+                };
+                for mark in marks {
                     for family in ["-4", "-6"] {
                         for _ in 0..4 {
                             if command_success(
@@ -319,7 +331,8 @@ mod tests {
     use async_trait::async_trait;
 
     use super::{
-        parse_start_time_ticks, CleanupBackend, ProcessIdentity, RecoveryManager, Resource,
+        parse_start_time_ticks, route_resources, CleanupBackend, ProcessIdentity, RecoveryManager,
+        Resource,
     };
     use crate::protocol::ConnectionPhase;
 
@@ -336,6 +349,18 @@ mod tests {
         let stat = "42 (Xray worker) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 98765 21";
         assert_eq!(parse_start_time_ticks(stat), Some(98765));
         assert_eq!(parse_start_time_ticks("broken"), None);
+    }
+
+    #[test]
+    fn dns_policy_route_is_recovered_independently() {
+        let resources = route_resources(
+            "90: from all fwmark 0x2023 lookup 101",
+            "default dev varmlen0 table 101",
+        );
+        assert_eq!(
+            resources,
+            BTreeSet::from([Resource::RouteTable("101".into())])
+        );
     }
 
     struct FakeCleanup {

@@ -8,7 +8,7 @@ use serde_json::Value;
 use tokio::process::{Child, Command};
 use tokio::time::{sleep, timeout, Duration};
 
-use crate::dns::{DnsBackend, DnsGuard, DnsPlan, SystemDnsBackend};
+use crate::dns::{DnsBackend, DnsGuard, SystemDnsBackend};
 use crate::lifecycle::LifecycleBackend;
 use crate::protocol::{ConnectRequest, ConnectionMode, DaemonError, DaemonErrorCode};
 use crate::recovery::ProcessIdentity;
@@ -18,7 +18,6 @@ use crate::split::{SplitBackend, SplitManager, SplitPlan};
 pub const INSTALLED_XRAY: &str = "/usr/libexec/varmlen/xray";
 pub const INSTALLED_NET_HELPER: &str = "/usr/libexec/varmlen/varmlen-net";
 const TUN_INTERFACE: &str = "varmlen0";
-const DNS_PORT: u16 = 5353;
 const PROXY_PORT: u16 = 2081;
 
 pub struct SystemLifecycleBackend {
@@ -228,7 +227,7 @@ impl SystemLifecycleBackend {
         if !self.dns_active {
             return Ok(());
         }
-        let mut backend = SystemDnsBackend::new(DNS_PORT);
+        let mut backend = SystemDnsBackend::new();
         backend.remove().await?;
         self.dns_active = false;
         Ok(())
@@ -393,9 +392,11 @@ impl LifecycleBackend for SystemLifecycleBackend {
             self.split = Some(split);
         }
 
-        let mut dns = DnsGuard::new(SystemDnsBackend::new(DNS_PORT));
-        dns.install(DnsPlan::new(DNS_PORT)).await?;
+        let mut dns = DnsGuard::new(SystemDnsBackend::new());
+        // Arm lifecycle cleanup before installation so a failed verification
+        // still gets a second, fail-closed attempt to remove the nft table.
         self.dns_active = true;
+        dns.install().await?;
         Ok(())
     }
 
@@ -529,10 +530,10 @@ pub fn validate_xray_document(raw: &str, expects_tun: bool) -> Result<(), Daemon
         .ok_or_else(|| {
             DaemonError::new(DaemonErrorCode::InvalidRequest, "Xray inbounds are missing")
         })?;
-    if inbounds.len() != 2 {
+    if inbounds.len() != 1 {
         return Err(DaemonError::new(
             DaemonErrorCode::InvalidRequest,
-            "Xray must contain exactly the data and DNS inbounds",
+            "Xray must contain exactly one data inbound",
         ));
     }
     let data_tag = if expects_tun { "tun-in" } else { "socks-in" };
@@ -553,16 +554,6 @@ pub fn validate_xray_document(raw: &str, expects_tun: bool) -> Result<(), Daemon
             "Xray SOCKS inbound must remain loopback-only",
         ));
     }
-    let dns = inbound_by_tag(inbounds, "dns-in", "dokodemo-door")?;
-    if dns.get("listen").and_then(Value::as_str) != Some("127.0.0.1")
-        || dns.get("port").and_then(Value::as_u64) != Some(DNS_PORT.into())
-    {
-        return Err(DaemonError::new(
-            DaemonErrorCode::InvalidRequest,
-            "Xray DNS inbound must remain on the fixed loopback port",
-        ));
-    }
-
     let outbounds = object
         .get("outbounds")
         .and_then(Value::as_array)
@@ -647,16 +638,7 @@ mod tests {
         json!({
             "log": {"loglevel": "warning"},
             "dns": {"servers": ["https://1.1.1.1/dns-query"]},
-            "inbounds": [
-                data,
-                {
-                    "tag": "dns-in",
-                    "listen": "127.0.0.1",
-                    "port": 5353,
-                    "protocol": "dokodemo-door",
-                    "settings": {"address": "1.1.1.1", "port": 53, "network": "tcp,udp"}
-                }
-            ],
+            "inbounds": [data],
             "outbounds": [
                 {"tag": "proxy", "protocol": "vless"},
                 {"tag": "direct", "protocol": "freedom"},
@@ -669,7 +651,7 @@ mod tests {
     }
 
     #[test]
-    fn accepts_fixed_tun_and_loopback_dns_inbounds() {
+    fn accepts_fixed_tun_with_no_local_dns_inbound() {
         let raw = config(json!({
             "tag": "tun-in",
             "protocol": "tun",

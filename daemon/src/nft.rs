@@ -5,42 +5,28 @@ use tokio::process::Command;
 
 use crate::protocol::{DaemonError, DaemonErrorCode};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DnsNftPlan {
-    local_port: u16,
-}
-
-impl DnsNftPlan {
-    pub fn new(local_port: u16) -> Self {
-        Self { local_port }
-    }
-}
-
-pub fn render_dns_rules(plan: &DnsNftPlan) -> String {
-    format!(
-        r#"table inet varmlen_dns {{
-  chain dns_output {{
-    type nat hook output priority dstnat - 10; policy accept;
-    udp dport 53 redirect to :{port}
-    tcp dport 53 redirect to :{port}
-  }}
-  chain guard_output {{
+pub fn render_dns_rules() -> String {
+    r#"table inet varmlen_dns {
+  chain mark_output {
+    type route hook output priority mangle + 10; policy accept;
+    ip daddr 127.0.0.0/8 return
+    ip6 daddr ::1 return
+    meta mark & 0x0000ffff != 0x2024 udp dport 53 meta mark set 0x2023 ct mark set meta mark
+    meta mark & 0x0000ffff != 0x2024 tcp dport 53 meta mark set 0x2023 ct mark set meta mark
+  }
+  chain guard_output {
     type filter hook output priority filter - 10; policy accept;
+    oifname "lo" accept
+    meta mark & 0x0000ffff == 0x2023 oifname "varmlen0" udp dport 53 accept
+    meta mark & 0x0000ffff == 0x2023 oifname "varmlen0" tcp dport 53 accept
+    oifname "varmlen0" tcp dport 853 accept
     udp dport 53 reject
     tcp dport 53 reject
     tcp dport 853 reject
-    oifname "lo" accept
-    meta mark & 0x0000ffff == 0x2025 accept
-    ct mark & 0x0000ffff == 0x2025 accept
-    ip daddr 10.0.0.0/8 accept
-    ip daddr 172.16.0.0/12 accept
-    ip daddr 192.168.0.0/16 accept
-    ip6 daddr fc00::/7 accept
-  }}
-}}
-"#,
-        port = plan.local_port
-    )
+  }
+}
+"#
+    .to_string()
 }
 
 pub async fn apply_ruleset(ruleset: &str) -> Result<(), DaemonError> {
@@ -108,27 +94,41 @@ pub async fn remove_dns_table() -> Result<(), DaemonError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{render_dns_rules, DnsNftPlan};
+    use super::render_dns_rules;
 
     #[test]
-    fn dns_redirect_runs_before_lan_and_split_accepts() {
-        let rules = render_dns_rules(&DnsNftPlan::new(5353));
-        let redirect = rules.find("udp dport 53 redirect to :5353").unwrap();
-        let split = rules
-            .find("meta mark & 0x0000ffff == 0x2025 accept")
+    fn system_dns_is_marked_for_the_tun_without_a_local_redirect() {
+        let rules = render_dns_rules();
+        assert!(!rules.contains("redirect"));
+        assert!(!rules.contains("5353"));
+        assert!(rules.contains("priority mangle + 10"));
+        let loopback = rules.find("ip daddr 127.0.0.0/8 return").unwrap();
+        let mark = rules
+            .find("meta mark & 0x0000ffff != 0x2024 udp dport 53")
             .unwrap();
-        let lan = rules.find("ip daddr 10.0.0.0/8 accept").unwrap();
-        assert!(redirect < split);
-        assert!(redirect < lan);
-        assert!(rules.contains("tcp dport 53 redirect to :5353"));
+        assert!(loopback < mark);
+        assert!(rules.contains("ip6 daddr ::1 return"));
+        assert!(rules.contains("meta mark & 0x0000ffff != 0x2024"));
+        assert!(rules.contains("meta mark set 0x2023 ct mark set meta mark"));
+        assert!(rules
+            .contains("meta mark & 0x0000ffff == 0x2023 oifname \"varmlen0\" udp dport 53 accept"));
+        assert!(rules
+            .contains("meta mark & 0x0000ffff == 0x2023 oifname \"varmlen0\" tcp dport 53 accept"));
         assert!(rules.contains("tcp dport 853 reject"));
     }
 
     #[test]
-    fn dns_policy_never_allows_direct_port_53() {
-        let rules = render_dns_rules(&DnsNftPlan::new(5353));
-        assert!(!rules.contains("dport 53 accept"));
-        assert!(!rules.contains("1.1.1.1"));
-        assert!(!rules.contains("192.168.1.1"));
+    fn xray_dials_are_not_reclassified_as_system_dns() {
+        let rules = render_dns_rules();
+        let mark_rule = rules
+            .lines()
+            .find(|line| line.contains("udp dport 53") && line.contains("meta mark set 0x2023"))
+            .expect("UDP DNS marking rule");
+        assert!(mark_rule.contains("meta mark & 0x0000ffff != 0x2024"));
+        let allow = rules
+            .find("meta mark & 0x0000ffff == 0x2023 oifname \"varmlen0\" udp dport 53 accept")
+            .unwrap();
+        let reject = rules.find("udp dport 53 reject").unwrap();
+        assert!(allow < reject);
     }
 }
