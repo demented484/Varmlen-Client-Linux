@@ -34,35 +34,28 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "resources": {
-      "../target/release/varmlend": "varmlend",
-      "../target/release/varmlen-net": "varmlen-net",
-      "../scripts/install-varmlend.sh": "install-varmlend.sh",
-      "../packaging/varmlend/app.varmlen.client.policy": "app.varmlen.client.policy",
-      "cores/xray": "xray"
-    },
     "linux": {
       "deb": {
         "files": {
-          "../target/release/varmlend": "/usr/libexec/varmlen/varmlend",
-          "../target/release/varmlen-net": "/usr/libexec/varmlen/varmlen-net",
-          "cores/xray": "/usr/libexec/varmlen/xray",
-          "../packaging/varmlend/app.varmlen.client.policy": "/usr/share/polkit-1/actions/app.varmlen.client.policy"
+          "/usr/libexec/varmlen/varmlend": "../target/release/varmlend",
+          "/usr/libexec/varmlen/varmlen-net": "../target/release/varmlen-net",
+          "/usr/libexec/varmlen/xray": "cores/xray",
+          "/usr/share/polkit-1/actions/app.varmlen.client.policy": "../packaging/varmlend/app.varmlen.client.policy"
         }
       },
       "rpm": {
         "files": {
-          "../target/release/varmlend": "/usr/libexec/varmlen/varmlend",
-          "../target/release/varmlen-net": "/usr/libexec/varmlen/varmlen-net",
-          "cores/xray": "/usr/libexec/varmlen/xray",
-          "../packaging/varmlend/app.varmlen.client.policy": "/usr/share/polkit-1/actions/app.varmlen.client.policy"
+          "/usr/libexec/varmlen/varmlend": "../target/release/varmlend",
+          "/usr/libexec/varmlen/varmlen-net": "../target/release/varmlen-net",
+          "/usr/libexec/varmlen/xray": "cores/xray",
+          "/usr/share/polkit-1/actions/app.varmlen.client.policy": "../packaging/varmlend/app.varmlen.client.policy"
         }
       },
       "appimage": {
         "files": {
-          "../target/release/varmlend": "usr/libexec/varmlen/varmlend",
-          "../target/release/varmlen-net": "usr/libexec/varmlen/varmlen-net",
-          "cores/xray": "usr/libexec/varmlen/xray"
+          "usr/libexec/varmlen/varmlend": "../target/release/varmlend",
+          "usr/libexec/varmlen/varmlen-net": "../target/release/varmlen-net",
+          "usr/libexec/varmlen/xray": "cores/xray"
         }
       }
     }

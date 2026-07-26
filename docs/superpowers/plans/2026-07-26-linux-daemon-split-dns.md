@@ -472,19 +472,19 @@ git add src-tauri/src src/lib/conn.svelte.ts src/lib/conn.test.ts
 git commit -m "Use daemon for Linux VPN lifecycle"
 ```
 
-### Task 8: Linux end-to-end release gate
+### Task 8: Host-safe Linux release gate
 
 **Files:**
-- Create: `scripts/test-linux-e2e.sh`
-- Modify: `tests/leakcheck/src/main.rs`
+- Create: `scripts/test-linux-package.sh`
+- Modify: `tools/leakcheck/src/main.rs`
 - Modify: `README.md`
 - Modify: `CHANGELOG.md`
 
 **Interfaces:**
-- Consumes: installed `varmlend`, GUI, and `leakcheck`
-- Produces: machine-readable JSON result for TCP IP, UDP IP, DNS resolver, and outage windows
+- Consumes: built package, injected daemon backends, and deterministic fixtures
+- Produces: package-layout and regression-test results without touching host networking
 
-- [ ] **Step 1: Add failing leakcheck assertions**
+- [x] **Step 1: Add machine-readable leakcheck assertions**
 
 ```sh
 leakcheck --json --duration 20 \
@@ -493,24 +493,25 @@ leakcheck --json --duration 20 \
   --expect-no-outage-ms 1500
 ```
 
-The test runs the native excluded binary before and after connection and fails
-until daemon-based split routing is active.
+The diagnostic remains available for an operator who explicitly chooses to run
+it, but it is never invoked by the automated release gate.
 
-- [ ] **Step 2: Verify RED on the current installed client**
+- [x] **Step 2: Add a failing package-layout check**
 
-Run: `sudo scripts/test-linux-e2e.sh --phase split`
+Run: `scripts/test-linux-package.sh target/release/bundle/deb/Varmlen_0.2.0_amd64.deb`
 
-Expected: failure because the current release does not expose verified daemon
-status and does not satisfy all UDP/process-tree assertions.
+Expected before the packaging fix: failure because privileged binaries are
+duplicated under `/usr/lib/Varmlen`.
 
-- [ ] **Step 3: Complete the end-to-end harness**
+- [x] **Step 3: Complete the host-safe gate**
 
-Cover normal app TCP/UDP through VPN, excluded native TCP/UDP direct, descendant
-processes direct, reconnect without real-IP exposure, DNS with LAN enabled,
-daemon kill/restart recovery, and optional Flatpak/Sober and Steam cases when
-installed. Optional cases report `SKIP`, never false `PASS`.
+Cover TCP/UDP marking, descendants, Proton executable matching, Flatpak command
+resolution, reconnect ordering, DNS/LAN policy, recovery, package ownership,
+modes, capabilities, and duplicate privileged payloads through unit tests and
+archive inspection. Do not call `ip`, `nft`, `resolvectl`, public-IP services,
+or VPN lifecycle commands on the host.
 
-- [ ] **Step 4: Run the complete Linux gate**
+- [x] **Step 4: Run the complete Linux gate**
 
 Run: `cargo test --workspace --locked`
 
@@ -518,10 +519,12 @@ Run: `cargo clippy --workspace --all-targets --locked -- -D warnings`
 
 Run: `npm run check && npm run build`
 
-Run: `sudo scripts/test-linux-e2e.sh`
+Run: `scripts/test-install-layout.sh`
 
-Expected: all automated checks pass; no real-IP or DNS leak is observed; TCP and
-UDP exclusions remain direct through reconnect and disconnect.
+Run: `scripts/test-linux-package.sh target/release/bundle/deb/Varmlen_0.2.0_amd64.deb`
+
+Expected: all deterministic checks pass without changing or bypassing the
+developer host's active VPN.
 
 - [ ] **Step 5: Commit**
 
@@ -529,4 +532,3 @@ UDP exclusions remain direct through reconnect and disconnect.
 git add scripts tests README.md CHANGELOG.md
 git commit -m "Add Linux VPN security release gate"
 ```
-

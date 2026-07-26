@@ -1,4 +1,3 @@
 [workspace]
-members = ["daemon", "helper", "src-tauri"]
+members = ["daemon", "helper", "src-tauri", "tools/leakcheck"]
 resolver = "2"
-
