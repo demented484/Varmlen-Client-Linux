@@ -11,7 +11,7 @@
 ## Global Constraints
 
 - Linux and Android must present the same card and version behaviour.
-- Grouped-row separators use exactly `1px solid var(--bg)`.
+- Grouped rows do not render separator borders.
 - Form controls, menus, errors, badges, tab navigation, and the VPN power control keep their functional outlines.
 - The version value comes from `getVersion()` in `@tauri-apps/api/app`.
 - Do not touch VPN connection, route, DNS, helper, or split-tunnelling logic.
@@ -43,7 +43,7 @@ const read = (relative: string) =>
   readFileSync(fileURLToPath(new URL(relative, import.meta.url)), "utf8");
 
 describe("card surface contract", () => {
-  it("uses borderless cards and page-coloured row separators", () => {
+  it("uses borderless card surfaces without row separators", () => {
     const css = read("../app.css");
     const home = read("../routes/+page.svelte");
     const settings = read("../routes/settings/+page.svelte");
@@ -51,14 +51,15 @@ describe("card surface contract", () => {
 
     expect(css).toMatch(/\.card\s*\{[^}]*border:\s*none;/s);
     expect(css).toMatch(/\.list\s*\{[^}]*border:\s*none;/s);
-    expect(css).toMatch(/\.list > \* \+ \*\s*\{[^}]*border-top:\s*1px solid var\(--bg\);/s);
+    expect(css).toMatch(/\.list > \* \+ \*\s*\{[^}]*border-top:\s*none;/s);
     expect(home).toMatch(/\.sub-card\s*\{[^}]*border:\s*none;/s);
     expect(settings).toMatch(/\.theme-tile\s*\{[^}]*border:\s*none;/s);
-    expect(settings).toMatch(/\.row \+ \.row\s*\{[^}]*border-top:\s*1px solid var\(--bg\);/s);
+    expect(settings).toMatch(/\.row \+ \.row\s*\{[^}]*border-top:\s*none;/s);
     expect(settings).toMatch(/\.ver-list\s*\{[^}]*border:\s*none;/s);
-    expect(settings).toMatch(/\.ver-list li \+ li\s*\{\s*border-top:\s*1px solid var\(--bg\);/s);
+    expect(settings).toMatch(/\.ver-list li \+ li\s*\{\s*border-top:\s*none;/s);
+    expect(split).toMatch(/\.empty-state\s*\{[^}]*border:\s*none;/s);
     expect(split).toMatch(/\.picker\s*\{[^}]*border:\s*none;/s);
-    expect(split).toMatch(/\.picker-row \+ \.picker-row\s*\{[^}]*border-top:\s*1px solid var\(--bg\);/s);
+    expect(split).toMatch(/\.picker-row \+ \.picker-row\s*\{[^}]*border-top:\s*none;/s);
   });
 
   it("shows the Tauri application version in Settings", () => {
@@ -79,7 +80,8 @@ Expected: both tests fail because the existing surfaces use `var(--border)` and 
 
 - [ ] **Step 3: Implement the Linux surface and version changes**
 
-In `src/app.css`, set `.card` and `.list` to `border: none`, and set `.list > * + *` to `border-top: 1px solid var(--bg)`.
+In `src/app.css`, set `.card` and `.list` to `border: none`, and set
+`.list > * + *` to `border-top: none`.
 
 In `src/routes/+page.svelte`, set `.sub-card` to `border: none` and remove the obsolete pinned-card border-colour rule.
 
@@ -98,9 +100,14 @@ onMount(async () => {
 });
 ```
 
-Add `<footer class="app-version muted">Varmlen {appVersion}</footer>` as the last child of the Settings scroll region. Give it centred, quiet text. Remove the theme-tile and local list outlines, use `var(--bg)` for row and version-list separators, and use an elevated active fill plus the existing soft accent shadow for active theme selection.
+Add `<footer class="app-version muted">Varmlen {appVersion}</footer>` as the
+last child of the Settings scroll region. Give it centred, quiet text. Remove
+the theme-tile and local list outlines, remove row and version-list separators,
+and use an elevated active fill plus the existing soft accent shadow for active
+theme selection.
 
-In `src/routes/split/+page.svelte`, remove the picker outline and use `var(--bg)` for picker-row separators.
+In `src/routes/split/+page.svelte`, remove the empty-state and picker outlines
+and remove picker-row separators.
 
 - [ ] **Step 4: Run the focused test and verify GREEN**
 
