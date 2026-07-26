@@ -44,6 +44,13 @@ pub fn render_dns_rules(plan: &DnsNftPlan) -> String {
 }
 
 pub async fn apply_ruleset(ruleset: &str) -> Result<(), DaemonError> {
+    apply_ruleset_with_code(ruleset, DaemonErrorCode::DnsInstallFailed).await
+}
+
+pub async fn apply_ruleset_with_code(
+    ruleset: &str,
+    error_code: DaemonErrorCode,
+) -> Result<(), DaemonError> {
     let mut child = Command::new("nft")
         .args(["-f", "-"])
         .stdin(Stdio::piped())
@@ -52,27 +59,27 @@ pub async fn apply_ruleset(ruleset: &str) -> Result<(), DaemonError> {
         .spawn()
         .map_err(|error| {
             DaemonError::new(
-                DaemonErrorCode::DnsInstallFailed,
+                error_code,
                 format!("could not start nft: {error}"),
             )
         })?;
     if let Some(mut stdin) = child.stdin.take() {
         stdin.write_all(ruleset.as_bytes()).await.map_err(|error| {
             DaemonError::new(
-                DaemonErrorCode::DnsInstallFailed,
+                error_code,
                 format!("could not write nft transaction: {error}"),
             )
         })?;
     }
     let output = child.wait_with_output().await.map_err(|error| {
         DaemonError::new(
-            DaemonErrorCode::DnsInstallFailed,
+            error_code,
             format!("could not wait for nft: {error}"),
         )
     })?;
     if !output.status.success() {
         return Err(DaemonError::new(
-            DaemonErrorCode::DnsInstallFailed,
+            error_code,
             format!(
                 "nft rejected DNS transaction: {}",
                 String::from_utf8_lossy(&output.stderr).trim()

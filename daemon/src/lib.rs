@@ -3,6 +3,7 @@ pub mod dns;
 pub mod nft;
 pub mod protocol;
 pub mod server;
+pub mod split;
 
 #[cfg(test)]
 mod tests {
