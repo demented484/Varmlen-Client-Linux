@@ -51,6 +51,12 @@ pub enum DaemonErrorCode {
     FrameTooLarge,
     InvalidFrame,
     Unauthorized,
+    HoldBlockFailed,
+    HoldBlockVerificationFailed,
+    HoldBlockRemovalFailed,
+    TunnelPreparationFailed,
+    TunnelCommitFailed,
+    TunnelCleanupFailed,
     Internal,
 }
 
@@ -58,6 +64,15 @@ pub enum DaemonErrorCode {
 pub struct DaemonError {
     pub code: DaemonErrorCode,
     pub message: String,
+}
+
+impl DaemonError {
+    pub fn new(code: DaemonErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -4595,6 +4595,7 @@ dependencies = [
 name = "varmlend"
 version = "0.2.0"
 dependencies = [
+ "async-trait",
  "libc",
  "serde",
  "serde_json",
