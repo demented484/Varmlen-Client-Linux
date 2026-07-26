@@ -22,3 +22,4 @@ src-tauri/gen/android/app/src/main/jniLibs/
 .serena/
 tools/leakcheck/target/
 target/
+.worktrees/
