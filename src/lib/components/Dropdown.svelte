@@ -132,6 +132,11 @@
     font-size: 13px;
     color: var(--text);
   }
+  .trigger:focus-visible,
+  .trigger[aria-expanded="true"] {
+    border-top-left-radius: 0;
+    border-top-right-radius: 0;
+  }
   .trigger:hover {
     border-color: var(--border-strong);
   }
