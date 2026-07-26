@@ -21,3 +21,4 @@ src-tauri/gen/android/app/src/main/assets/
 src-tauri/gen/android/app/src/main/jniLibs/
 .serena/
 tools/leakcheck/target/
+target/

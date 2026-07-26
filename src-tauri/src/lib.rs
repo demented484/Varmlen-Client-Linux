@@ -1,5 +1,7 @@
 mod apps;
 mod core;
+#[cfg(target_os = "linux")]
+mod daemon_client;
 #[cfg(target_os = "android")]
 mod mobile_vpn;
 mod split;

@@ -28,7 +28,7 @@ percent-encoding = "2"
 base64 = "0.22"
 thiserror = "2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "socks"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "io-util"] }
 flate2 = "1"
 tar = "0.4"
 # xray-core ships its release binary in a .zip; flate2/tar remain for a future
@@ -42,6 +42,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 # tunnel is up (otherwise pings would route through the active server).
 socket2 = "0.5"
 libc = "0.2"
+varmlend = { path = "../daemon" }
 
 # Desktop-only dependencies. Single-instance + the XDG-portal file picker have
 # no Android equivalent (Android uses the system VpnService / picker instead).
@@ -50,4 +51,3 @@ tauri-plugin-single-instance = "2"
 # File picker via the XDG desktop portal — shows the user's own DE file manager
 # dialog (with proper search). Cross-desktop, not GNOME-specific.
 rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
-
