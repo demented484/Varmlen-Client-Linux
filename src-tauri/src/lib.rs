@@ -58,6 +58,36 @@ fn is_blocked_host(host: &str) -> bool {
     }
 }
 
+fn target_platform() -> &'static str {
+    if cfg!(target_os = "android") {
+        "Android"
+    } else if cfg!(target_os = "linux") {
+        "Linux"
+    } else if cfg!(target_os = "windows") {
+        "Windows"
+    } else if cfg!(target_os = "macos") {
+        "macOS"
+    } else {
+        std::env::consts::OS
+    }
+}
+
+fn target_arch() -> &'static str {
+    match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        other => other,
+    }
+}
+
+fn subscription_user_agent() -> String {
+    format!(
+        "Varmlen/{} ({}; {})",
+        env!("CARGO_PKG_VERSION"),
+        target_platform(),
+        target_arch()
+    )
+}
+
 /// Fetch and parse a subscription. Returns servers + server-side metadata
 /// (title, update interval, traffic counters, expiry, support URL).
 ///
@@ -83,12 +113,18 @@ async fn fetch_subscription(url: String) -> Result<ImportResult, String> {
             meta: SubscriptionMeta::default(),
             servers,
             description: None,
+            source_json: Some(trimmed.to_string()),
         });
     }
 
     if is_supported_uri(trimmed) {
         // One pasted share-link, or several newline/whitespace-separated.
-        if trimmed.lines().filter(|l| is_supported_uri(l.trim())).count() > 1 {
+        if trimmed
+            .lines()
+            .filter(|l| is_supported_uri(l.trim()))
+            .count()
+            > 1
+        {
             let servers = parse_subscription(trimmed);
             if servers.is_empty() {
                 return Err("no servers found".to_string());
@@ -97,6 +133,7 @@ async fn fetch_subscription(url: String) -> Result<ImportResult, String> {
                 meta: Default::default(),
                 servers,
                 description: None,
+                source_json: None,
             });
         }
         return parse_proxy_uri(trimmed)
@@ -104,6 +141,7 @@ async fn fetch_subscription(url: String) -> Result<ImportResult, String> {
                 meta: Default::default(),
                 servers: vec![s],
                 description: None,
+                source_json: None,
             })
             .map_err(|e| e.to_string());
     }
@@ -119,13 +157,18 @@ async fn fetch_subscription(url: String) -> Result<ImportResult, String> {
     }
 
     let client = reqwest::Client::builder()
-        .user_agent("Varmlen")
+        .user_agent(subscription_user_agent())
         .timeout(Duration::from_secs(15))
         // Validate every redirect hop too, so a 30x can't escape the guard.
         .redirect(reqwest::redirect::Policy::custom(|attempt| {
             if attempt.previous().len() >= 5 {
                 attempt.error("too many redirects")
-            } else if attempt.url().host_str().map(is_blocked_host).unwrap_or(true) {
+            } else if attempt
+                .url()
+                .host_str()
+                .map(is_blocked_host)
+                .unwrap_or(true)
+            {
                 attempt.error("redirect to a loopback/private address")
             } else {
                 attempt.follow()
@@ -168,6 +211,10 @@ async fn fetch_subscription(url: String) -> Result<ImportResult, String> {
         }
     }
     let body = String::from_utf8_lossy(&buf).into_owned();
+    let trimmed_body = body.trim_start_matches('\u{feff}').trim();
+    let source_json = serde_json::from_str::<serde_json::Value>(trimmed_body)
+        .ok()
+        .map(|_| trimmed_body.to_string());
     let servers = parse_subscription(&body);
 
     // Some panels (Marzban / Happ-style) inline the metadata as `#key: value`
@@ -194,7 +241,12 @@ async fn fetch_subscription(url: String) -> Result<ImportResult, String> {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
     });
-    Ok(ImportResult { meta, servers, description })
+    Ok(ImportResult {
+        meta,
+        servers,
+        description,
+        source_json,
+    })
 }
 
 // (Ping/latency probes are intentionally absent — pending a design pass.
@@ -219,7 +271,9 @@ pub fn run() {
         set_default("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
         set_default("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
         let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some()
-            || std::env::var("XDG_SESSION_TYPE").map(|s| s == "wayland").unwrap_or(false);
+            || std::env::var("XDG_SESSION_TYPE")
+                .map(|s| s == "wayland")
+                .unwrap_or(false);
         if wayland {
             set_default("GDK_BACKEND", "x11");
         }
@@ -319,4 +373,30 @@ pub fn run() {
                 vpn::teardown_on_exit(_app_handle);
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn subscription_ua_identifies_target() {
+        let ua = subscription_user_agent();
+        assert!(ua.starts_with(concat!("Varmlen/", env!("CARGO_PKG_VERSION"), " (")));
+        assert!(ua.ends_with(')'));
+        assert!(ua.contains(target_platform()));
+        assert!(ua.contains(target_arch()));
+    }
+
+    #[test]
+    fn import_result_serializes_json_source() {
+        let result = ImportResult {
+            meta: SubscriptionMeta::default(),
+            servers: Vec::new(),
+            description: None,
+            source_json: Some("{\"outbounds\":[]}".into()),
+        };
+        let value = serde_json::to_value(result).expect("serialize import result");
+        assert_eq!(value["source_json"], "{\"outbounds\":[]}");
+    }
 }
