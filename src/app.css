@@ -200,7 +200,7 @@ a {
 
 .card {
   background: var(--bg-elev);
-  border: 1px solid var(--border);
+  border: none;
   border-radius: var(--radius);
 }
 
@@ -280,12 +280,12 @@ a {
 /* ---------- list rows ---------- */
 .list {
   background: var(--bg-elev);
-  border: 1px solid var(--border);
+  border: none;
   border-radius: var(--radius);
   overflow: hidden;
 }
 .list > * + * {
-  border-top: 1px solid var(--border);
+  border-top: 1px solid var(--bg);
 }
 .list-row {
   display: flex;

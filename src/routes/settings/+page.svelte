@@ -7,6 +7,7 @@
   import Dropdown from "$lib/components/Dropdown.svelte";
   import { onMount, tick } from "svelte";
   import { isAndroid } from "$lib/platform";
+  import { getVersion } from "@tauri-apps/api/app";
 
   const logLevelOptions = $derived([
     { value: "debug", label: "debug" },
@@ -91,6 +92,7 @@
   // sync the toggles from it on open. `minimized` only applies when enabled.
   let autostart = $state(false);
   let autostartMinimized = $state(false);
+  let appVersion = $state("…");
   onMount(async () => {
     try {
       const s = await autostartStatus();
@@ -98,6 +100,13 @@
       autostartMinimized = s.minimized;
     } catch (e) {
       console.error("autostart status:", e);
+    }
+  });
+  onMount(async () => {
+    try {
+      appVersion = await getVersion();
+    } catch {
+      appVersion = "—";
     }
   });
 
@@ -651,6 +660,7 @@
   </section>
   {/if}
 
+  <footer class="app-version muted">Varmlen {appVersion}</footer>
 </main>
 
 {#if showLog}
@@ -832,12 +842,12 @@
     gap: 8px;
     padding: 12px;
     background: var(--bg-elev-2);
-    border: 1px solid var(--border);
+    border: none;
     border-radius: var(--radius-sm);
     color: var(--text);
   }
   .theme-tile.active {
-    border-color: var(--accent);
+    background: var(--bg-elev-3);
     box-shadow: 0 0 0 2px var(--accent-faint);
   }
   .swatch {
@@ -860,7 +870,7 @@
     cursor: pointer;
   }
   .row + .row {
-    border-top: 1px solid var(--border);
+    border-top: 1px solid var(--bg);
   }
   /* Sub-setting that only applies when its parent toggle is on. */
   .row.disabled {
@@ -872,9 +882,15 @@
   }
   .list {
     background: var(--bg-elev);
-    border: 1px solid var(--border);
+    border: none;
     border-radius: var(--radius);
     overflow: hidden;
+  }
+  .app-version {
+    padding: 2px 0 4px;
+    text-align: center;
+    font-size: 11px;
+    letter-spacing: 0.02em;
   }
   .row-text {
     flex: 1;
@@ -990,11 +1006,11 @@
     padding: 0;
     max-height: 42vh;
     overflow-y: auto;
-    border: 1px solid var(--border);
+    border: none;
     border-radius: var(--radius-sm);
     background: var(--bg-elev-2);
   }
-  .ver-list li + li { border-top: 1px solid var(--border); }
+  .ver-list li + li { border-top: 1px solid var(--bg); }
   .ver-row {
     color: var(--text);
     padding: 10px 12px;
