@@ -16,6 +16,7 @@ pub struct DnsGuard<B> {
     backend: B,
 }
 
+#[derive(Default)]
 pub struct SystemDnsBackend;
 
 impl SystemDnsBackend {
@@ -122,12 +123,8 @@ impl<B: DnsBackend> DnsGuard<B> {
         let probe = self.backend.probe_through_tunnel().await;
         if !matches!(&probe, Ok(true)) {
             let cleanup = self.backend.remove().await;
-            if let Err(error) = probe {
-                return Err(error);
-            }
-            if let Err(error) = cleanup {
-                return Err(error);
-            }
+            probe?;
+            cleanup?;
             return Err(DaemonError::new(
                 DaemonErrorCode::DnsVerificationFailed,
                 "DNS interception could not be verified",
