@@ -2,8 +2,10 @@ pub mod connection;
 pub mod dns;
 pub mod nft;
 pub mod protocol;
+pub mod recovery;
 pub mod server;
 pub mod split;
+pub mod state;
 
 #[cfg(test)]
 mod tests {

@@ -2,9 +2,14 @@ use std::fs::{self, OpenOptions};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{chown, PermissionsExt};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use tokio::net::UnixListener;
+use tokio::sync::RwLock;
+use varmlend::protocol::{ConnectionPhase, DaemonState};
+use varmlend::recovery::{RecoveryManager, SystemCleanupBackend};
 use varmlend::server::{parse_owner_uid, serve_connection, PeerPolicy};
+use varmlend::state::{PersistedState, StateStore};
 
 fn runtime_paths(uid: u32) -> (PathBuf, PathBuf) {
     let root = PathBuf::from("/run/varmlen");
@@ -24,6 +29,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     fs::create_dir_all("/run/varmlen")?;
     fs::set_permissions("/run/varmlen", fs::Permissions::from_mode(0o711))?;
+    fs::create_dir_all("/var/lib/varmlen")?;
+    fs::set_permissions("/var/lib/varmlen", fs::Permissions::from_mode(0o700))?;
 
     let lock = OpenOptions::new()
         .create(true)
@@ -42,11 +49,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     chown(&socket_path, Some(owner_uid), Some(owner_uid))?;
     fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))?;
 
+    let state_path = PathBuf::from(format!("/var/lib/varmlen/state-{owner_uid}.json"));
+    let mut recovery =
+        RecoveryManager::new(SystemCleanupBackend::new(owner_uid, state_path.clone()));
+    let phase = recovery
+        .cleanup()
+        .await
+        .map(|report| report.phase())
+        .unwrap_or(ConnectionPhase::RecoveryRequired);
+    let state = Arc::new(RwLock::new(DaemonState {
+        phase,
+        split_active: false,
+        dns_protected: false,
+    }));
+    StateStore::new(state_path).write(&PersistedState::new(owner_uid, phase))?;
+
     let policy = PeerPolicy::new(owner_uid);
     loop {
         let (stream, _) = listener.accept().await?;
+        let state = Arc::clone(&state);
         tokio::spawn(async move {
-            let _ = serve_connection(stream, policy).await;
+            let _ = serve_connection(stream, policy, state).await;
         });
     }
 }

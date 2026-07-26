@@ -1,12 +1,14 @@
 use std::io;
 use std::os::fd::AsRawFd;
+use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
+use tokio::sync::RwLock;
 
 use crate::protocol::{
-    decode_request_frame, encode_frame, ConnectionPhase, DaemonError, DaemonErrorCode,
-    DaemonState, ResponseEnvelope, PROTOCOL_VERSION, MAX_FRAME_BYTES,
+    decode_request_frame, encode_frame, DaemonError, DaemonErrorCode, DaemonState,
+    ResponseEnvelope, PROTOCOL_VERSION, MAX_FRAME_BYTES,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -91,6 +93,7 @@ pub async fn write_response(
 pub async fn serve_connection(
     mut stream: UnixStream,
     policy: PeerPolicy,
+    state: Arc<RwLock<DaemonState>>,
 ) -> Result<(), DaemonErrorCode> {
     let uid = peer_uid(&stream).map_err(|_| DaemonErrorCode::Unauthorized)?;
     if !policy.authorize(uid) {
@@ -121,12 +124,52 @@ pub async fn serve_connection(
         let response = ResponseEnvelope {
             version: PROTOCOL_VERSION,
             operation_id: request.operation_id,
-            result: Ok(DaemonState {
-                phase: ConnectionPhase::Disconnected,
-                split_active: false,
-                dns_protected: false,
-            }),
+            result: Ok(state.read().await.clone()),
         };
         write_response(&mut stream, &response).await?;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::UnixStream;
+    use tokio::sync::RwLock;
+
+    use super::{serve_connection, PeerPolicy};
+    use crate::protocol::{
+        decode_response_frame, encode_frame, ConnectionPhase, DaemonCommand, DaemonState,
+        RequestEnvelope, PROTOCOL_VERSION,
+    };
+
+    #[tokio::test]
+    async fn status_returns_recovery_required_snapshot() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let state = Arc::new(RwLock::new(DaemonState {
+            phase: ConnectionPhase::RecoveryRequired,
+            split_active: false,
+            dns_protected: false,
+        }));
+        let server_task = tokio::spawn(serve_connection(
+            server,
+            PeerPolicy::new(unsafe { libc::getuid() }),
+            state,
+        ));
+        let request = RequestEnvelope::new(PROTOCOL_VERSION, 9, DaemonCommand::Status);
+        let bytes = encode_frame(&request).unwrap();
+        client.write_u32(bytes.len() as u32).await.unwrap();
+        client.write_all(&bytes).await.unwrap();
+        let length = client.read_u32().await.unwrap();
+        let mut response = vec![0; length as usize];
+        client.read_exact(&mut response).await.unwrap();
+        let response = decode_response_frame(&response).unwrap();
+        assert_eq!(
+            response.result.unwrap().phase,
+            ConnectionPhase::RecoveryRequired
+        );
+        drop(client);
+        server_task.await.unwrap().unwrap();
     }
 }
