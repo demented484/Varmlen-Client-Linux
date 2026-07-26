@@ -8,6 +8,7 @@ mod tests {
         RequestEnvelope, MAX_FRAME_BYTES, PROTOCOL_VERSION,
     };
     use crate::server::PeerPolicy;
+    use crate::server::parse_owner_uid;
 
     #[test]
     fn rejects_unknown_protocol_version() {
@@ -43,5 +44,13 @@ mod tests {
             decode_request_frame(&bytes),
             Err(DaemonErrorCode::FrameTooLarge)
         );
+    }
+
+    #[test]
+    fn daemon_owner_must_come_from_valid_pkexec_uid() {
+        assert_eq!(parse_owner_uid(Some("1000")), Ok(1000));
+        assert!(parse_owner_uid(Some("0")).is_err());
+        assert!(parse_owner_uid(Some("../1000")).is_err());
+        assert!(parse_owner_uid(None).is_err());
     }
 }

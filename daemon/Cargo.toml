@@ -9,10 +9,13 @@ description = "Privileged networking daemon for Varmlen"
 name = "varmlend"
 path = "src/lib.rs"
 
+[[bin]]
+name = "varmlend"
+path = "src/main.rs"
+
 [dependencies]
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync"] }
-
