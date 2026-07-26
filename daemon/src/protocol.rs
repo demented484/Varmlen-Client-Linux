@@ -57,6 +57,8 @@ pub enum DaemonErrorCode {
     TunnelPreparationFailed,
     TunnelCommitFailed,
     TunnelCleanupFailed,
+    DnsInstallFailed,
+    DnsVerificationFailed,
     Internal,
 }
 

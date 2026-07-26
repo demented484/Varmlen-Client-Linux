@@ -360,7 +360,7 @@ fn build_inbounds(tun: TunMode) -> Vec<Value> {
         "destOverride": ["http", "tls", "quic"],
         "routeOnly": true
     });
-    match tun {
+    let mut inbounds = match tun {
         TunMode::XrayNative => vec![json!({
             "tag": "tun-in",
             "protocol": "tun",
@@ -377,7 +377,19 @@ fn build_inbounds(tun: TunMode) -> Vec<Value> {
             "settings": { "udp": true, "auth": "noauth" },
             "sniffing": sniffing,
         })],
-    }
+    };
+    inbounds.push(json!({
+        "tag": "dns-in",
+        "listen": "127.0.0.1",
+        "port": 5353,
+        "protocol": "dokodemo-door",
+        "settings": {
+            "address": "1.1.1.1",
+            "port": 53,
+            "network": "tcp,udp"
+        }
+    }));
+    inbounds
 }
 
 /// Routing rules. Per-app (`process`) and per-site (`domain`) split are BOTH
@@ -420,6 +432,8 @@ fn build_route_rules(
     let mut rules = vec![
         // 1. Hijack app DNS (:53) into xray's DNS module.
         json!({ "type": "field", "inboundTag": [inbound_tag], "port": 53, "outboundTag": "dns-out" }),
+        // System DNS is redirected here by varmlend before split/LAN rules.
+        json!({ "type": "field", "inboundTag": ["dns-in"], "outboundTag": "dns-out" }),
     ];
 
     // 2. Keep LAN/private traffic direct when allowed.
@@ -717,10 +731,23 @@ mod tests {
         let s = parse_proxy_uri("vless://u@1.2.3.4:443?type=xhttp&security=reality&pbk=K#X").unwrap();
         let cfg = build_xray_config(&s, &split(), "tun", TunMode::XrayNative, true, "warning");
         assert_eq!(cfg["dns"]["servers"][0], "https://1.1.1.1/dns-query");
+        let dns_in = cfg["inbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|inbound| inbound["tag"] == "dns-in")
+            .expect("local DNS inbound");
+        assert_eq!(dns_in["listen"], "127.0.0.1");
+        assert_eq!(dns_in["port"], 5353);
+        assert_eq!(dns_in["protocol"], "dokodemo-door");
         let serialized = serde_json::to_string(&cfg).unwrap();
         assert!(!serialized.contains("localhost") && !serialized.contains("\"local\""));
-        let dns_hijack = rule_for(&cfg, "inboundTag").unwrap();
-        assert_eq!(dns_hijack["port"], 53);
+        let dns_hijack = cfg["routing"]["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|rule| rule["inboundTag"][0] == "dns-in")
+            .expect("local DNS routing rule");
         assert_eq!(dns_hijack["outboundTag"], "dns-out");
         // DoH upstream pinned to proxy.
         let doh_rule = cfg["routing"]["rules"].as_array().unwrap().iter()

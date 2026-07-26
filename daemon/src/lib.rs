@@ -1,4 +1,6 @@
 pub mod connection;
+pub mod dns;
+pub mod nft;
 pub mod protocol;
 pub mod server;
 
