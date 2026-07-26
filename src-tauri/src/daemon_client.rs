@@ -22,6 +22,8 @@ pub enum ClientError {
     OperationMismatch,
     #[error("installed daemon is unavailable: {0}")]
     Unavailable(String),
+    #[error("restart required: {0}")]
+    RestartRequired(String),
 }
 
 impl From<DaemonError> for ClientError {
@@ -30,6 +32,7 @@ impl From<DaemonError> for ClientError {
     }
 }
 
+#[derive(Debug)]
 pub struct DaemonClient {
     stream: UnixStream,
     next_operation_id: u64,
@@ -50,12 +53,32 @@ impl DaemonClient {
     }
 
     pub async fn connect_installed() -> Result<Self, ClientError> {
-        Self::connect(&Self::installed_socket_path()).await
+        Self::connect_compatible(&Self::installed_socket_path()).await
+    }
+
+    async fn connect_compatible(path: &Path) -> Result<Self, ClientError> {
+        let mut client = Self::connect(path).await?;
+        match client.request(DaemonCommand::Status).await {
+            Ok(_) => Ok(client),
+            Err(ClientError::Protocol(
+                varmlend::protocol::DaemonErrorCode::UnsupportedVersion,
+            ))
+            | Err(ClientError::Daemon(
+                varmlend::protocol::DaemonErrorCode::UnsupportedVersion,
+                _,
+            )) => Err(ClientError::RestartRequired(
+                "an outdated Varmlen background daemon is still running; reboot once before connecting this build"
+                    .into(),
+            )),
+            Err(error) => Err(error),
+        }
     }
 
     pub async fn connect_or_start_installed() -> Result<Self, ClientError> {
-        if let Ok(client) = Self::connect_installed().await {
-            return Ok(client);
+        match Self::connect_installed().await {
+            Ok(client) => return Ok(client),
+            Err(error @ ClientError::RestartRequired(_)) => return Err(error),
+            Err(_) => {}
         }
         const DAEMON: &str = "/usr/libexec/varmlen/varmlend";
         if !Path::new(DAEMON).is_file() {
@@ -70,11 +93,15 @@ impl DaemonClient {
                 ClientError::Unavailable(format!("could not start pkexec: {error}"))
             })?;
         for _ in 0..150 {
-            if let Ok(client) = Self::connect_installed().await {
-                tokio::spawn(async move {
-                    let _ = child.wait().await;
-                });
-                return Ok(client);
+            match Self::connect_installed().await {
+                Ok(client) => {
+                    tokio::spawn(async move {
+                        let _ = child.wait().await;
+                    });
+                    return Ok(client);
+                }
+                Err(error @ ClientError::RestartRequired(_)) => return Err(error),
+                Err(_) => {}
             }
             if let Some(status) = child.try_wait()? {
                 return Err(ClientError::Unavailable(format!(
@@ -116,6 +143,7 @@ impl DaemonClient {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use tokio::net::UnixListener;
     use varmlend::protocol::{
@@ -123,7 +151,7 @@ mod tests {
     };
     use varmlend::server::{read_frame, write_response};
 
-    use super::DaemonClient;
+    use super::{ClientError, DaemonClient};
 
     #[tokio::test]
     async fn client_round_trip_preserves_operation_id() {
@@ -156,7 +184,46 @@ mod tests {
         let _ = std::fs::remove_file(socket);
     }
 
+    #[tokio::test]
+    async fn compatibility_probe_requires_reboot_for_an_old_daemon() {
+        let socket = unique_socket_path();
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let bytes = read_frame(&mut stream).await.unwrap();
+            let request: varmlend::protocol::RequestEnvelope =
+                serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(request.command, DaemonCommand::Status);
+            write_response(
+                &mut stream,
+                &ResponseEnvelope {
+                    version: PROTOCOL_VERSION - 1,
+                    operation_id: request.operation_id,
+                    result: Err(varmlend::protocol::DaemonError::new(
+                        varmlend::protocol::DaemonErrorCode::UnsupportedVersion,
+                        "old daemon",
+                    )),
+                },
+            )
+            .await
+            .unwrap();
+        });
+
+        let error = DaemonClient::connect_compatible(&socket).await.unwrap_err();
+        assert!(matches!(error, ClientError::RestartRequired(_)));
+        assert!(error.to_string().contains("reboot"));
+        server.await.unwrap();
+        let _ = std::fs::remove_file(socket);
+    }
+
     fn unique_socket_path() -> PathBuf {
-        std::env::temp_dir().join(format!("vd-{}.sock", std::process::id()))
+        static NEXT_SOCKET: AtomicU64 = AtomicU64::new(1);
+        let path = std::env::temp_dir().join(format!(
+            "vd-{}-{}.sock",
+            std::process::id(),
+            NEXT_SOCKET.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&path);
+        path
     }
 }

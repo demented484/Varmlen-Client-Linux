@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_CONFIG_BYTES: usize = 384 * 1024;
 const MAX_SERVER_IPS: usize = 16;
@@ -177,7 +177,14 @@ pub fn decode_response_frame(bytes: &[u8]) -> Result<ResponseEnvelope, DaemonErr
 mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
-    use super::{validate_connect_request, ConnectRequest, ConnectionMode, DaemonErrorCode};
+    use super::{
+        validate_connect_request, ConnectRequest, ConnectionMode, DaemonErrorCode, PROTOCOL_VERSION,
+    };
+
+    #[test]
+    fn protocol_version_rejects_withdrawn_port_based_release() {
+        assert_eq!(PROTOCOL_VERSION, 2);
+    }
 
     fn valid_connect() -> ConnectRequest {
         ConnectRequest {
