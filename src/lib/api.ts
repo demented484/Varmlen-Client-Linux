@@ -111,7 +111,7 @@ export function coreInfo(kind: CoreKind): Promise<CoreInfo> {
 
 /** Download a specific version (or latest when `version` is null) into the
  *  local cache. Emits `core://progress` events. First install for a kind
- *  auto-activates it; xray installs trigger a setcap prompt (native TUN). */
+ *  auto-activates it. Linux's packaged daemon uses its root-owned Xray copy. */
 export function coreInstall(kind: CoreKind, version: string | null = null): Promise<string> {
   return invoke<string>("core_install", { kind, version });
 }
@@ -224,14 +224,12 @@ export function vpnStatus(): Promise<HelperResponse> {
   return invoke<HelperResponse>("vpn_status");
 }
 
-/** Whether xray has the network capability it needs for its native TUN
- *  (cap_net_admin). Replaces the old root-helper check. */
+/** Whether the root-owned Linux networking components are installed. */
 export function capsGranted(): Promise<boolean> {
   return invoke<boolean>("caps_granted");
 }
 
-/** Grant network permissions (setcap via one pkexec prompt). Also removes the
- *  legacy root helper if present. Replaces installHelper. */
+/** Start the installed Linux daemon through one retained polkit authorization. */
 export function grantCaps(): Promise<void> {
   return invoke<void>("grant_caps");
 }

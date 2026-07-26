@@ -5,10 +5,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio::net::UnixListener;
-use tokio::sync::RwLock;
-use varmlend::protocol::{ConnectionPhase, DaemonState};
+use tokio::time::{sleep, Duration};
+use varmlend::controller::SystemController;
+use varmlend::protocol::ConnectionPhase;
 use varmlend::recovery::{RecoveryManager, SystemCleanupBackend};
-use varmlend::server::{parse_owner_uid, serve_connection, PeerPolicy};
+use varmlend::server::{parse_owner_uid, serve_connection, CommandHandler, PeerPolicy};
 use varmlend::state::{PersistedState, StateStore};
 
 fn runtime_paths(uid: u32) -> (PathBuf, PathBuf) {
@@ -57,19 +58,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await
         .map(|report| report.phase())
         .unwrap_or(ConnectionPhase::RecoveryRequired);
-    let state = Arc::new(RwLock::new(DaemonState {
-        phase,
-        split_active: false,
-        dns_protected: false,
-    }));
-    StateStore::new(state_path).write(&PersistedState::new(owner_uid, phase))?;
+    StateStore::new(state_path.clone()).write(&PersistedState::new(owner_uid, phase))?;
+    let controller = Arc::new(SystemController::new(owner_uid, phase, state_path));
+    let monitor = Arc::clone(&controller);
+    tokio::spawn(async move {
+        loop {
+            sleep(Duration::from_secs(1)).await;
+            let _ = monitor.poll_health().await;
+        }
+    });
+    let handler: Arc<dyn CommandHandler> = controller;
 
     let policy = PeerPolicy::new(owner_uid);
     loop {
         let (stream, _) = listener.accept().await?;
-        let state = Arc::clone(&state);
+        let handler = Arc::clone(&handler);
         tokio::spawn(async move {
-            let _ = serve_connection(stream, policy, state).await;
+            let _ = serve_connection(stream, policy, handler).await;
         });
     }
 }

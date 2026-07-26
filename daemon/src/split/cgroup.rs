@@ -112,7 +112,12 @@ fn create_real_directory(path: &Path) -> Result<(), SplitError> {
 
 fn verify_cgroup2(directory: &File) -> Result<(), SplitError> {
     let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
-    let result = unsafe { libc::fstatfs(std::os::fd::AsRawFd::as_raw_fd(directory), stats.as_mut_ptr()) };
+    let result = unsafe {
+        libc::fstatfs(
+            std::os::fd::AsRawFd::as_raw_fd(directory),
+            stats.as_mut_ptr(),
+        )
+    };
     if result != 0 {
         return Err(SplitError::CgroupUnavailable);
     }

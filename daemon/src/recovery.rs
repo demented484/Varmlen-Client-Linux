@@ -19,11 +19,7 @@ pub struct ProcessIdentity {
 }
 
 impl ProcessIdentity {
-    pub fn new(
-        pid: u32,
-        start_time_ticks: u64,
-        executable: impl Into<PathBuf>,
-    ) -> Self {
+    pub fn new(pid: u32, start_time_ticks: u64, executable: impl Into<PathBuf>) -> Self {
         Self {
             pid,
             start_time_ticks,
@@ -56,9 +52,7 @@ pub fn parse_start_time_ticks(stat: &str) -> Option<u64> {
         .and_then(|value| value.parse().ok())
 }
 
-#[derive(
-    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Resource {
     XrayProcess(ProcessIdentity),
     TunInterface(String),
@@ -128,9 +122,7 @@ impl CleanupBackend for SystemCleanupBackend {
                 return Err("recovery state belongs to another user".into());
             }
             if let Some(saved) = state.xray {
-                if ProcessIdentity::from_pid(saved.pid)
-                    .is_ok_and(|live| saved.matches(&live))
-                {
+                if ProcessIdentity::from_pid(saved.pid).is_ok_and(|live| saved.matches(&live)) {
                     resources.insert(Resource::XrayProcess(saved));
                 }
             }
@@ -144,7 +136,31 @@ impl CleanupBackend for SystemCleanupBackend {
             .output()
             .await
             .map_err(|error| format!("inspect policy rules: {error}"))?;
-        if String::from_utf8_lossy(&rules.stdout).contains("0x2025") {
+        let rules_text = String::from_utf8_lossy(&rules.stdout);
+        let routes_v4 = Command::new("ip")
+            .args(["route", "show"])
+            .output()
+            .await
+            .map_err(|error| format!("inspect IPv4 routes: {error}"))?;
+        let routes_v6 = Command::new("ip")
+            .args(["-6", "route", "show"])
+            .output()
+            .await
+            .map_err(|error| format!("inspect IPv6 routes: {error}"))?;
+        let routes_text = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&routes_v4.stdout),
+            String::from_utf8_lossy(&routes_v6.stdout)
+        );
+        if rules_text.contains("0x2024")
+            || rules_text.contains("0x00002024")
+            || rules_text.contains("0x2025")
+            || rules_text.contains("0x00002025")
+            || routes_text.contains("0.0.0.0/1")
+            || routes_text.contains("128.0.0.0/1")
+            || routes_text.contains("blackhole ::/1")
+            || routes_text.contains("blackhole 8000::/1")
+        {
             resources.insert(Resource::RouteTable("100".into()));
         }
         for table in ["varmlen_dns", "varmlen_split", "varmlen_ks"] {
@@ -169,9 +185,26 @@ impl CleanupBackend for SystemCleanupBackend {
                 command_success("ip", &["link", "delete", "dev", interface]).await
             }
             Resource::RouteTable(table) if table == "100" => {
-                let _ =
-                    command_success("ip", &["rule", "del", "fwmark", "0x2025", "lookup", table])
-                        .await;
+                let _ = command_success(
+                    "/usr/libexec/varmlen/varmlen-net",
+                    &["cleanup"],
+                )
+                .await;
+                for mark in ["0x2024", "0x2025"] {
+                    for family in ["-4", "-6"] {
+                        for _ in 0..4 {
+                            if command_success(
+                                "ip",
+                                &[family, "rule", "del", "fwmark", mark, "lookup", table],
+                            )
+                            .await
+                            .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
                 command_success("ip", &["route", "flush", "table", table]).await
             }
             Resource::NftTable(table)
@@ -295,11 +328,7 @@ mod tests {
         let saved = ProcessIdentity::new(42, 100, "/usr/libexec/varmlen/xray");
         let reused = ProcessIdentity::new(42, 101, "/usr/bin/unrelated");
         assert!(!saved.matches(&reused));
-        assert!(saved.matches(&ProcessIdentity::new(
-            42,
-            100,
-            "/usr/libexec/varmlen/xray"
-        )));
+        assert!(saved.matches(&ProcessIdentity::new(42, 100, "/usr/libexec/varmlen/xray")));
     }
 
     #[test]

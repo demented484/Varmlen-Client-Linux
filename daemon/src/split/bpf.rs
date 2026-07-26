@@ -68,26 +68,14 @@ pub fn attach_socket_mark(cgroup: &File) -> Result<(), SplitError> {
     put_u32(&mut load_attributes, 4, (program.len() / 8) as u32);
     put_u64(&mut load_attributes, 8, program.as_ptr() as u64);
     put_u64(&mut load_attributes, 16, license.as_ptr() as u64);
-    put_u32(
-        &mut load_attributes,
-        68,
-        BPF_CGROUP_INET_SOCK_CREATE,
-    );
+    put_u32(&mut load_attributes, 68, BPF_CGROUP_INET_SOCK_CREATE);
     let program_fd = bpf_call(BPF_PROG_LOAD, &mut load_attributes)? as libc::c_int;
 
     let _ = detach_socket_mark(cgroup);
     let mut attach_attributes = vec![0_u8; 16];
-    put_u32(
-        &mut attach_attributes,
-        0,
-        cgroup.as_raw_fd() as u32,
-    );
+    put_u32(&mut attach_attributes, 0, cgroup.as_raw_fd() as u32);
     put_u32(&mut attach_attributes, 4, program_fd as u32);
-    put_u32(
-        &mut attach_attributes,
-        8,
-        BPF_CGROUP_INET_SOCK_CREATE,
-    );
+    put_u32(&mut attach_attributes, 8, BPF_CGROUP_INET_SOCK_CREATE);
     let result = bpf_call(BPF_PROG_ATTACH, &mut attach_attributes).map(|_| ());
     unsafe {
         libc::close(program_fd);

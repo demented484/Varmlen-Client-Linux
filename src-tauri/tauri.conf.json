@@ -1,12 +1,12 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Varmlen",
-  "version": "0.1.3",
+  "version": "0.2.0",
   "identifier": "app.varmlen.client",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://127.0.0.1:1420",
-    "beforeBuildCommand": "npm run build && cargo build --release --manifest-path helper/Cargo.toml && bash scripts/fetch-xray.sh",
+    "beforeBuildCommand": "npm run build && bash scripts/fetch-xray.sh && cargo build --release -p varmlend -p varmlen-net",
     "frontendDist": "../build"
   },
   "app": {
@@ -35,10 +35,36 @@
       "icons/icon.ico"
     ],
     "resources": {
-      "../helper/target/release/varmlen-probe": "varmlen-probe",
-      "../helper/varmlen-setcap.sh": "varmlen-setcap.sh",
-      "../helper/uninstall.sh": "uninstall.sh",
+      "../target/release/varmlend": "varmlend",
+      "../target/release/varmlen-net": "varmlen-net",
+      "../scripts/install-varmlend.sh": "install-varmlend.sh",
+      "../packaging/varmlend/app.varmlen.client.policy": "app.varmlen.client.policy",
       "cores/xray": "xray"
+    },
+    "linux": {
+      "deb": {
+        "files": {
+          "../target/release/varmlend": "/usr/libexec/varmlen/varmlend",
+          "../target/release/varmlen-net": "/usr/libexec/varmlen/varmlen-net",
+          "cores/xray": "/usr/libexec/varmlen/xray",
+          "../packaging/varmlend/app.varmlen.client.policy": "/usr/share/polkit-1/actions/app.varmlen.client.policy"
+        }
+      },
+      "rpm": {
+        "files": {
+          "../target/release/varmlend": "/usr/libexec/varmlen/varmlend",
+          "../target/release/varmlen-net": "/usr/libexec/varmlen/varmlen-net",
+          "cores/xray": "/usr/libexec/varmlen/xray",
+          "../packaging/varmlend/app.varmlen.client.policy": "/usr/share/polkit-1/actions/app.varmlen.client.policy"
+        }
+      },
+      "appimage": {
+        "files": {
+          "../target/release/varmlend": "usr/libexec/varmlen/varmlend",
+          "../target/release/varmlen-net": "usr/libexec/varmlen/varmlen-net",
+          "cores/xray": "usr/libexec/varmlen/xray"
+        }
+      }
     }
   }
 }

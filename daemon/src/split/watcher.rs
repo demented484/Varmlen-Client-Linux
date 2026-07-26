@@ -57,9 +57,7 @@ impl PermissionWatcher {
         cgroup_procs: PathBuf,
     ) -> Result<Self, SplitError> {
         let fanotify = Fanotify::init(
-            InitFlags::FAN_CLASS_CONTENT
-                | InitFlags::FAN_CLOEXEC
-                | InitFlags::FAN_NONBLOCK,
+            InitFlags::FAN_CLASS_CONTENT | InitFlags::FAN_CLOEXEC | InitFlags::FAN_NONBLOCK,
             EventFFlags::O_RDONLY | EventFFlags::O_CLOEXEC,
         )
         .map_err(|_| SplitError::WatcherUnavailable)?;
@@ -91,7 +89,10 @@ impl PermissionWatcher {
 
     pub fn is_healthy(&self) -> bool {
         self.healthy.load(Ordering::Acquire)
-            && self.thread.as_ref().is_some_and(|thread| !thread.is_finished())
+            && self
+                .thread
+                .as_ref()
+                .is_some_and(|thread| !thread.is_finished())
     }
 }
 
@@ -213,10 +214,8 @@ fn run_permission_loop(
                     let pid = match u32::try_from(event.pid()) {
                         Ok(pid) => pid,
                         Err(_) => {
-                            let _ = fanotify.write_response(FanotifyResponse::new(
-                                fd,
-                                Response::FAN_ALLOW,
-                            ));
+                            let _ = fanotify
+                                .write_response(FanotifyResponse::new(fd, Response::FAN_ALLOW));
                             continue;
                         }
                     };
@@ -232,8 +231,7 @@ fn run_permission_loop(
                         && selectors.iter().any(|selector| {
                             selector.matches_target(&target) || selector.matches(&process)
                         });
-                    let moved = !is_match
-                        || std::fs::write(&cgroup_procs, pid.to_string()).is_ok();
+                    let moved = !is_match || std::fs::write(&cgroup_procs, pid.to_string()).is_ok();
                     let decision = permission_decision(
                         process_uid,
                         owner_uid,

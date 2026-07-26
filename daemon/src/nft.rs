@@ -57,12 +57,7 @@ pub async fn apply_ruleset_with_code(
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|error| {
-            DaemonError::new(
-                error_code,
-                format!("could not start nft: {error}"),
-            )
-        })?;
+        .map_err(|error| DaemonError::new(error_code, format!("could not start nft: {error}")))?;
     if let Some(mut stdin) = child.stdin.take() {
         stdin.write_all(ruleset.as_bytes()).await.map_err(|error| {
             DaemonError::new(
@@ -72,10 +67,7 @@ pub async fn apply_ruleset_with_code(
         })?;
     }
     let output = child.wait_with_output().await.map_err(|error| {
-        DaemonError::new(
-            error_code,
-            format!("could not wait for nft: {error}"),
-        )
+        DaemonError::new(error_code, format!("could not wait for nft: {error}"))
     })?;
     if !output.status.success() {
         return Err(DaemonError::new(
@@ -122,7 +114,9 @@ mod tests {
     fn dns_redirect_runs_before_lan_and_split_accepts() {
         let rules = render_dns_rules(&DnsNftPlan::new(5353));
         let redirect = rules.find("udp dport 53 redirect to :5353").unwrap();
-        let split = rules.find("meta mark & 0x0000ffff == 0x2025 accept").unwrap();
+        let split = rules
+            .find("meta mark & 0x0000ffff == 0x2025 accept")
+            .unwrap();
         let lan = rules.find("ip daddr 10.0.0.0/8 accept").unwrap();
         assert!(redirect < split);
         assert!(redirect < lan);

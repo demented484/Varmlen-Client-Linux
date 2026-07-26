@@ -118,11 +118,7 @@ pub fn mark_existing_sockets(pid: u32, mark: u32) -> Result<usize, SplitError> {
             .map_err(|_| SplitError::ReconciliationFailed)?;
         let mut marked = 0_usize;
         for entry in entries.flatten() {
-            let Some(target_fd) = entry
-                .file_name()
-                .to_str()
-                .and_then(fd_number)
-            else {
+            let Some(target_fd) = entry.file_name().to_str().and_then(fd_number) else {
                 continue;
             };
             let duplicate = unsafe {
@@ -180,9 +176,7 @@ pub fn mark_existing_sockets(pid: u32, mark: u32) -> Result<usize, SplitError> {
 mod tests {
     use std::path::PathBuf;
 
-    use super::{
-        fd_number, is_transient_fd_error, parse_real_uid, AppSelector, ProcessSnapshot,
-    };
+    use super::{fd_number, is_transient_fd_error, parse_real_uid, AppSelector, ProcessSnapshot};
 
     #[test]
     fn parses_real_uid_from_proc_status() {

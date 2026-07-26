@@ -108,10 +108,7 @@ impl DnsBackend for SystemDnsBackend {
                     format!("DNS probe failed: {error}"),
                 )
             })?;
-        Ok(validate_dns_response(
-            transaction_id,
-            &response[..received],
-        ))
+        Ok(validate_dns_response(transaction_id, &response[..received]))
     }
 
     async fn remove(&mut self) -> Result<(), DaemonError> {
@@ -119,10 +116,7 @@ impl DnsBackend for SystemDnsBackend {
     }
 }
 
-pub fn build_dns_query(
-    transaction_id: u16,
-    domain: &str,
-) -> Result<Vec<u8>, DaemonError> {
+pub fn build_dns_query(transaction_id: u16, domain: &str) -> Result<Vec<u8>, DaemonError> {
     let mut query = Vec::with_capacity(64);
     query.extend_from_slice(&transaction_id.to_be_bytes());
     query.extend_from_slice(&[0x01, 0x00]);
@@ -192,8 +186,8 @@ impl<B: DnsBackend> DnsGuard<B> {
 mod tests {
     use async_trait::async_trait;
 
-    use super::{DnsBackend, DnsGuard, DnsPlan};
     use super::{build_dns_query, validate_dns_response};
+    use super::{DnsBackend, DnsGuard, DnsPlan};
     use crate::protocol::{DaemonError, DaemonErrorCode};
 
     #[derive(Default)]

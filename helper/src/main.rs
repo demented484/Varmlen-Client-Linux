@@ -1,9 +1,7 @@
-//! varmlen-probe — a tiny setcap'd helper for the Varmlen desktop client.
+//! varmlen-net — root-invoked network transactions for `varmlend`.
 //!
-//! Replaces the old root systemd daemon. It is NOT a daemon: the GUI invokes it
-//! per-action and it exits. It carries file capabilities
-//! `cap_net_admin,cap_net_raw,cap_dac_override+ep` (set once via pkexec at
-//! install/update):
+//! It is not reachable from the GUI and carries no file capabilities. The
+//! root-owned daemon invokes it by a fixed root-owned path:
 //!   - cap_net_admin: SO_MARK, nftables, ip routes/rules, net sysctls
 //!   - cap_net_raw:   SO_BINDTODEVICE for the bypass probes
 //!   - cap_dac_override: write the root-owned rp_filter sysctl + /run state
@@ -12,11 +10,10 @@
 //!   - `tcp`/`icmp`     latency probes that bypass the active tunnel
 //!   - `killswitch-up`  apply the nftables drop table
 //!   - `killswitch-down`remove it
-//!   - `route-up`       lay the routing xray's native tun needs: default route
-//!                      into the tun, a physical bypass table + ip rule for
-//!                      xray's own marked dials, the anti-loop server route,
-//!                      loose rp_filter, and system DNS routed through the tun
-//!                      (a direct /etc/resolv.conf takeover — no D-Bus/polkit)
+//!   - `route-up` lay the routing xray's native tun needs: default route into
+//!     the tun, a physical bypass table and policy rule for xray's own marked
+//!     dials, the anti-loop server route, and loose rp_filter. DNS is owned by
+//!     `varmlend`.
 //!   - `route-down`     tear that routing down (idempotent)
 //!   - `cleanup`        crash-recovery superset (killswitch + routing + stray TUN)
 //!
@@ -26,17 +23,16 @@
 //! xray's tun inbound manages no routes/DNS itself.
 //!
 //! Usage:
-//!   varmlen-probe tcp  <host> <port> <timeout_ms>      -> prints RTT ms
-//!   varmlen-probe icmp <host> <timeout_ms>             -> prints RTT ms
-//!   varmlen-probe killswitch-up [--allow-lan] <ip>...  -> applies nft table
-//!   varmlen-probe killswitch-down
-//!   varmlen-probe route-up [--server <ip>]... [--bypass-cgroup <rel>] [--bypass-app <id>]...
-//!   varmlen-probe route-down [--keep-bypass]
-//!   varmlen-probe bypass-up <cgroup-rel> | bypass-down | bypass-watch <cgroup-rel> <id>...
-//!   varmlen-probe cleanup
+//!   varmlen-net tcp  <host> <port> <timeout_ms>      -> prints RTT ms
+//!   varmlen-net icmp <host> <timeout_ms>             -> prints RTT ms
+//!   varmlen-net killswitch-up [--allow-lan] <ip>...
+//!   varmlen-net killswitch-down
+//!   varmlen-net route-up [--server <ip>]...
+//!   varmlen-net route-down
+//!   varmlen-net cleanup
 
-use std::process::{Command, Stdio};
 use std::io::Write;
+use std::process::{Command, Stdio};
 
 const KS_TABLE: &str = "varmlen_ks";
 const TUN_IFACE: &str = "varmlen0";
@@ -80,7 +76,7 @@ fn main() {
     // Harden the environment BEFORE any privileged child spawn. This binary
     // carries file caps and raises CAP_NET_ADMIN into the ambient set, which is
     // inherited across execve — so it must never resolve ip/nft/ping via an
-    // attacker-controlled $PATH (e.g. `PATH=/tmp/evil varmlen-probe ...` would run
+    // attacker-controlled $PATH (e.g. `PATH=/tmp/evil varmlen-net ...` would run
     // /tmp/evil/nft with CAP_NET_ADMIN). Pin PATH to root-owned dirs. (LD_* is
     // already neutralised by the loader's secure-execution mode for fcaps.)
     std::env::set_var("PATH", "/usr/sbin:/usr/bin:/sbin:/bin");
@@ -108,41 +104,69 @@ fn run(args: &[String]) -> i32 {
     match args.first().map(String::as_str) {
         Some("tcp") => {
             // tcp <host> <port> <timeout_ms>
-            let (Some(host), Some(port), Some(tmo)) = (args.get(1), args.get(2), args.get(3)) else {
-                eprintln!("usage: varmlen-probe tcp <host> <port> <timeout_ms>");
+            let (Some(host), Some(port), Some(tmo)) = (args.get(1), args.get(2), args.get(3))
+            else {
+                eprintln!("usage: varmlen-net tcp <host> <port> <timeout_ms>");
                 return 2;
             };
-            let port: u16 = match port.parse() { Ok(p) => p, Err(_) => { eprintln!("bad port"); return 2; } };
+            let port: u16 = match port.parse() {
+                Ok(p) => p,
+                Err(_) => {
+                    eprintln!("bad port");
+                    return 2;
+                }
+            };
             let tmo: u32 = tmo.parse().unwrap_or(2500);
             match tcp_ping_bypass(host, port, tmo) {
-                Ok(ms) => { println!("{ms}"); 0 }
-                Err(e) => { eprintln!("{e}"); 1 }
+                Ok(ms) => {
+                    println!("{ms}");
+                    0
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    1
+                }
             }
         }
         Some("icmp") => {
             let (Some(host), Some(tmo)) = (args.get(1), args.get(2)) else {
-                eprintln!("usage: varmlen-probe icmp <host> <timeout_ms>");
+                eprintln!("usage: varmlen-net icmp <host> <timeout_ms>");
                 return 2;
             };
             let tmo: u32 = tmo.parse().unwrap_or(2000);
             match icmp_ping(host, tmo) {
-                Ok(ms) => { println!("{ms}"); 0 }
-                Err(e) => { eprintln!("{e}"); 1 }
+                Ok(ms) => {
+                    println!("{ms}");
+                    0
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    1
+                }
             }
         }
         Some("killswitch-up") => {
             let mut allow_lan = false;
             let mut ips = Vec::new();
             for a in &args[1..] {
-                if a == "--allow-lan" { allow_lan = true; }
-                else if let Ok(ip) = a.parse::<std::net::IpAddr>() { ips.push(ip); }
+                if a == "--allow-lan" {
+                    allow_lan = true;
+                } else if let Ok(ip) = a.parse::<std::net::IpAddr>() {
+                    ips.push(ip);
+                }
             }
             match apply_killswitch(&ips, allow_lan) {
                 Ok(()) => 0,
-                Err(e) => { eprintln!("{e}"); 1 }
+                Err(e) => {
+                    eprintln!("{e}");
+                    1
+                }
             }
         }
-        Some("killswitch-down") => { remove_killswitch(); 0 }
+        Some("killswitch-down") => {
+            remove_killswitch();
+            0
+        }
         Some("route-up") => {
             // route-up [--server <ip>]... [--bypass-cgroup <rel>] [--bypass-app <id>]...
             let mut servers = Vec::new();
@@ -152,8 +176,9 @@ fn run(args: &[String]) -> i32 {
             while i < args.len() {
                 match args[i].as_str() {
                     "--server" => {
-                        if let Some(ip) =
-                            args.get(i + 1).and_then(|s| s.parse::<std::net::IpAddr>().ok())
+                        if let Some(ip) = args
+                            .get(i + 1)
+                            .and_then(|s| s.parse::<std::net::IpAddr>().ok())
                         {
                             servers.push(ip);
                         }
@@ -177,7 +202,10 @@ fn run(args: &[String]) -> i32 {
             }
             match route_up(&servers, bypass_cgroup.as_deref(), &bypass_apps) {
                 Ok(()) => 0,
-                Err(e) => { eprintln!("{e}"); 1 }
+                Err(e) => {
+                    eprintln!("{e}");
+                    1
+                }
             }
         }
         Some("route-down") => {
@@ -190,29 +218,40 @@ fn run(args: &[String]) -> i32 {
         Some("bypass-up") => {
             // bypass-up <cgroup-path>
             let Some(path) = args.get(1) else {
-                eprintln!("usage: varmlen-probe bypass-up <cgroup-path>");
+                eprintln!("usage: varmlen-net bypass-up <cgroup-path>");
                 return 2;
             };
             match bypass_up(path, None) {
                 Ok(()) => 0,
-                Err(e) => { eprintln!("{e}"); 1 }
+                Err(e) => {
+                    eprintln!("{e}");
+                    1
+                }
             }
         }
         // bypass-down [cgroup-rel] — the optional path also detaches the
         // socket-mark BPF program from that cgroup.
-        Some("bypass-down") => { bypass_down(args.get(1).map(String::as_str)); 0 }
+        Some("bypass-down") => {
+            bypass_down(args.get(1).map(String::as_str));
+            0
+        }
         Some("bypass-watch") => {
             // bypass-watch <cgroup-path> <excluded-id>...  (runs until killed)
             let Some(path) = args.get(1) else {
-                eprintln!("usage: varmlen-probe bypass-watch <cgroup-path> <id>...");
+                eprintln!("usage: varmlen-net bypass-watch <cgroup-path> <id>...");
                 return 2;
             };
             let excluded: Vec<String> = args[2..].to_vec();
             bypass_watch(path, &excluded)
         }
-        Some("cleanup") => { remove_killswitch(); route_down(false); delete_tun(); 0 }
+        Some("cleanup") => {
+            remove_killswitch();
+            route_down(false);
+            delete_tun();
+            0
+        }
         _ => {
-            eprintln!("usage: varmlen-probe <tcp|icmp|killswitch-up|killswitch-down|route-up|route-down|cleanup> ...");
+            eprintln!("usage: varmlen-net <tcp|icmp|killswitch-up|killswitch-down|route-up|route-down|cleanup> ...");
             2
         }
     }
@@ -234,7 +273,9 @@ fn pick_physical_iface() -> Option<String> {
         while !cur.is_null() {
             let ifa = &*cur;
             if !ifa.ifa_name.is_null() && !ifa.ifa_addr.is_null() {
-                let name = std::ffi::CStr::from_ptr(ifa.ifa_name).to_string_lossy().into_owned();
+                let name = std::ffi::CStr::from_ptr(ifa.ifa_name)
+                    .to_string_lossy()
+                    .into_owned();
                 let virt = name.starts_with("lo")
                     || name.starts_with("tun")
                     || name.starts_with("tap")
@@ -270,7 +311,10 @@ fn tcp_ping_bypass(host: &str, port: u16, timeout_ms: u32) -> Result<u32, String
     if host.trim().is_empty() {
         return Err("empty host".into());
     }
-    if !host.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | ':' | '-' | '_')) {
+    if !host
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | ':' | '-' | '_'))
+    {
         return Err("invalid host".into());
     }
     let dst: SocketAddr = (host, port)
@@ -297,14 +341,24 @@ fn icmp_ping(host: &str, timeout_ms: u32) -> Result<u32, String> {
     if host.trim().is_empty() {
         return Err("empty host".into());
     }
-    if !host.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | ':' | '-' | '_')) {
+    if !host
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | ':' | '-' | '_'))
+    {
         return Err("invalid host".into());
     }
-    let timeout_s = ((timeout_ms + 999) / 1000).clamp(1, 10);
+    let timeout_s = timeout_ms.div_ceil(1000).clamp(1, 10);
     let out = Command::new("ping")
-        .arg("-n").arg("-c").arg("1").arg("-W").arg(timeout_s.to_string()).arg(host)
-        .stdout(Stdio::piped()).stderr(Stdio::null())
-        .output().map_err(|e| format!("spawn ping: {e}"))?;
+        .arg("-n")
+        .arg("-c")
+        .arg("1")
+        .arg("-W")
+        .arg(timeout_s.to_string())
+        .arg(host)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|e| format!("spawn ping: {e}"))?;
     if !out.status.success() {
         return Err("ping failed".into());
     }
@@ -312,7 +366,10 @@ fn icmp_ping(host: &str, timeout_ms: u32) -> Result<u32, String> {
     for line in text.lines() {
         if let Some(idx) = line.find("time=") {
             let rest = &line[idx + 5..];
-            let num: String = rest.chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+            let num: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == '.')
+                .collect();
             if let Ok(ms) = num.parse::<f64>() {
                 return Ok(ms.round().max(1.0).min(u32::MAX as f64) as u32);
             }
@@ -383,18 +440,33 @@ fn apply_killswitch(server_ips: &[std::net::IpAddr], allow_lan: bool) -> Result<
 
 /// Pipe a ruleset into `nft -f -` (atomic transaction).
 fn nft_apply(ruleset: &str) -> Result<(), String> {
-    let mut child = Command::new("nft").arg("-f").arg("-")
-        .stdin(Stdio::piped()).spawn().map_err(|e| format!("nft spawn: {e}"))?;
+    let mut child = Command::new("nft")
+        .arg("-f")
+        .arg("-")
+        .stdin(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("nft spawn: {e}"))?;
     if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(ruleset.as_bytes()).map_err(|e| format!("nft write: {e}"))?;
+        stdin
+            .write_all(ruleset.as_bytes())
+            .map_err(|e| format!("nft write: {e}"))?;
     }
     let status = child.wait().map_err(|e| format!("nft wait: {e}"))?;
-    if status.success() { Ok(()) } else { Err("nft apply failed".to_string()) }
+    if status.success() {
+        Ok(())
+    } else {
+        Err("nft apply failed".to_string())
+    }
 }
 
 fn remove_killswitch() {
-    let _ = Command::new("nft").arg("delete").arg("table").arg("inet").arg(KS_TABLE)
-        .stderr(Stdio::null()).status();
+    let _ = Command::new("nft")
+        .arg("delete")
+        .arg("table")
+        .arg("inet")
+        .arg(KS_TABLE)
+        .stderr(Stdio::null())
+        .status();
 }
 
 /// Per-app split bypass: tag traffic from the given (user-owned, cgroup-v2)
@@ -427,7 +499,9 @@ fn bypass_up(cgroup_path: &str, iface_override: Option<&str>) -> Result<(), Stri
         None => pick_physical_iface().ok_or("no physical interface")?,
     };
     if iface.is_empty()
-        || !iface.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        || !iface
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
     {
         return Err("bad interface name".into());
     }
@@ -465,8 +539,13 @@ fn bypass_up(cgroup_path: &str, iface_override: Option<&str>) -> Result<(), Stri
 /// cgroup socket-mark BPF program (without it the program stays attached but is
 /// inert once the mark rules are gone, and the next attach replaces it).
 fn bypass_down(cgroup_rel: Option<&str>) {
-    let _ = Command::new("nft").arg("delete").arg("table").arg("inet").arg(BYPASS_TABLE)
-        .stderr(Stdio::null()).status();
+    let _ = Command::new("nft")
+        .arg("delete")
+        .arg("table")
+        .arg("inet")
+        .arg(BYPASS_TABLE)
+        .stderr(Stdio::null())
+        .status();
     if let Some(rel) = cgroup_rel {
         if cg_valid(rel) {
             let _ = bypass_bpf(rel, false);
@@ -536,7 +615,12 @@ fn bpf_call(cmd: libc::c_int, attr: &mut [u8]) -> Result<i64, String> {
 fn bypass_bpf(cgroup_rel: &str, attach: bool) -> Result<(), String> {
     let dir = format!("/sys/fs/cgroup/{}", cgroup_rel.trim_start_matches('/'));
     let cdir = std::ffi::CString::new(dir).map_err(|_| "bad path")?;
-    let cg = unsafe { libc::open(cdir.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY) };
+    let cg = unsafe {
+        libc::open(
+            cdir.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY,
+        )
+    };
     if cg < 0 {
         return Err(format!("open cgroup: {}", std::io::Error::last_os_error()));
     }
@@ -558,13 +642,16 @@ fn bypass_bpf(cgroup_rel: &str, attach: bool) -> Result<(), String> {
         put_u64(&mut attr, 8, insns.as_ptr() as u64);
         put_u64(&mut attr, 16, license.as_ptr() as u64);
         put_u32(&mut attr, 68, BPF_CGROUP_INET_SOCK_CREATE);
-        let prog = bpf_call(BPF_PROG_LOAD, &mut attr).map_err(|e| format!("prog load: {e}"))? as i32;
+        let prog =
+            bpf_call(BPF_PROG_LOAD, &mut attr).map_err(|e| format!("prog load: {e}"))? as i32;
         // union bpf_attr (attach): target_fd @0, attach_bpf_fd @4, type @8, flags @12.
         let mut attr = vec![0u8; 16];
         put_u32(&mut attr, 0, cg as u32);
         put_u32(&mut attr, 4, prog as u32);
         put_u32(&mut attr, 8, BPF_CGROUP_INET_SOCK_CREATE);
-        let r = bpf_call(BPF_PROG_ATTACH, &mut attr).map(|_| ()).map_err(|e| format!("attach: {e}"));
+        let r = bpf_call(BPF_PROG_ATTACH, &mut attr)
+            .map(|_| ())
+            .map_err(|e| format!("attach: {e}"));
         unsafe { libc::close(prog) }; // the attachment holds its own reference
         r
     })();
@@ -577,7 +664,9 @@ fn bypass_bpf(cgroup_rel: &str, attach: bool) -> Result<(), String> {
 fn cg_valid(rel: &str) -> bool {
     !rel.is_empty()
         && rel.len() <= 512
-        && rel.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-' | b'@'))
+        && rel
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-' | b'@'))
 }
 
 /// comm is truncated by the kernel to TASK_COMM_LEN - 1 bytes.
@@ -623,7 +712,10 @@ fn pid_matches_excluded(pid: u32, excluded: &[String]) -> bool {
     let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
     let comm = comm.trim();
     let exe = std::fs::read_link(format!("/proc/{pid}/exe")).ok();
-    let exe_str = exe.as_ref().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+    let exe_str = exe
+        .as_ref()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
     let exe_base = exe
         .as_ref()
         .and_then(|p| p.file_name())
@@ -632,7 +724,9 @@ fn pid_matches_excluded(pid: u32, excluded: &[String]) -> bool {
     let arg0 = std::fs::read(format!("/proc/{pid}/cmdline"))
         .map(|b| arg0_basename(&b))
         .unwrap_or_default();
-    excluded.iter().any(|id| id_matches(id, comm, &exe_str, &exe_base, &arg0))
+    excluded
+        .iter()
+        .any(|id| id_matches(id, comm, &exe_str, &exe_base, &arg0))
 }
 
 /// Move `pid` into the bypass cgroup if its name/exe matches an excluded id.
@@ -649,7 +743,9 @@ fn hex_to_ipv4(hex: &str) -> Option<std::net::Ipv4Addr> {
     if hex.len() != 8 {
         return None;
     }
-    Some(std::net::Ipv4Addr::from(u32::from_str_radix(hex, 16).ok()?.to_le_bytes()))
+    Some(std::net::Ipv4Addr::from(
+        u32::from_str_radix(hex, 16).ok()?.to_le_bytes(),
+    ))
 }
 
 fn hex_to_ipv6(hex: &str) -> Option<std::net::Ipv6Addr> {
@@ -832,11 +928,20 @@ fn bypass_watch(cgroup_rel: &str, excluded: &[String]) -> i32 {
     // the GUI spawns us from a short-lived tokio worker, which would kill us
     // almost immediately.
     let gui_pid = unsafe { libc::getppid() };
-    let procs = format!("/sys/fs/cgroup/{}/cgroup.procs", cgroup_rel.trim_start_matches('/'));
+    let procs = format!(
+        "/sys/fs/cgroup/{}/cgroup.procs",
+        cgroup_rel.trim_start_matches('/')
+    );
 
     bypass_sweep(&procs, excluded);
 
-    let fd = unsafe { libc::socket(libc::AF_NETLINK, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, NETLINK_CONNECTOR) };
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_NETLINK,
+            libc::SOCK_DGRAM | libc::SOCK_CLOEXEC,
+            NETLINK_CONNECTOR,
+        )
+    };
     if fd < 0 {
         eprintln!("netlink socket: {}", std::io::Error::last_os_error());
         return 1;
@@ -851,7 +956,10 @@ fn bypass_watch(cgroup_rel: &str, excluded: &[String]) -> i32 {
         return 1;
     }
     // Wake recv every 2s so we can notice the GUI exiting and stop.
-    let tv = libc::timeval { tv_sec: 2, tv_usec: 0 };
+    let tv = libc::timeval {
+        tv_sec: 2,
+        tv_usec: 0,
+    };
     unsafe {
         libc::setsockopt(
             fd,
@@ -862,7 +970,7 @@ fn bypass_watch(cgroup_rel: &str, excluded: &[String]) -> i32 {
         );
     }
     // Subscribe: nlmsghdr(16) + cn_msg(20) + op(4).
-    let mut listen = vec![0u8; 40];
+    let mut listen = [0u8; 40];
     listen[0..4].copy_from_slice(&40u32.to_ne_bytes());
     listen[4..6].copy_from_slice(&3u16.to_ne_bytes()); // NLMSG_DONE
     listen[12..16].copy_from_slice(&std::process::id().to_ne_bytes());
@@ -914,8 +1022,13 @@ fn bypass_watch(cgroup_rel: &str, excluded: &[String]) -> i32 {
 }
 
 fn delete_tun() {
-    let _ = Command::new("ip").arg("link").arg("delete").arg("dev").arg(TUN_IFACE)
-        .stderr(Stdio::null()).status();
+    let _ = Command::new("ip")
+        .arg("link")
+        .arg("delete")
+        .arg("dev")
+        .arg(TUN_IFACE)
+        .stderr(Stdio::null())
+        .status();
 }
 
 // --- routing for xray's native tun -----------------------------------------
@@ -928,11 +1041,18 @@ fn delete_tun() {
 
 /// Run `ip <args>`, returning an error with stderr on failure.
 fn ip_req(args: &[&str]) -> Result<(), String> {
-    let out = Command::new("ip").args(args).output().map_err(|e| format!("ip: {e}"))?;
+    let out = Command::new("ip")
+        .args(args)
+        .output()
+        .map_err(|e| format!("ip: {e}"))?;
     if out.status.success() {
         Ok(())
     } else {
-        Err(format!("ip {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim()))
+        Err(format!(
+            "ip {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))
     }
 }
 
@@ -973,15 +1093,23 @@ fn write_state(path: &str, val: &str) {
 /// WireGuard-as-default — `default dev ppp0 scope link`) have a `dev` but no
 /// `via`, and must still work.
 fn detect_default_route() -> Result<(Option<String>, String), String> {
-    let out = Command::new("ip").args(["-4", "route", "show", "default"])
-        .output().map_err(|e| format!("ip route: {e}"))?;
+    let out = Command::new("ip")
+        .args(["-4", "route", "show", "default"])
+        .output()
+        .map_err(|e| format!("ip route: {e}"))?;
     for line in String::from_utf8_lossy(&out.stdout).lines() {
         if line.contains(&format!("dev {TUN_IFACE}")) {
             continue;
         }
         let toks: Vec<&str> = line.split_whitespace().collect();
-        let via = toks.iter().position(|&t| t == "via").and_then(|i| toks.get(i + 1));
-        let dev = toks.iter().position(|&t| t == "dev").and_then(|i| toks.get(i + 1));
+        let via = toks
+            .iter()
+            .position(|&t| t == "via")
+            .and_then(|i| toks.get(i + 1));
+        let dev = toks
+            .iter()
+            .position(|&t| t == "dev")
+            .and_then(|i| toks.get(i + 1));
         if let Some(d) = dev {
             return Ok((via.map(|g| g.to_string()), d.to_string()));
         }
@@ -991,14 +1119,23 @@ fn detect_default_route() -> Result<(Option<String>, String), String> {
 
 /// The physical IPv6 default route `(gateway, iface)`, if the host has v6.
 fn detect_default_route6() -> Option<(String, String)> {
-    let out = Command::new("ip").args(["-6", "route", "show", "default"]).output().ok()?;
+    let out = Command::new("ip")
+        .args(["-6", "route", "show", "default"])
+        .output()
+        .ok()?;
     for line in String::from_utf8_lossy(&out.stdout).lines() {
         if line.contains(&format!("dev {TUN_IFACE}")) {
             continue;
         }
         let toks: Vec<&str> = line.split_whitespace().collect();
-        let via = toks.iter().position(|&t| t == "via").and_then(|i| toks.get(i + 1));
-        let dev = toks.iter().position(|&t| t == "dev").and_then(|i| toks.get(i + 1));
+        let via = toks
+            .iter()
+            .position(|&t| t == "via")
+            .and_then(|i| toks.get(i + 1));
+        let dev = toks
+            .iter()
+            .position(|&t| t == "dev")
+            .and_then(|i| toks.get(i + 1));
         if let (Some(g), Some(d)) = (via, dev) {
             return Some((g.to_string(), d.to_string()));
         }
@@ -1014,81 +1151,6 @@ fn ensure_tun() -> Result<(), String> {
     }
     ip_quiet(&["addr", "replace", TUN_ADDR, "dev", TUN_IFACE]);
     ip_req(&["link", "set", TUN_IFACE, "up"])
-}
-
-// --- DNS anti-leak -----------------------------------------------------------
-//
-// xray's tun-in inbound hijacks any DNS (port 53) packet that actually ARRIVES
-// on the tun and answers it via DoH through the tunnel (see xray.rs's routing
-// rule). But the OS resolver decides which interface/server to query BEFORE
-// any of that: systemd-resolved keeps using the physical link's DHCP-handed
-// DNS server unless told otherwise, and even the tun's 0.0.0.0/1 catch-all
-// route loses to the physical link's pre-existing, more specific LAN-subnet
-// route for that server's IP (longest-prefix-match) — so DNS queries silently
-// leave through the physical NIC, wholly bypassing xray, no matter the
-// killswitch/allow_lan setting. This must be fixed by making the OS resolver
-// itself route DNS through the tun.
-
-const DNS_UPSTREAM: &str = "1.1.1.1";
-const RESOLV_CONF: &str = "/etc/resolv.conf";
-/// One-line record of what /etc/resolv.conf was before we took it over, so
-/// teardown can restore it exactly: `SYMLINK:<raw target>`, `FILE:<content>`,
-/// or `NONE` (didn't exist).
-const RESOLV_CONF_BACKUP: &str = "/run/varmlen/resolv_conf.orig";
-
-/// Route all system DNS through the tun by taking over /etc/resolv.conf
-/// directly (needs cap_dac_override, already carried for the /run state
-/// writes) — no D-Bus/resolvectl involved.
-///
-/// An earlier version used resolved's SetLinkDNS/SetLinkDomains D-Bus calls.
-/// Those are guarded by polkit's `auth_admin` action (no `_keep`), which
-/// demands an interactive password EVERY call regardless of our CAP_NET_ADMIN
-/// — three prompts on every single connect (revert + dns + domain). A file
-/// write has none of that friction, matching every other privileged write
-/// this helper already does with zero prompts (rp_filter, /run state).
-///
-/// On a systemd-resolved host /etc/resolv.conf is normally a SYMLINK to
-/// resolved's own stub file (127.0.0.53). We detach that symlink — leaving
-/// resolved's stub file and resolved itself untouched — and put a plain file
-/// naming our upstream in its place. glibc's classic resolver (the `dns` NSS
-/// module; this only fully covers hosts where `hosts:` in nsswitch.conf does
-/// NOT use `nss-resolve`, which talks to resolved directly instead of reading
-/// this file — checked: this project targets that common case) reads
-/// /etc/resolv.conf's CONTENT the same way whether it's a symlink or a plain
-/// file, so detaching it works exactly like editing it would, without ever
-/// touching resolved.
-///
-/// FATAL on failure (e.g. an unwritable /etc): a VPN that can't secure DNS
-/// must refuse to report "connected", never leak silently.
-fn configure_dns() -> Result<(), String> {
-    let path = std::path::Path::new(RESOLV_CONF);
-    let backup = if let Ok(target) = std::fs::read_link(path) {
-        format!("SYMLINK:{}", target.to_string_lossy())
-    } else if let Ok(content) = std::fs::read_to_string(path) {
-        format!("FILE:{content}")
-    } else {
-        "NONE".to_string()
-    };
-    write_state(RESOLV_CONF_BACKUP, &backup);
-    // Remove whatever's there (symlink or file) FIRST — fs::write would
-    // otherwise follow a symlink and clobber resolved's stub file's content
-    // instead of detaching /etc/resolv.conf from it.
-    let _ = std::fs::remove_file(path);
-    write_file(RESOLV_CONF, &format!("nameserver {DNS_UPSTREAM}\n"))
-}
-
-/// Restore whatever /etc/resolv.conf pointed to/contained before
-/// `configure_dns`. Best-effort + idempotent (a missing backup is a no-op).
-fn teardown_dns() {
-    let Ok(backup) = std::fs::read_to_string(RESOLV_CONF_BACKUP) else { return };
-    let _ = std::fs::remove_file(RESOLV_CONF);
-    if let Some(target) = backup.strip_prefix("SYMLINK:") {
-        let _ = std::os::unix::fs::symlink(target, RESOLV_CONF);
-    } else if let Some(content) = backup.strip_prefix("FILE:") {
-        let _ = write_file(RESOLV_CONF, content);
-    }
-    // "NONE": leave it absent, matching the original state.
-    let _ = std::fs::remove_file(RESOLV_CONF_BACKUP);
 }
 
 const RP_ALL: &str = "/proc/sys/net/ipv4/conf/all/rp_filter";
@@ -1125,12 +1187,6 @@ fn route_up(
         // 1. tun device (xray usually created it already; ensure addr + up).
         ensure_tun()?;
 
-        // 1b. DNS anti-leak: route system DNS through the tun BEFORE anything
-        //     else, so a failure here rolls back cleanly via route_down and the
-        //     connect never reports "connected" with plaintext DNS still going
-        //     to the physical resolver. See the DNS anti-leak comment above.
-        configure_dns()?;
-
         // 2. loosen RPF so the asymmetric bypass replies aren't dropped.
         set_rp_filter_loose()?;
 
@@ -1152,8 +1208,13 @@ fn route_up(
         // whose subnet routes handle it. Matters for marked-at-creation sockets
         // of excluded apps talking to LAN peers.
         for net in [
-            "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16",
-            "100.64.0.0/10", "224.0.0.0/4", "255.255.255.255/32",
+            "10.0.0.0/8",
+            "172.16.0.0/12",
+            "192.168.0.0/16",
+            "169.254.0.0/16",
+            "100.64.0.0/10",
+            "224.0.0.0/4",
+            "255.255.255.255/32",
         ] {
             ip_req(&["route", "replace", "throw", net, "table", PHYS_TABLE])?;
         }
@@ -1166,7 +1227,9 @@ fn route_up(
         // physical NIC, not fall into the main table's v6 blackhole (step 6).
         let v6 = detect_default_route6();
         if let Some((g6, if6)) = v6.as_ref() {
-            ip_req(&["-6", "route", "replace", "default", "via", g6, "dev", if6, "table", PHYS_TABLE])?;
+            ip_req(&[
+                "-6", "route", "replace", "default", "via", g6, "dev", if6, "table", PHYS_TABLE,
+            ])?;
             for net in ["fe80::/10", "fc00::/7", "ff00::/8"] {
                 ip_req(&["-6", "route", "replace", "throw", net, "table", PHYS_TABLE])?;
             }
@@ -1230,7 +1293,16 @@ fn route_up(
         for s in servers {
             if let std::net::IpAddr::V6(addr) = s {
                 if let Some((gw6, if6)) = v6.as_ref() {
-                    ip_req(&["-6", "route", "replace", &format!("{addr}/128"), "via", gw6, "dev", if6])?;
+                    ip_req(&[
+                        "-6",
+                        "route",
+                        "replace",
+                        &format!("{addr}/128"),
+                        "via",
+                        gw6,
+                        "dev",
+                        if6,
+                    ])?;
                     s6.push_str(&format!("{addr}\n"));
                 }
             }
@@ -1276,8 +1348,12 @@ fn route_down(keep_bypass: bool) {
         let m = format!("{mark:#x}");
         for fam in ["-4", "-6"] {
             for _ in 0..4 {
-                let ok = Command::new("ip").args([fam, "rule", "del", "fwmark", &m])
-                    .stderr(Stdio::null()).status().map(|s| s.success()).unwrap_or(false);
+                let ok = Command::new("ip")
+                    .args([fam, "rule", "del", "fwmark", &m])
+                    .stderr(Stdio::null())
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
                 if !ok {
                     break;
                 }
@@ -1324,9 +1400,6 @@ fn route_down(keep_bypass: bool) {
         }
         let _ = std::fs::remove_file(RP_STATE);
     }
-
-    // 6. restore /etc/resolv.conf to what it was before.
-    teardown_dns();
 }
 
 #[cfg(test)]
@@ -1378,13 +1451,19 @@ mod tests {
                 r.contains("udp dport 53 ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 100.64.0.0/10 } counter drop"),
                 "allow_lan={allow_lan}:\n{r}"
             );
-            assert!(r.contains("tcp dport 53 ip daddr { 10.0.0.0/8"), "allow_lan={allow_lan}:\n{r}");
+            assert!(
+                r.contains("tcp dport 53 ip daddr { 10.0.0.0/8"),
+                "allow_lan={allow_lan}:\n{r}"
+            );
             assert!(r.contains("udp dport 53 ip6 daddr { fe80::/10, fc00::/7 } counter drop"));
             // The drop must appear BEFORE any LAN accept block so it wins the match.
             if allow_lan {
                 let drop_pos = r.find("udp dport 53 ip daddr {").unwrap();
                 let accept_pos = r.find("ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 100.64.0.0/10 } counter accept").unwrap();
-                assert!(drop_pos < accept_pos, "dns-drop must precede the lan-accept block");
+                assert!(
+                    drop_pos < accept_pos,
+                    "dns-drop must precede the lan-accept block"
+                );
             }
         }
     }
@@ -1398,9 +1477,14 @@ mod tests {
         let peers6 = ["2001:db8::7".parse().unwrap()].into_iter().collect();
         let sports = [27015u16].into_iter().collect();
         let batch = pin_rules_batch(&peers4, &peers6, &sports);
-        assert!(batch.contains("add rule inet varmlen_bypass mangle ip daddr 91.92.43.10 meta mark set 0x2025"));
-        assert!(batch.contains("add rule inet varmlen_bypass mangle ip6 daddr 2001:db8::7 meta mark set 0x2025"));
-        assert!(batch.contains("add rule inet varmlen_bypass mangle udp sport 27015 meta mark set 0x2025"));
+        assert!(batch.contains(
+            "add rule inet varmlen_bypass mangle ip daddr 91.92.43.10 meta mark set 0x2025"
+        ));
+        assert!(batch.contains(
+            "add rule inet varmlen_bypass mangle ip6 daddr 2001:db8::7 meta mark set 0x2025"
+        ));
+        assert!(batch
+            .contains("add rule inet varmlen_bypass mangle udp sport 27015 meta mark set 0x2025"));
     }
 
     #[test]
@@ -1432,10 +1516,34 @@ mod tests {
     #[test]
     fn id_matches_plain_names() {
         // Browsers / native apps: comm or exe basename equals the id.
-        assert!(id_matches("firefox", "firefox", "/usr/lib/firefox/firefox", "firefox", ""));
-        assert!(id_matches("cs2", "cs2", "/home/u/steam/cs2/cs2", "cs2", "cs2"));
-        assert!(!id_matches("firefox", "chrome", "/opt/chrome/chrome", "chrome", "chrome"));
-        assert!(!id_matches("", "firefox", "/usr/bin/firefox", "firefox", "firefox"));
+        assert!(id_matches(
+            "firefox",
+            "firefox",
+            "/usr/lib/firefox/firefox",
+            "firefox",
+            ""
+        ));
+        assert!(id_matches(
+            "cs2",
+            "cs2",
+            "/home/u/steam/cs2/cs2",
+            "cs2",
+            "cs2"
+        ));
+        assert!(!id_matches(
+            "firefox",
+            "chrome",
+            "/opt/chrome/chrome",
+            "chrome",
+            "chrome"
+        ));
+        assert!(!id_matches(
+            "",
+            "firefox",
+            "/usr/bin/firefox",
+            "firefox",
+            "firefox"
+        ));
     }
 
     #[test]
@@ -1505,7 +1613,10 @@ mod tests {
     #[test]
     fn arg0_basename_handles_unix_and_windows_paths() {
         assert_eq!(arg0_basename(b"/usr/bin/firefox\0-new-tab\0"), "firefox");
-        assert_eq!(arg0_basename(b"Z:\\Games\\PUBG\\TslGame.exe\0-windowed\0"), "TslGame.exe");
+        assert_eq!(
+            arg0_basename(b"Z:\\Games\\PUBG\\TslGame.exe\0-windowed\0"),
+            "TslGame.exe"
+        );
         assert_eq!(arg0_basename(b"C:/Games/Game.exe\0"), "Game.exe");
         assert_eq!(arg0_basename(b"game.exe\0"), "game.exe");
         assert_eq!(arg0_basename(b""), "");

@@ -2,13 +2,14 @@ use std::io;
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::sync::RwLock;
 
 use crate::protocol::{
-    decode_request_frame, encode_frame, DaemonError, DaemonErrorCode, DaemonState,
-    ResponseEnvelope, PROTOCOL_VERSION, MAX_FRAME_BYTES,
+    decode_request_frame, encode_frame, DaemonCommand, DaemonError, DaemonErrorCode, DaemonState,
+    ResponseEnvelope, MAX_FRAME_BYTES, PROTOCOL_VERSION,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -90,10 +91,38 @@ pub async fn write_response(
         .map_err(|_| DaemonErrorCode::Internal)
 }
 
+#[async_trait]
+pub trait CommandHandler: Send + Sync {
+    async fn handle(&self, command: DaemonCommand) -> Result<DaemonState, DaemonError>;
+}
+
+pub struct SnapshotHandler {
+    state: Arc<RwLock<DaemonState>>,
+}
+
+impl SnapshotHandler {
+    pub fn new(state: Arc<RwLock<DaemonState>>) -> Self {
+        Self { state }
+    }
+}
+
+#[async_trait]
+impl CommandHandler for SnapshotHandler {
+    async fn handle(&self, command: DaemonCommand) -> Result<DaemonState, DaemonError> {
+        match command {
+            DaemonCommand::Status => Ok(self.state.read().await.clone()),
+            DaemonCommand::Connect(_) | DaemonCommand::Disconnect => Err(DaemonError::new(
+                DaemonErrorCode::Internal,
+                "VPN lifecycle controller is unavailable",
+            )),
+        }
+    }
+}
+
 pub async fn serve_connection(
     mut stream: UnixStream,
     policy: PeerPolicy,
-    state: Arc<RwLock<DaemonState>>,
+    handler: Arc<dyn CommandHandler>,
 ) -> Result<(), DaemonErrorCode> {
     let uid = peer_uid(&stream).map_err(|_| DaemonErrorCode::Unauthorized)?;
     if !policy.authorize(uid) {
@@ -124,7 +153,7 @@ pub async fn serve_connection(
         let response = ResponseEnvelope {
             version: PROTOCOL_VERSION,
             operation_id: request.operation_id,
-            result: Ok(state.read().await.clone()),
+            result: handler.handle(request.command).await,
         };
         write_response(&mut stream, &response).await?;
     }
@@ -138,7 +167,7 @@ mod tests {
     use tokio::net::UnixStream;
     use tokio::sync::RwLock;
 
-    use super::{serve_connection, PeerPolicy};
+    use super::{serve_connection, PeerPolicy, SnapshotHandler};
     use crate::protocol::{
         decode_response_frame, encode_frame, ConnectionPhase, DaemonCommand, DaemonState,
         RequestEnvelope, PROTOCOL_VERSION,
@@ -152,10 +181,11 @@ mod tests {
             split_active: false,
             dns_protected: false,
         }));
+        let handler = Arc::new(SnapshotHandler::new(state));
         let server_task = tokio::spawn(serve_connection(
             server,
             PeerPolicy::new(unsafe { libc::getuid() }),
-            state,
+            handler,
         ));
         let request = RequestEnvelope::new(PROTOCOL_VERSION, 9, DaemonCommand::Status);
         let bytes = encode_frame(&request).unwrap();

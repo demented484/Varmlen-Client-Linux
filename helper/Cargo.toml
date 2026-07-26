@@ -1,12 +1,12 @@
 [package]
-name = "varmlen-probe"
-version = "0.0.3"
+name = "varmlen-net"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
-description = "Small setcap'd helper for Varmlen: tunnel-bypass latency probes, killswitch, TUN cleanup"
+description = "Root-invoked network transaction helper for the Varmlen daemon"
 
 [[bin]]
-name = "varmlen-probe"
+name = "varmlen-net"
 path = "src/main.rs"
 
 [dependencies]
@@ -14,6 +14,6 @@ libc = "0.2"
 # SO_MARK + SO_BINDTODEVICE for probes that must bypass the tun (traffic routes
 # into the tun by destination, so a plain source bind isn't enough).
 socket2 = { version = "0.5", features = ["all"] }
-# Raise CAP_NET_ADMIN into the ambient set so the `ip`/`nft` child processes we
-# spawn inherit it — file capabilities alone do NOT propagate across execve.
+# The installed helper runs only as a child of the root-owned daemon. The caps
+# crate remains for harmless compatibility with direct root diagnostics.
 caps = "0.5"

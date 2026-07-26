@@ -152,10 +152,7 @@ mod tests {
         symlink(&target, &state_path).unwrap();
         let store = StateStore::new(state_path);
         assert!(store
-            .write(&PersistedState::new(
-                1000,
-                ConnectionPhase::Disconnected
-            ))
+            .write(&PersistedState::new(1000, ConnectionPhase::Disconnected))
             .is_err());
         assert_eq!(std::fs::read(&target).unwrap(), b"do not touch");
     }

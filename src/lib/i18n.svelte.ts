@@ -159,7 +159,7 @@ const EN: Dict = {
   "core.reinstall": "Re-download",
   "core.delete": "Delete",
 
-  // Network permissions (setcap on the cores; no root daemon)
+  // Root-owned Linux networking service
   "settings.helper": "Network permissions",
   "helper.title": "Network permissions",
   "helper.ready": "Granted",

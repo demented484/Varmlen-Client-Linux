@@ -5,8 +5,6 @@ mod daemon_client;
 #[cfg(target_os = "android")]
 mod mobile_vpn;
 mod split;
-#[cfg(target_os = "linux")]
-mod split_bypass;
 mod storage;
 mod subscription;
 mod tray;
@@ -29,12 +27,6 @@ fn parse_vless_uri(uri: String) -> Result<VlessServer, String> {
 fn parse_subscription_body(body: String) -> Vec<VlessServer> {
     parse_subscription(&body)
 }
-
-/// Fetch and parse a subscription. Returns servers + server-side metadata
-/// (title, update interval, traffic counters, expiry, support URL).
-///
-/// If `url` is a raw `vless://` link, returns a single-server result with
-/// an empty meta block.
 
 /// True for hosts we refuse to fetch (SSRF guard): localhost and literal
 /// loopback / private / link-local / CGNAT addresses. A domain that *resolves*
@@ -66,6 +58,11 @@ fn is_blocked_host(host: &str) -> bool {
     }
 }
 
+/// Fetch and parse a subscription. Returns servers + server-side metadata
+/// (title, update interval, traffic counters, expiry, support URL).
+///
+/// If `url` is a raw `vless://` link, returns a single-server result with
+/// an empty meta block.
 #[tauri::command]
 async fn fetch_subscription(url: String) -> Result<ImportResult, String> {
     let trimmed = url.trim();
@@ -315,7 +312,8 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|_app_handle, _event| {
-            // Desktop: drop the tunnel so xray never outlives the process.
+            // Linux's daemon intentionally outlives the GUI, preserving a
+            // healthy 24/7 tunnel across frontend restarts.
             #[cfg(desktop)]
             if let tauri::RunEvent::Exit = _event {
                 vpn::teardown_on_exit(_app_handle);

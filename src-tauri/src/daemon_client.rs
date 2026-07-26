@@ -1,11 +1,13 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
+use tokio::process::Command;
+use tokio::time::{sleep, Duration};
 use varmlend::protocol::{
-    decode_response_frame, encode_frame, DaemonCommand, DaemonError, DaemonState,
-    RequestEnvelope, MAX_FRAME_BYTES, PROTOCOL_VERSION,
+    decode_response_frame, encode_frame, DaemonCommand, DaemonError, DaemonState, RequestEnvelope,
+    MAX_FRAME_BYTES, PROTOCOL_VERSION,
 };
 
 #[derive(Debug, Error)]
@@ -18,6 +20,8 @@ pub enum ClientError {
     Daemon(varmlend::protocol::DaemonErrorCode, String),
     #[error("daemon response operation ID mismatch")]
     OperationMismatch,
+    #[error("installed daemon is unavailable: {0}")]
+    Unavailable(String),
 }
 
 impl From<DaemonError> for ClientError {
@@ -32,11 +36,56 @@ pub struct DaemonClient {
 }
 
 impl DaemonClient {
+    pub fn installed_socket_path() -> PathBuf {
+        PathBuf::from(format!("/run/varmlen/daemon-{}.sock", unsafe {
+            libc::getuid()
+        }))
+    }
+
     pub async fn connect(path: &Path) -> Result<Self, ClientError> {
         Ok(Self {
             stream: UnixStream::connect(path).await?,
             next_operation_id: 1,
         })
+    }
+
+    pub async fn connect_installed() -> Result<Self, ClientError> {
+        Self::connect(&Self::installed_socket_path()).await
+    }
+
+    pub async fn connect_or_start_installed() -> Result<Self, ClientError> {
+        if let Ok(client) = Self::connect_installed().await {
+            return Ok(client);
+        }
+        const DAEMON: &str = "/usr/libexec/varmlen/varmlend";
+        if !Path::new(DAEMON).is_file() {
+            return Err(ClientError::Unavailable(format!(
+                "{DAEMON} is not installed"
+            )));
+        }
+        let mut child = Command::new("pkexec")
+            .arg(DAEMON)
+            .spawn()
+            .map_err(|error| {
+                ClientError::Unavailable(format!("could not start pkexec: {error}"))
+            })?;
+        for _ in 0..150 {
+            if let Ok(client) = Self::connect_installed().await {
+                tokio::spawn(async move {
+                    let _ = child.wait().await;
+                });
+                return Ok(client);
+            }
+            if let Some(status) = child.try_wait()? {
+                return Err(ClientError::Unavailable(format!(
+                    "daemon startup was cancelled or failed ({status})"
+                )));
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+        Err(ClientError::Unavailable(
+            "timed out waiting for the daemon socket".into(),
+        ))
     }
 
     pub async fn request(&mut self, command: DaemonCommand) -> Result<DaemonState, ClientError> {

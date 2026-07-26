@@ -27,9 +27,15 @@ impl SystemSplitBackend {
     }
 
     fn cgroup(&self) -> Result<&BypassCgroup, SplitError> {
-        self.cgroup
-            .as_ref()
-            .ok_or(SplitError::CgroupUnavailable)
+        self.cgroup.as_ref().ok_or(SplitError::CgroupUnavailable)
+    }
+
+    pub fn is_healthy(&self) -> bool {
+        self.routing_active
+            && self
+                .watcher
+                .as_ref()
+                .is_some_and(PermissionWatcher::is_healthy)
     }
 
     fn selectors(plan: &SplitPlan) -> Result<Vec<AppSelector>, SplitError> {
@@ -93,8 +99,7 @@ impl SplitBackend for SystemSplitBackend {
     }
 
     async fn reconcile_existing(&mut self, _plan: &SplitPlan) -> Result<(), SplitError> {
-        let entries =
-            std::fs::read_dir("/proc").map_err(|_| SplitError::ReconciliationFailed)?;
+        let entries = std::fs::read_dir("/proc").map_err(|_| SplitError::ReconciliationFailed)?;
         for entry in entries.flatten() {
             let Some(pid) = entry
                 .file_name()

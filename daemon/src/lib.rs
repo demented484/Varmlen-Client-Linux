@@ -1,11 +1,13 @@
-pub mod connection;
+pub mod controller;
 pub mod dns;
+pub mod lifecycle;
 pub mod nft;
 pub mod protocol;
 pub mod recovery;
 pub mod server;
 pub mod split;
 pub mod state;
+pub mod system;
 
 #[cfg(test)]
 mod tests {
@@ -13,13 +15,12 @@ mod tests {
         decode_request_frame, encode_frame, validate_request, DaemonCommand, DaemonErrorCode,
         RequestEnvelope, MAX_FRAME_BYTES, PROTOCOL_VERSION,
     };
-    use crate::server::PeerPolicy;
     use crate::server::parse_owner_uid;
+    use crate::server::PeerPolicy;
 
     #[test]
     fn rejects_unknown_protocol_version() {
-        let request =
-            RequestEnvelope::new(PROTOCOL_VERSION + 1, 7, DaemonCommand::Status);
+        let request = RequestEnvelope::new(PROTOCOL_VERSION + 1, 7, DaemonCommand::Status);
         assert_eq!(
             validate_request(&request),
             Err(DaemonErrorCode::UnsupportedVersion)

@@ -75,6 +75,10 @@ impl<B: SplitBackend> SplitManager<B> {
         &self.backend
     }
 
+    pub fn backend_mut(&mut self) -> &mut B {
+        &mut self.backend
+    }
+
     pub async fn apply(&mut self, plan: SplitPlan) -> Result<(), SplitError> {
         let result = async {
             self.backend.create_cgroup(plan.uid).await?;
@@ -127,10 +131,7 @@ mod tests {
             Ok(())
         }
 
-        async fn start_permission_watcher(
-            &mut self,
-            _plan: &SplitPlan,
-        ) -> Result<(), SplitError> {
+        async fn start_permission_watcher(&mut self, _plan: &SplitPlan) -> Result<(), SplitError> {
             if self.fail_watcher {
                 return Err(SplitError::WatcherUnavailable);
             }

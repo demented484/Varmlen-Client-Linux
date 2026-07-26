@@ -3,9 +3,9 @@ use std::process::Stdio;
 
 use tokio::process::Command;
 
+use super::SplitError;
 use crate::nft::apply_ruleset_with_code;
 use crate::protocol::DaemonErrorCode;
-use super::SplitError;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PhysicalRoute {
@@ -163,9 +163,8 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(rules.contains(
-            "socket cgroupv2 level 3 \"varmlen/user-1000/bypass\" meta mark set 0x2025"
-        ));
+        assert!(rules
+            .contains("socket cgroupv2 level 3 \"varmlen/user-1000/bypass\" meta mark set 0x2025"));
         assert!(rules.contains("meta mark 0x2025 oifname \"enp11s0\" masquerade"));
         assert!(!rules.contains("tcp "));
         assert!(!rules.contains("udp "));
