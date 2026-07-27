@@ -126,14 +126,14 @@
     align-items: center;
     gap: 6px;
     padding: 6px 8px 6px 12px;
-    background: var(--bg-elev);
+    background: var(--bg-elev-2);
     border: none;
     border-radius: var(--radius-sm);
     font-size: 13px;
     color: var(--text);
   }
   .trigger:hover {
-    background: var(--bg-elev-2);
+    background: var(--bg-elev-3);
   }
   .trigger-text {
     font-weight: 500;

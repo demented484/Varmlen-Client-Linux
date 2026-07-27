@@ -37,10 +37,6 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 sha2 = "0.10"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
-# Used by the location-ping feature to source-bind TCP probes to the user's
-# physical interface, so latencies reflect the real network even when the VPN
-# tunnel is up (otherwise pings would route through the active server).
-socket2 = "0.5"
 libc = "0.2"
 varmlend = { path = "../daemon" }
 

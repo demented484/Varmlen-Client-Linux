@@ -522,6 +522,29 @@ pub fn build_xray_config(
     })
 }
 
+/// Minimal per-location latency configuration. The temporary Xray only exposes
+/// a loopback SOCKS port and sends every request through the measured server.
+/// `build_proxy_outbound` keeps the 0x2024 mark that escapes the active TUN.
+pub fn build_ping_config(server: &VlessServer, socks_port: u16) -> Value {
+    json!({
+        "log": { "loglevel": "warning" },
+        "inbounds": [{
+            "tag": "socks-in",
+            "listen": "127.0.0.1",
+            "port": socks_port,
+            "protocol": "socks",
+            "settings": { "udp": false, "auth": "noauth" }
+        }],
+        "outbounds": [
+            build_proxy_outbound(server),
+            { "tag": "direct", "protocol": "freedom" }
+        ],
+        "routing": { "rules": [
+            { "type": "field", "network": "tcp,udp", "outboundTag": "proxy" }
+        ] }
+    })
+}
+
 // --- Tauri command ----------------------------------------------------------
 
 /// Build and pretty-print the xray config JSON for inspection / launch.
@@ -710,6 +733,21 @@ mod tests {
             XRAY_DIAL_MARK
         );
         assert_eq!(cfg["outbounds"][1]["protocol"], "freedom");
+    }
+
+    #[test]
+    fn ping_config_uses_requested_loopback_port_and_marked_proxy() {
+        let s =
+            parse_proxy_uri("vless://u@1.2.3.4:443?type=xhttp&security=reality&pbk=K#X").unwrap();
+        let cfg = build_ping_config(&s, 32_000);
+        assert_eq!(cfg["inbounds"][0]["listen"], "127.0.0.1");
+        assert_eq!(cfg["inbounds"][0]["port"], 32_000);
+        assert_eq!(cfg["outbounds"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            cfg["outbounds"][0]["streamSettings"]["sockopt"]["mark"],
+            XRAY_DIAL_MARK
+        );
+        assert_eq!(cfg["routing"]["rules"][0]["outboundTag"], "proxy");
     }
 
     #[test]

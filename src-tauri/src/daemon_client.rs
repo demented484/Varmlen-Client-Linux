@@ -170,6 +170,7 @@ mod tests {
                         phase: ConnectionPhase::Disconnected,
                         split_active: false,
                         dns_protected: false,
+                        rtt_ms: None,
                     }),
                 },
             )

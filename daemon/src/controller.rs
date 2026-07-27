@@ -57,11 +57,28 @@ impl SystemController {
 #[async_trait]
 impl CommandHandler for SystemController {
     async fn handle(&self, command: DaemonCommand) -> Result<DaemonState, DaemonError> {
+        match command {
+            DaemonCommand::TcpPing(request) => {
+                let rtt = crate::system::run_tcp_ping(&request).await?;
+                let mut state = self.manager.lock().await.state().clone();
+                state.rtt_ms = Some(rtt);
+                return Ok(state);
+            }
+            DaemonCommand::ProxyPing(request) => {
+                let rtt = crate::system::run_proxy_ping(self.owner_uid, &request).await?;
+                let mut state = self.manager.lock().await.state().clone();
+                state.rtt_ms = Some(rtt);
+                return Ok(state);
+            }
+            _ => {}
+        }
+
         let mut manager = self.manager.lock().await;
         let result = match command {
             DaemonCommand::Status => manager.reconcile_health().await,
             DaemonCommand::Connect(request) => manager.connect(request).await,
             DaemonCommand::Disconnect => manager.disconnect().await,
+            DaemonCommand::TcpPing(_) | DaemonCommand::ProxyPing(_) => unreachable!(),
         };
         self.persist(&mut manager)?;
         result

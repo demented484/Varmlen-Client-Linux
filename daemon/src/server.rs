@@ -111,7 +111,10 @@ impl CommandHandler for SnapshotHandler {
     async fn handle(&self, command: DaemonCommand) -> Result<DaemonState, DaemonError> {
         match command {
             DaemonCommand::Status => Ok(self.state.read().await.clone()),
-            DaemonCommand::Connect(_) | DaemonCommand::Disconnect => Err(DaemonError::new(
+            DaemonCommand::Connect(_)
+            | DaemonCommand::Disconnect
+            | DaemonCommand::TcpPing(_)
+            | DaemonCommand::ProxyPing(_) => Err(DaemonError::new(
                 DaemonErrorCode::Internal,
                 "VPN lifecycle controller is unavailable",
             )),
@@ -180,6 +183,7 @@ mod tests {
             phase: ConnectionPhase::RecoveryRequired,
             split_active: false,
             dns_protected: false,
+            rtt_ms: None,
         }));
         let handler = Arc::new(SnapshotHandler::new(state));
         let server_task = tokio::spawn(serve_connection(

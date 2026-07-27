@@ -2,15 +2,18 @@ use std::fs::{self, OpenOptions};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use serde_json::Value;
 use tokio::process::{Child, Command};
-use tokio::time::{sleep, timeout, Duration};
+use tokio::time::{sleep, timeout, Duration, Instant};
 
 use crate::dns::{DnsBackend, DnsGuard, SystemDnsBackend};
 use crate::lifecycle::LifecycleBackend;
-use crate::protocol::{ConnectRequest, ConnectionMode, DaemonError, DaemonErrorCode};
+use crate::protocol::{
+    ConnectRequest, ConnectionMode, DaemonError, DaemonErrorCode, ProxyPingRequest, TcpPingRequest,
+};
 use crate::recovery::ProcessIdentity;
 use crate::split::system::SystemSplitBackend;
 use crate::split::{SplitBackend, SplitManager, SplitPlan};
@@ -19,6 +22,184 @@ pub const INSTALLED_XRAY: &str = "/usr/libexec/varmlen/xray";
 pub const INSTALLED_NET_HELPER: &str = "/usr/libexec/varmlen/varmlen-net";
 const TUN_INTERFACE: &str = "varmlen0";
 const PROXY_PORT: u16 = 2081;
+const XRAY_DIAL_MARK: u64 = 0x2024;
+static PING_CONFIG_ID: AtomicU64 = AtomicU64::new(1);
+
+pub async fn run_tcp_ping(request: &TcpPingRequest) -> Result<u32, DaemonError> {
+    let helper = Path::new(INSTALLED_NET_HELPER);
+    ensure_trusted_binary(helper)?;
+    let output = timeout(
+        Duration::from_millis(request.timeout_ms as u64 + 500),
+        Command::new(helper)
+            .args([
+                "tcp",
+                &request.host,
+                &request.port.to_string(),
+                &request.timeout_ms.to_string(),
+            ])
+            .env_clear()
+            .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
+            .output(),
+    )
+    .await
+    .map_err(|_| DaemonError::new(DaemonErrorCode::PingFailed, "TCP ping timed out"))?
+    .map_err(|error| {
+        DaemonError::new(
+            DaemonErrorCode::PingFailed,
+            format!("could not start network ping helper: {error}"),
+        )
+    })?;
+    if !output.status.success() {
+        return Err(DaemonError::new(
+            DaemonErrorCode::PingFailed,
+            format!(
+                "TCP ping failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        ));
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<u32>()
+        .map_err(|_| {
+            DaemonError::new(
+                DaemonErrorCode::PingFailed,
+                "network ping helper returned an invalid RTT",
+            )
+        })
+}
+
+pub async fn run_proxy_ping(
+    owner_uid: u32,
+    request: &ProxyPingRequest,
+) -> Result<u32, DaemonError> {
+    let xray = Path::new(INSTALLED_XRAY);
+    ensure_trusted_binary(xray)?;
+    validate_ping_xray_document(&request.xray_config, request.socks_port)?;
+
+    let runtime_dir = PathBuf::from(format!("/run/varmlen/user-{owner_uid}"));
+    fs::create_dir_all(&runtime_dir).map_err(internal_io("create ping runtime directory"))?;
+    fs::set_permissions(&runtime_dir, fs::Permissions::from_mode(0o700))
+        .map_err(internal_io("secure ping runtime directory"))?;
+    let sequence = PING_CONFIG_ID.fetch_add(1, Ordering::Relaxed);
+    let config_path = runtime_dir.join(format!(
+        "ping-{}-{}-{sequence}.json",
+        request.socks_port,
+        std::process::id()
+    ));
+    write_private_file(&config_path, &request.xray_config)?;
+
+    let mut child = match Command::new(xray)
+        .args(["run", "-c"])
+        .arg(&config_path)
+        .env_clear()
+        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = fs::remove_file(&config_path);
+            return Err(DaemonError::new(
+                DaemonErrorCode::PingFailed,
+                format!("could not start ping Xray: {error}"),
+            ));
+        }
+    };
+
+    let port = request.socks_port;
+    let operation = async {
+        loop {
+            if child.try_wait().is_ok_and(|status| status.is_some()) {
+                return Err(DaemonError::new(
+                    DaemonErrorCode::PingFailed,
+                    "ping Xray exited before its SOCKS listener was ready",
+                ));
+            }
+            if timeout(
+                Duration::from_millis(100),
+                tokio::net::TcpStream::connect(("127.0.0.1", port)),
+            )
+            .await
+            .is_ok_and(|result| result.is_ok())
+            {
+                break;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+
+        let client = reqwest::Client::builder()
+            .proxy(
+                reqwest::Proxy::all(format!("socks5h://127.0.0.1:{port}")).map_err(|error| {
+                    DaemonError::new(
+                        DaemonErrorCode::PingFailed,
+                        format!("could not configure ping proxy: {error}"),
+                    )
+                })?,
+            )
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|error| {
+                DaemonError::new(
+                    DaemonErrorCode::PingFailed,
+                    format!("could not build ping HTTP client: {error}"),
+                )
+            })?;
+        let started = Instant::now();
+        let response = client
+            .get("http://cp.cloudflare.com/generate_204")
+            .send()
+            .await
+            .map_err(|error| {
+                DaemonError::new(
+                    DaemonErrorCode::PingFailed,
+                    format!("HTTP ping failed: {error}"),
+                )
+            })?;
+        if response.status().as_u16() != 204 {
+            return Err(DaemonError::new(
+                DaemonErrorCode::PingFailed,
+                format!("HTTP ping returned status {}", response.status()),
+            ));
+        }
+        Ok(started.elapsed().as_millis().min(u32::MAX as u128) as u32)
+    };
+
+    let result = timeout(Duration::from_millis(request.timeout_ms.into()), operation)
+        .await
+        .map_err(|_| DaemonError::new(DaemonErrorCode::PingFailed, "HTTP ping timed out"))
+        .and_then(|result| result);
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+    let _ = fs::remove_file(&config_path);
+    result
+}
+
+fn write_private_file(path: &Path, content: &str) -> Result<(), DaemonError> {
+    let temporary = path.with_extension(format!(
+        "tmp-{}-{}",
+        std::process::id(),
+        PING_CONFIG_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&temporary)?;
+        std::io::Write::write_all(&mut file, content.as_bytes())?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)?;
+        Ok::<(), std::io::Error>(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result.map_err(internal_io("write private ping configuration"))
+}
 
 pub struct SystemLifecycleBackend {
     owner_uid: u32,
@@ -595,6 +776,131 @@ pub fn validate_xray_document(raw: &str, expects_tun: bool) -> Result<(), Daemon
     Ok(())
 }
 
+pub fn validate_ping_xray_document(raw: &str, socks_port: u16) -> Result<(), DaemonError> {
+    let document: Value = serde_json::from_str(raw).map_err(|error| {
+        DaemonError::new(
+            DaemonErrorCode::InvalidRequest,
+            format!("invalid ping Xray JSON: {error}"),
+        )
+    })?;
+    let object = document.as_object().ok_or_else(|| {
+        DaemonError::new(
+            DaemonErrorCode::InvalidRequest,
+            "ping Xray configuration must be an object",
+        )
+    })?;
+    if object
+        .keys()
+        .any(|key| !matches!(key.as_str(), "log" | "inbounds" | "outbounds" | "routing"))
+    {
+        return Err(DaemonError::new(
+            DaemonErrorCode::InvalidRequest,
+            "ping Xray configuration contains an unsupported privileged section",
+        ));
+    }
+    let log = object
+        .get("log")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            DaemonError::new(DaemonErrorCode::InvalidRequest, "ping Xray log is missing")
+        })?;
+    if log.keys().any(|key| key != "loglevel") {
+        return Err(DaemonError::new(
+            DaemonErrorCode::InvalidRequest,
+            "ping Xray file logging is not permitted",
+        ));
+    }
+
+    let inbounds = object
+        .get("inbounds")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            DaemonError::new(
+                DaemonErrorCode::InvalidRequest,
+                "ping Xray inbound is missing",
+            )
+        })?;
+    if inbounds.len() != 1 {
+        return Err(DaemonError::new(
+            DaemonErrorCode::InvalidRequest,
+            "ping Xray must contain exactly one inbound",
+        ));
+    }
+    let inbound = &inbounds[0];
+    if inbound.get("tag").and_then(Value::as_str) != Some("socks-in")
+        || inbound.get("protocol").and_then(Value::as_str) != Some("socks")
+        || inbound.get("listen").and_then(Value::as_str) != Some("127.0.0.1")
+        || inbound.get("port").and_then(Value::as_u64) != Some(socks_port.into())
+        || inbound.pointer("/settings/auth").and_then(Value::as_str) != Some("noauth")
+        || inbound.pointer("/settings/udp").and_then(Value::as_bool) != Some(false)
+    {
+        return Err(DaemonError::new(
+            DaemonErrorCode::InvalidRequest,
+            "ping Xray SOCKS inbound must be loopback-only on the requested port",
+        ));
+    }
+
+    let outbounds = object
+        .get("outbounds")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            DaemonError::new(
+                DaemonErrorCode::InvalidRequest,
+                "ping Xray outbounds are missing",
+            )
+        })?;
+    let proxy_protocol = outbounds
+        .first()
+        .and_then(|outbound| outbound.get("protocol"))
+        .and_then(Value::as_str);
+    let proxy_mark = outbounds
+        .first()
+        .and_then(|outbound| outbound.pointer("/streamSettings/sockopt/mark"))
+        .and_then(Value::as_u64);
+    if outbounds.len() != 2
+        || !matches!(
+            proxy_protocol,
+            Some("vless" | "vmess" | "trojan" | "shadowsocks")
+        )
+        || outbounds[0].get("tag").and_then(Value::as_str) != Some("proxy")
+        || proxy_mark != Some(XRAY_DIAL_MARK)
+        || outbounds[1].get("tag").and_then(Value::as_str) != Some("direct")
+        || outbounds[1].get("protocol").and_then(Value::as_str) != Some("freedom")
+    {
+        return Err(DaemonError::new(
+            DaemonErrorCode::InvalidRequest,
+            "ping Xray outbound set or bypass mark is not permitted",
+        ));
+    }
+
+    let rules = document
+        .pointer("/routing/rules")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            DaemonError::new(
+                DaemonErrorCode::InvalidRequest,
+                "ping Xray routing rule is missing",
+            )
+        })?;
+    if rules.len() != 1
+        || rules[0].get("type").and_then(Value::as_str) != Some("field")
+        || rules[0].get("network").and_then(Value::as_str) != Some("tcp,udp")
+        || rules[0].get("outboundTag").and_then(Value::as_str) != Some("proxy")
+    {
+        return Err(DaemonError::new(
+            DaemonErrorCode::InvalidRequest,
+            "ping Xray must route every request through the measured server",
+        ));
+    }
+    if contains_forbidden_file_key(&document) {
+        return Err(DaemonError::new(
+            DaemonErrorCode::InvalidRequest,
+            "ping Xray configuration may not reference privileged files",
+        ));
+    }
+    Ok(())
+}
+
 fn inbound_by_tag<'a>(
     inbounds: &'a [Value],
     tag: &str,
@@ -631,7 +937,7 @@ fn contains_forbidden_file_key(value: &Value) -> bool {
 mod tests {
     use serde_json::json;
 
-    use super::validate_xray_document;
+    use super::{validate_ping_xray_document, validate_xray_document};
     use crate::protocol::DaemonErrorCode;
 
     fn config(data: serde_json::Value) -> String {
@@ -688,6 +994,42 @@ mod tests {
         value["outbounds"][0]["streamSettings"] =
             json!({"tlsSettings": {"certificateFile": "/root/private.pem"}});
         let error = validate_xray_document(&value.to_string(), false).unwrap_err();
+        assert_eq!(error.code, DaemonErrorCode::InvalidRequest);
+    }
+
+    #[test]
+    fn ping_config_is_loopback_only_and_requires_the_dial_mark() {
+        let raw = json!({
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+                "tag": "socks-in",
+                "listen": "127.0.0.1",
+                "port": 32000,
+                "protocol": "socks",
+                "settings": {"udp": false, "auth": "noauth"}
+            }],
+            "outbounds": [
+                {
+                    "tag": "proxy",
+                    "protocol": "vless",
+                    "streamSettings": {"sockopt": {"mark": 0x2024}}
+                },
+                {"tag": "direct", "protocol": "freedom"}
+            ],
+            "routing": {"rules": [
+                {"type": "field", "network": "tcp,udp", "outboundTag": "proxy"}
+            ]}
+        });
+        assert!(validate_ping_xray_document(&raw.to_string(), 32_000).is_ok());
+
+        let mut unmarked = raw.clone();
+        unmarked["outbounds"][0]["streamSettings"]["sockopt"]["mark"] = json!(0);
+        let error = validate_ping_xray_document(&unmarked.to_string(), 32_000).unwrap_err();
+        assert_eq!(error.code, DaemonErrorCode::InvalidRequest);
+
+        let mut exposed = raw;
+        exposed["inbounds"][0]["listen"] = json!("0.0.0.0");
+        let error = validate_ping_xray_document(&exposed.to_string(), 32_000).unwrap_err();
         assert_eq!(error.code, DaemonErrorCode::InvalidRequest);
     }
 }

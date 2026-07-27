@@ -7,6 +7,9 @@ const MAX_CONFIG_BYTES: usize = 384 * 1024;
 const MAX_SERVER_IPS: usize = 16;
 const MAX_EXCLUDED_APPS: usize = 256;
 const MAX_APP_SELECTOR_BYTES: usize = 4096;
+const MAX_PING_HOST_BYTES: usize = 253;
+const MIN_PING_TIMEOUT_MS: u32 = 100;
+const MAX_PING_TIMEOUT_MS: u32 = 10_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -27,11 +30,27 @@ pub struct ConnectRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TcpPingRequest {
+    pub host: String,
+    pub port: u16,
+    pub timeout_ms: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProxyPingRequest {
+    pub xray_config: String,
+    pub socks_port: u16,
+    pub timeout_ms: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DaemonCommand {
     Status,
     Connect(ConnectRequest),
     Disconnect,
+    TcpPing(TcpPingRequest),
+    ProxyPing(ProxyPingRequest),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,6 +86,8 @@ pub struct DaemonState {
     pub phase: ConnectionPhase,
     pub split_active: bool,
     pub dns_protected: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rtt_ms: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,6 +110,7 @@ pub enum DaemonErrorCode {
     XrayValidationFailed,
     XrayStartFailed,
     SplitUnavailable,
+    PingFailed,
     Internal,
 }
 
@@ -118,8 +140,11 @@ pub fn validate_request(request: &RequestEnvelope) -> Result<(), DaemonErrorCode
     if request.version != PROTOCOL_VERSION {
         return Err(DaemonErrorCode::UnsupportedVersion);
     }
-    if let DaemonCommand::Connect(connect) = &request.command {
-        validate_connect_request(connect)?;
+    match &request.command {
+        DaemonCommand::Connect(connect) => validate_connect_request(connect)?,
+        DaemonCommand::TcpPing(ping) => validate_tcp_ping_request(ping)?,
+        DaemonCommand::ProxyPing(ping) => validate_proxy_ping_request(ping)?,
+        DaemonCommand::Status | DaemonCommand::Disconnect => {}
     }
     Ok(())
 }
@@ -138,6 +163,29 @@ pub fn validate_connect_request(request: &ConnectRequest) -> Result<(), DaemonEr
                 || application.contains('\0')
         })
         || (request.mode == ConnectionMode::Proxy && !request.excluded_apps.is_empty())
+    {
+        return Err(DaemonErrorCode::InvalidRequest);
+    }
+    Ok(())
+}
+
+pub fn validate_tcp_ping_request(request: &TcpPingRequest) -> Result<(), DaemonErrorCode> {
+    if request.host.trim().is_empty()
+        || request.host.len() > MAX_PING_HOST_BYTES
+        || request.host.contains('\0')
+        || request.port == 0
+        || !(MIN_PING_TIMEOUT_MS..=MAX_PING_TIMEOUT_MS).contains(&request.timeout_ms)
+    {
+        return Err(DaemonErrorCode::InvalidRequest);
+    }
+    Ok(())
+}
+
+pub fn validate_proxy_ping_request(request: &ProxyPingRequest) -> Result<(), DaemonErrorCode> {
+    if request.xray_config.is_empty()
+        || request.xray_config.len() > MAX_CONFIG_BYTES
+        || request.socks_port == 0
+        || !(MIN_PING_TIMEOUT_MS..=MAX_PING_TIMEOUT_MS).contains(&request.timeout_ms)
     {
         return Err(DaemonErrorCode::InvalidRequest);
     }
@@ -178,7 +226,9 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
     use super::{
-        validate_connect_request, ConnectRequest, ConnectionMode, DaemonErrorCode, PROTOCOL_VERSION,
+        decode_response_frame, validate_connect_request, validate_proxy_ping_request,
+        validate_tcp_ping_request, ConnectRequest, ConnectionMode, ConnectionPhase,
+        DaemonErrorCode, ProxyPingRequest, TcpPingRequest, PROTOCOL_VERSION,
     };
 
     #[test]
@@ -225,5 +275,53 @@ mod tests {
     #[test]
     fn valid_tun_connect_request_is_accepted() {
         assert_eq!(validate_connect_request(&valid_connect()), Ok(()));
+    }
+
+    #[test]
+    fn ping_requests_accept_bounded_inputs_and_reject_unsafe_ones() {
+        let tcp = TcpPingRequest {
+            host: "vpn.example.com".into(),
+            port: 443,
+            timeout_ms: 2_500,
+        };
+        assert_eq!(validate_tcp_ping_request(&tcp), Ok(()));
+
+        let mut invalid_tcp = tcp.clone();
+        invalid_tcp.host = "\0".into();
+        assert_eq!(
+            validate_tcp_ping_request(&invalid_tcp),
+            Err(DaemonErrorCode::InvalidRequest)
+        );
+        invalid_tcp = tcp;
+        invalid_tcp.timeout_ms = 60_000;
+        assert_eq!(
+            validate_tcp_ping_request(&invalid_tcp),
+            Err(DaemonErrorCode::InvalidRequest)
+        );
+
+        let proxy = ProxyPingRequest {
+            xray_config: r#"{"log":{"loglevel":"warning"}}"#.into(),
+            socks_port: 32_000,
+            timeout_ms: 5_000,
+        };
+        assert_eq!(validate_proxy_ping_request(&proxy), Ok(()));
+
+        let mut invalid_proxy = proxy;
+        invalid_proxy.xray_config.clear();
+        assert_eq!(
+            validate_proxy_ping_request(&invalid_proxy),
+            Err(DaemonErrorCode::InvalidRequest)
+        );
+    }
+
+    #[test]
+    fn new_client_accepts_an_old_daemon_state_without_ping_result() {
+        let response = format!(
+            r#"{{"version":{PROTOCOL_VERSION},"operation_id":1,"result":{{"Ok":{{"phase":"connected","split_active":true,"dns_protected":true}}}}}}"#
+        );
+        let decoded = decode_response_frame(response.as_bytes()).unwrap();
+        let state = decoded.result.unwrap();
+        assert_eq!(state.phase, ConnectionPhase::Connected);
+        assert_eq!(state.rtt_ms, None);
     }
 }

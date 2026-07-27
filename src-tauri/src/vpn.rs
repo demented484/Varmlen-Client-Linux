@@ -6,7 +6,6 @@
 
 use std::collections::BTreeSet;
 use std::sync::OnceLock;
-use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -378,24 +377,6 @@ pub async fn grant_caps(app: tauri::AppHandle) -> Result<(), String> {
     }
 }
 
-fn tcp_ping_local(host: &str, port: u16, timeout: Duration) -> Result<u32, String> {
-    use socket2::{Domain, Protocol, SockAddr, Socket, Type};
-    use std::net::{SocketAddr, ToSocketAddrs};
-
-    let destination: SocketAddr = (host, port)
-        .to_socket_addrs()
-        .map_err(|error| format!("resolve: {error}"))?
-        .find(SocketAddr::is_ipv4)
-        .ok_or_else(|| "no IPv4 address".to_string())?;
-    let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
-        .map_err(|error| format!("socket: {error}"))?;
-    let started = Instant::now();
-    socket
-        .connect_timeout(&SockAddr::from(destination), timeout)
-        .map_err(|error| format!("connect: {error}"))?;
-    Ok(started.elapsed().as_millis().min(u32::MAX as u128) as u32)
-}
-
 #[tauri::command]
 pub async fn tcp_ping_host(
     app: tauri::AppHandle,
@@ -403,11 +384,39 @@ pub async fn tcp_ping_host(
     port: u16,
     timeout_ms: Option<u32>,
 ) -> Result<u32, String> {
-    let _ = app;
-    let timeout = Duration::from_millis(timeout_ms.unwrap_or(2500).into());
-    tokio::task::spawn_blocking(move || tcp_ping_local(&host, port, timeout))
-        .await
-        .map_err(|error| format!("ping task: {error}"))?
+    #[cfg(target_os = "linux")]
+    {
+        use varmlend::protocol::{DaemonCommand, TcpPingRequest};
+
+        let mut daemon = crate::daemon_client::DaemonClient::connect_or_start_installed()
+            .await
+            .map_err(|error| error.to_string())?;
+        let state = daemon
+            .request(DaemonCommand::TcpPing(TcpPingRequest {
+                host,
+                port,
+                timeout_ms: timeout_ms.unwrap_or(2500),
+            }))
+            .await
+            .map_err(|error| error.to_string())?;
+        let _ = app;
+        return state
+            .rtt_ms
+            .ok_or_else(|| "daemon did not return a TCP RTT".to_string());
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (app, host, port, timeout_ms);
+        Err("TCP location ping is unavailable on this platform".into())
+    }
+}
+
+fn free_local_port() -> Result<u16, String> {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|listener| listener.local_addr())
+        .map(|address| address.port())
+        .map_err(|error| format!("could not allocate ping port: {error}"))
 }
 
 #[tauri::command]
@@ -416,7 +425,36 @@ pub async fn proxy_get_ping(
     server: VlessServer,
     timeout_ms: Option<u32>,
 ) -> Result<u32, String> {
-    tcp_ping_host(app, server.host, server.port, timeout_ms).await
+    #[cfg(target_os = "linux")]
+    {
+        use varmlend::protocol::{DaemonCommand, ProxyPingRequest};
+
+        let socks_port = free_local_port()?;
+        let xray_config =
+            serde_json::to_string(&crate::xray::build_ping_config(&server, socks_port))
+                .map_err(|error| error.to_string())?;
+        let mut daemon = crate::daemon_client::DaemonClient::connect_or_start_installed()
+            .await
+            .map_err(|error| error.to_string())?;
+        let state = daemon
+            .request(DaemonCommand::ProxyPing(ProxyPingRequest {
+                xray_config,
+                socks_port,
+                timeout_ms: timeout_ms.unwrap_or(5000),
+            }))
+            .await
+            .map_err(|error| error.to_string())?;
+        let _ = app;
+        return state
+            .rtt_ms
+            .ok_or_else(|| "daemon did not return an HTTP RTT".to_string());
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (app, server, timeout_ms);
+        Err("HTTP location ping is unavailable on this platform".into())
+    }
 }
 
 /// The daemon intentionally outlives the GUI, so closing or restarting the
