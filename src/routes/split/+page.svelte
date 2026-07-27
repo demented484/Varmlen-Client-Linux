@@ -522,7 +522,7 @@
     contain-intrinsic-size: auto 52px;
   }
   .picker-row + .picker-row {
-    border-top: none;
+    border-top: 1px solid var(--bg);
   }
   .picker-row:hover:not(:disabled) {
     background: var(--bg-elev-3);
