@@ -1,0 +1,130 @@
+name: Build Linux release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Linux ${{ matrix.asset_arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            rust_target: x86_64-unknown-linux-gnu
+            deb_arch: amd64
+            rpm_arch: x86_64
+            asset_arch: amd64
+          - runner: ubuntu-24.04-arm
+            rust_target: aarch64-unknown-linux-gnu
+            deb_arch: arm64
+            rpm_arch: aarch64
+            asset_arch: arm64
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            build-essential \
+            curl \
+            fakeroot \
+            file \
+            jq \
+            libayatana-appindicator3-dev \
+            libcap2-bin \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            patchelf \
+            rpm \
+            unzip \
+            wget
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify native runner architecture
+        shell: bash
+        run: |
+          actual="$(rustc -vV | sed -n 's/^host: //p')"
+          test "$actual" = "${{ matrix.rust_target }}"
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Run source checks
+        run: |
+          npm test
+          npm run check
+          cargo test --manifest-path daemon/Cargo.toml --locked
+          cargo test --manifest-path src-tauri/Cargo.toml --locked
+          bash scripts/test-install-layout.sh
+          bash scripts/test-fetch-xray-arch.sh
+
+      - name: Fetch matching Xray core
+        env:
+          VARMLEN_TARGET_TRIPLE: ${{ matrix.rust_target }}
+        run: bash scripts/fetch-xray.sh
+
+      - name: Build native bundles
+        env:
+          VARMLEN_TARGET_TRIPLE: ${{ matrix.rust_target }}
+        run: npm run tauri build
+
+      - name: Collect and validate bundles
+        shell: bash
+        run: |
+          mkdir -p "dist/${{ matrix.asset_arch }}"
+          deb="$(find target/release/bundle/deb -maxdepth 1 -type f -name '*.deb' -print -quit)"
+          rpm="$(find target/release/bundle/rpm -maxdepth 1 -type f -name '*.rpm' -print -quit)"
+          appimage="$(find target/release/bundle/appimage -maxdepth 1 -type f -name '*.AppImage' -print -quit)"
+          test -n "$deb"
+          test -n "$rpm"
+          test -n "$appimage"
+
+          install -m 0644 "$deb" \
+            "dist/${{ matrix.asset_arch }}/Varmlen_0.2.5_${{ matrix.asset_arch }}.deb"
+          install -m 0644 "$rpm" \
+            "dist/${{ matrix.asset_arch }}/Varmlen-0.2.5-1.${{ matrix.rpm_arch }}.rpm"
+          install -m 0755 "$appimage" \
+            "dist/${{ matrix.asset_arch }}/Varmlen_0.2.5_${{ matrix.asset_arch }}.AppImage"
+
+          bash scripts/test-linux-package.sh \
+            "dist/${{ matrix.asset_arch }}/Varmlen_0.2.5_${{ matrix.asset_arch }}.deb" \
+            "${{ matrix.deb_arch }}"
+          test "$(rpm -qp --queryformat '%{ARCH}' \
+            "dist/${{ matrix.asset_arch }}/Varmlen-0.2.5-1.${{ matrix.rpm_arch }}.rpm")" \
+            = "${{ matrix.rpm_arch }}"
+
+          file "dist/${{ matrix.asset_arch }}/Varmlen_0.2.5_${{ matrix.asset_arch }}.AppImage" \
+            > "dist/${{ matrix.asset_arch }}/appimage-file.txt"
+          case "${{ matrix.asset_arch }}" in
+            amd64) grep -q "x86-64" "dist/${{ matrix.asset_arch }}/appimage-file.txt" ;;
+            arm64) grep -Eq "ARM aarch64|aarch64" "dist/${{ matrix.asset_arch }}/appimage-file.txt" ;;
+          esac
+          (
+            cd "dist/${{ matrix.asset_arch }}"
+            sha256sum Varmlen* > SHA256SUMS
+          )
+
+      - name: Upload native bundles
+        uses: actions/upload-artifact@v4
+        with:
+          name: varmlen-linux-${{ matrix.asset_arch }}
+          path: dist/${{ matrix.asset_arch }}/
+          if-no-files-found: error
+          retention-days: 14

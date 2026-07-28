@@ -28,4 +28,23 @@ assert_asset s390x-unknown-linux-gnu Xray-linux-s390x.zip
 assert_asset mipsel-unknown-linux-gnu Xray-linux-mips32le.zip
 assert_asset mips64-unknown-linux-gnuabi64 Xray-linux-mips64.zip
 
+WORKFLOW=".github/workflows/release-linux.yml"
+if [ ! -f "$WORKFLOW" ]; then
+  echo "missing native Linux release workflow: $WORKFLOW" >&2
+  exit 1
+fi
+
+for required in \
+  "runner: ubuntu-24.04" \
+  "runner: ubuntu-24.04-arm" \
+  "rust_target: x86_64-unknown-linux-gnu" \
+  "rust_target: aarch64-unknown-linux-gnu" \
+  "asset_arch: amd64" \
+  "asset_arch: arm64"; do
+  if ! grep -Fq "$required" "$WORKFLOW"; then
+    echo "release workflow is missing: $required" >&2
+    exit 1
+  fi
+done
+
 echo "Xray target architecture mapping: PASS"

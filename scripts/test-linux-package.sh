@@ -2,10 +2,19 @@
 set -eu
 
 DEB="${1:-target/release/bundle/deb/Varmlen_0.2.5_amd64.deb}"
+EXPECTED_ARCH="${2:-}"
 
 if [ ! -f "$DEB" ]; then
   echo "missing Debian package: $DEB" >&2
   exit 1
+fi
+
+if [ -n "$EXPECTED_ARCH" ]; then
+  ACTUAL_ARCH="$(dpkg-deb -f "$DEB" Architecture)"
+  if [ "$ACTUAL_ARCH" != "$EXPECTED_ARCH" ]; then
+    echo "package architecture: expected $EXPECTED_ARCH, got $ACTUAL_ARCH" >&2
+    exit 1
+  fi
 fi
 
 LISTING="$(mktemp)"
