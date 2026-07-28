@@ -351,44 +351,6 @@ pub async fn open_notification_settings(app: tauri::AppHandle) -> Result<(), Str
 }
 
 #[tauri::command]
-pub async fn caps_granted(app: tauri::AppHandle) -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        let _ = app;
-        varmlend::system::ensure_trusted_binary(std::path::Path::new(
-            varmlend::system::INSTALLED_XRAY,
-        ))
-        .is_ok()
-            && varmlend::system::ensure_trusted_binary(std::path::Path::new(
-                varmlend::system::INSTALLED_NET_HELPER,
-            ))
-            .is_ok()
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = app;
-        true
-    }
-}
-
-#[tauri::command]
-pub async fn grant_caps(app: tauri::AppHandle) -> Result<(), String> {
-    #[cfg(target_os = "linux")]
-    {
-        let _ = app;
-        crate::daemon_client::DaemonClient::connect_or_start_installed()
-            .await
-            .map(|_| ())
-            .map_err(|error| error.to_string())
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = app;
-        Ok(())
-    }
-}
-
-#[tauri::command]
 pub async fn tcp_ping_host(
     app: tauri::AppHandle,
     host: String,

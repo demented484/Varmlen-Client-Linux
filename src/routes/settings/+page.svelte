@@ -4,7 +4,7 @@
   import type { SubscriptionUserAgent } from "$lib/subscription-user-agent";
   import { i18n, t, LANGUAGES, type Lang } from "$lib/i18n.svelte";
   import { core } from "$lib/core.svelte";
-  import { capsGranted, grantCaps, autostartStatus, setAutostart, vpnLog, clearVpnLog, notificationsEnabled, openNotificationSettings } from "$lib/api";
+  import { autostartStatus, setAutostart, vpnLog, clearVpnLog, notificationsEnabled, openNotificationSettings } from "$lib/api";
   import Dropdown from "$lib/components/Dropdown.svelte";
   import { onMount, tick } from "svelte";
   import { isAndroid } from "$lib/platform";
@@ -166,50 +166,6 @@
   // Refresh the core's status when Settings opens (cheap GitHub check).
   $effect(() => {
     void core.check();
-  });
-
-  /** Tri-state so we don't flash "Not installed" while the very first check
-   *  is still in flight (the helper check is async but the section paints
-   *  instantly). "checking" renders the neutral yellow dot + a soft label
-   *  until we actually know. */
-  type HelperState = "checking" | "ok" | "missing";
-  let helperState = $state<HelperState>("checking");
-  let helperBusy = $state(false);
-  let helperErr = $state<string | null>(null);
-
-  async function refreshHelper(allowChecking = false) {
-    if (allowChecking) helperState = "checking";
-    try {
-      helperState = (await capsGranted()) ? "ok" : "missing";
-    } catch {
-      helperState = "missing";
-    }
-  }
-  $effect(() => {
-    void refreshHelper(true);
-  });
-
-  async function setupHelper() {
-    helperBusy = true;
-    helperErr = null;
-    try {
-      await grantCaps();
-      for (let i = 0; i < 10; i++) {
-        await refreshHelper();
-        if (helperState === "ok") break;
-        await new Promise((r) => setTimeout(r, 250));
-      }
-    } catch (e) {
-      helperErr = e instanceof Error ? e.message : String(e);
-    } finally {
-      helperBusy = false;
-    }
-  }
-
-  const helperStatus = $derived.by(() => {
-    if (helperState === "checking") return t("helper.checking");
-    if (helperState === "ok") return t("helper.ready");
-    return helperErr ?? t("helper.notInstalled");
   });
 
   // The versions modal is shared by both cores; `activeCore` is whichever the
@@ -660,44 +616,6 @@
     </div>
   </section>
 
-  <!-- Network permissions (file caps via pkexec) are a desktop concept; on
-       Android the VPN consent dialog handles permission per-connect. -->
-  {#if !isAndroid}
-  <section>
-    <h2>{t("settings.helper")}</h2>
-    <div class="list">
-      <div class="row">
-        <span
-          class="status-dot"
-          class:on={helperState === "ok" && !helperBusy}
-          class:off={helperState === "missing" && !helperBusy}
-          class:busy={helperState === "checking" || helperBusy}
-        ></span>
-        <div class="row-text">
-          <div class="row-title">{t("helper.title")}</div>
-          <div class="row-sub muted">{helperStatus}</div>
-        </div>
-        {#if helperState !== "checking"}
-          <button
-            class="btn {helperState === "ok" ? '' : 'btn-primary'}"
-            onclick={setupHelper}
-            disabled={helperBusy}
-          >
-            {helperBusy
-              ? t("helper.installing")
-              : helperState === "ok"
-                ? t("helper.reinstall")
-                : t("helper.install")}
-          </button>
-        {/if}
-      </div>
-      {#if helperErr}
-        <div class="row-sub" style="color: var(--danger); padding: 6px 14px;">{helperErr}</div>
-      {/if}
-    </div>
-  </section>
-  {/if}
-
   <footer class="app-version muted">Varmlen {appVersion}</footer>
 </main>
 
@@ -944,30 +862,6 @@
   }
   .row-title { font-size: 14px; }
   .row-sub { font-size: 12px; margin-top: 2px; }
-
-  .status-dot {
-    width: 9px;
-    height: 9px;
-    border-radius: 50%;
-    flex-shrink: 0;
-    margin-right: 2px;
-  }
-  .status-dot.on {
-    background: #2eb872;
-    box-shadow: 0 0 0 3px rgba(46, 184, 114, 0.18);
-  }
-  .status-dot.off {
-    background: var(--danger);
-    box-shadow: 0 0 0 3px var(--danger-faint);
-  }
-  .status-dot.busy {
-    background: var(--warn);
-    box-shadow: 0 0 0 3px rgba(245, 165, 36, 0.22);
-    animation: status-pulse 1.2s ease-in-out infinite;
-  }
-  @keyframes status-pulse {
-    50% { opacity: 0.45; }
-  }
 
   /* ---------- version-picker modal ---------- */
   .modal-backdrop {

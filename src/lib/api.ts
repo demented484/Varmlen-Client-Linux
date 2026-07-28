@@ -208,8 +208,8 @@ export interface HelperResponse {
   error: string | null;
 }
 
-/** Connect in the given mode: "tun" (full system, via the root helper) or
- *  "proxy" (local SOCKS/HTTP, run as the user — no root). */
+/** Connect in the given mode: "tun" (full system through a virtual network
+ *  interface) or "proxy" (local SOCKS proxy managed by the Linux daemon). */
 export function vpnConnect(
   server: VlessServer,
   split: SplitInput,
@@ -263,16 +263,6 @@ export function clearVpnLog(): Promise<void> {
 
 export function vpnStatus(): Promise<HelperResponse> {
   return invoke<HelperResponse>("vpn_status");
-}
-
-/** Whether the root-owned Linux networking components are installed. */
-export function capsGranted(): Promise<boolean> {
-  return invoke<boolean>("caps_granted");
-}
-
-/** Start the installed Linux daemon through one retained polkit authorization. */
-export function grantCaps(): Promise<void> {
-  return invoke<void>("grant_caps");
 }
 
 /** TCP-connect RTT to host:port in ms. Source-bound to the user's physical

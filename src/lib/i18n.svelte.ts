@@ -175,9 +175,9 @@ const EN: Dict = {
   // VPN mode
   "settings.vpnMode": "VPN mode",
   "mode.tun": "TUN (system-wide)",
-  "mode.proxy": "Proxy (SOCKS/HTTP)",
-  "mode.tunSub": "Routes every app. Needs network permissions.",
-  "mode.proxySub": "Local proxy at 127.0.0.1:2081 - no root. Point your apps/system at it.",
+  "mode.proxy": "Proxy (SOCKS)",
+  "mode.tunSub": "Routes all system traffic through a virtual network interface.",
+  "mode.proxySub": "Local SOCKS proxy at 127.0.0.1:2081. Configure apps or the system to use it.",
 
   // VPN core (xray)
   "settings.core": "VPN core",
@@ -205,15 +205,6 @@ const EN: Dict = {
   "core.reinstall": "Re-download",
   "core.delete": "Delete",
 
-  // Root-owned Linux networking service
-  "settings.helper": "Network permissions",
-  "helper.title": "Network permissions",
-  "helper.ready": "Granted",
-  "helper.notInstalled": "Not granted - required for TUN mode",
-  "helper.checking": "Checking…",
-  "helper.install": "Grant",
-  "helper.reinstall": "Re-grant",
-  "helper.installing": "Granting…",
 };
 
 const RU: Dict = {
@@ -375,9 +366,9 @@ const RU: Dict = {
 
   "settings.vpnMode": "Режим VPN",
   "mode.tun": "TUN (всё устройство)",
-  "mode.proxy": "Прокси (SOCKS/HTTP)",
-  "mode.tunSub": "Весь трафик системы. Нужны сетевые права.",
-  "mode.proxySub": "Локальный прокси 127.0.0.1:2081 - без root. Укажи его в приложениях/системе.",
+  "mode.proxy": "Прокси (SOCKS)",
+  "mode.tunSub": "Направляет весь системный трафик через виртуальный сетевой интерфейс.",
+  "mode.proxySub": "Локальный SOCKS-прокси 127.0.0.1:2081. Укажите его в приложениях или системе.",
 
   "settings.core": "Ядро VPN",
   "core.checking": "Проверка обновлений…",
@@ -404,14 +395,6 @@ const RU: Dict = {
   "core.reinstall": "Перекачать",
   "core.delete": "Удалить",
 
-  "settings.helper": "Сетевые права",
-  "helper.title": "Сетевые права",
-  "helper.ready": "Выданы",
-  "helper.notInstalled": "Не выданы - нужны для режима TUN",
-  "helper.checking": "Проверка…",
-  "helper.install": "Выдать",
-  "helper.reinstall": "Выдать заново",
-  "helper.installing": "Выдача…",
 };
 
 const DICTS: Record<Lang, Dict> = { en: EN, ru: RU };
