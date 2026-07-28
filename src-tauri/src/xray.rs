@@ -1801,8 +1801,7 @@ mod tests {
 
     #[test]
     fn proxy_mode_ignores_apps_and_honors_general_sites() {
-        let s =
-            parse_proxy_uri("vless://u@1.2.3.4:443?security=reality&pbk=K#X").unwrap();
+        let s = parse_proxy_uri("vless://u@1.2.3.4:443?security=reality&pbk=K#X").unwrap();
         let sp = SplitInput {
             apps_mode: "general".into(),
             sites_mode: "general".into(),
@@ -1811,24 +1810,16 @@ mod tests {
         };
         let cfg = build_xray_config(&s, &sp, "proxy", TunMode::XrayNative, true, "warning");
         assert!(rule_for(&cfg, "process").is_none());
+        assert_eq!(rule_for(&cfg, "domain").unwrap()["outboundTag"], "direct");
         assert_eq!(
-            rule_for(&cfg, "domain").unwrap()["outboundTag"],
-            "direct"
-        );
-        assert_eq!(
-            cfg["routing"]["rules"]
-                .as_array()
-                .unwrap()
-                .last()
-                .unwrap()["outboundTag"],
+            cfg["routing"]["rules"].as_array().unwrap().last().unwrap()["outboundTag"],
             "proxy"
         );
     }
 
     #[test]
     fn proxy_mode_honors_selective_sites() {
-        let s =
-            parse_proxy_uri("vless://u@1.2.3.4:443?security=reality&pbk=K#X").unwrap();
+        let s = parse_proxy_uri("vless://u@1.2.3.4:443?security=reality&pbk=K#X").unwrap();
         let sp = SplitInput {
             apps_mode: "general".into(),
             sites_mode: "selective".into(),
@@ -1837,16 +1828,9 @@ mod tests {
         };
         let cfg = build_xray_config(&s, &sp, "proxy", TunMode::XrayNative, true, "warning");
         assert!(rule_for(&cfg, "process").is_none());
+        assert_eq!(rule_for(&cfg, "domain").unwrap()["outboundTag"], "proxy");
         assert_eq!(
-            rule_for(&cfg, "domain").unwrap()["outboundTag"],
-            "proxy"
-        );
-        assert_eq!(
-            cfg["routing"]["rules"]
-                .as_array()
-                .unwrap()
-                .last()
-                .unwrap()["outboundTag"],
+            cfg["routing"]["rules"].as_array().unwrap().last().unwrap()["outboundTag"],
             "direct"
         );
     }
