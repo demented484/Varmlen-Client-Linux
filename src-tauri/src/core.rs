@@ -404,18 +404,35 @@ pub async fn list_core_releases(kind: String) -> Result<Vec<CoreRelease>, String
 
 // --- download + install ----------------------------------------------------
 
+/// Translate Rust's target architecture into Xray's release asset naming.
+/// This intentionally covers every Linux architecture published by Xray.
+fn xray_asset_name(arch: &str, little_endian: bool) -> Option<&'static str> {
+    match (arch, little_endian) {
+        ("x86_64", _) => Some("Xray-linux-64.zip"),
+        ("x86", _) => Some("Xray-linux-32.zip"),
+        ("aarch64", _) => Some("Xray-linux-arm64-v8a.zip"),
+        // Rust exposes all 32-bit ARM targets as `arm` at runtime. Varmlen's
+        // supported 32-bit Linux baseline is ARMv7; the build fetcher uses the
+        // full target triple and can additionally bundle v5/v6 assets.
+        ("arm", _) => Some("Xray-linux-arm32-v7a.zip"),
+        ("riscv64", _) => Some("Xray-linux-riscv64.zip"),
+        ("loongarch64", _) => Some("Xray-linux-loong64.zip"),
+        ("powerpc64", true) => Some("Xray-linux-ppc64le.zip"),
+        ("powerpc64", false) => Some("Xray-linux-ppc64.zip"),
+        ("s390x", _) => Some("Xray-linux-s390x.zip"),
+        ("mips", true) | ("mips32r6", true) => Some("Xray-linux-mips32le.zip"),
+        ("mips", false) | ("mips32r6", false) => Some("Xray-linux-mips32.zip"),
+        ("mips64", true) | ("mips64r6", true) => Some("Xray-linux-mips64le.zip"),
+        ("mips64", false) | ("mips64r6", false) => Some("Xray-linux-mips64.zip"),
+        _ => None,
+    }
+}
+
 /// Does the asset name match the OS/arch build we want for this kind?
-/// xray: `Xray-linux-64.zip` (amd64) / `Xray-linux-arm64-v8a.zip`.
 fn asset_matches(kind: CoreKind, name: &str) -> bool {
     match kind {
-        CoreKind::Xray => {
-            // The native-TUN host is Linux only.
-            match std::env::consts::ARCH {
-                "x86_64" => name == "Xray-linux-64.zip",
-                "aarch64" => name == "Xray-linux-arm64-v8a.zip",
-                _ => false,
-            }
-        }
+        CoreKind::Xray => xray_asset_name(std::env::consts::ARCH, cfg!(target_endian = "little"))
+            .is_some_and(|expected| name == expected),
     }
 }
 
@@ -695,6 +712,49 @@ pub async fn core_uninstall(app: AppHandle, kind: String, tag: String) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn xray_assets_cover_supported_linux_architectures() {
+        assert_eq!(xray_asset_name("x86_64", true), Some("Xray-linux-64.zip"));
+        assert_eq!(xray_asset_name("x86", true), Some("Xray-linux-32.zip"));
+        assert_eq!(
+            xray_asset_name("aarch64", true),
+            Some("Xray-linux-arm64-v8a.zip")
+        );
+        assert_eq!(
+            xray_asset_name("arm", true),
+            Some("Xray-linux-arm32-v7a.zip")
+        );
+        assert_eq!(
+            xray_asset_name("riscv64", true),
+            Some("Xray-linux-riscv64.zip")
+        );
+        assert_eq!(
+            xray_asset_name("loongarch64", true),
+            Some("Xray-linux-loong64.zip")
+        );
+        assert_eq!(
+            xray_asset_name("powerpc64", true),
+            Some("Xray-linux-ppc64le.zip")
+        );
+        assert_eq!(
+            xray_asset_name("powerpc64", false),
+            Some("Xray-linux-ppc64.zip")
+        );
+        assert_eq!(
+            xray_asset_name("mips", true),
+            Some("Xray-linux-mips32le.zip")
+        );
+        assert_eq!(
+            xray_asset_name("mips64", false),
+            Some("Xray-linux-mips64.zip")
+        );
+        assert_eq!(
+            xray_asset_name("s390x", false),
+            Some("Xray-linux-s390x.zip")
+        );
+        assert_eq!(xray_asset_name("unknown", true), None);
+    }
 
     #[test]
     fn valid_tag_accepts_versions_and_rejects_traversal() {

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.3
+
+- Send client-family subscription User-Agents as
+  `<client>/<platform>/<architecture>` without an application version.
+- Fix Happ and INCY compatibility with providers such as Proxen that select
+  full Xray JSON profiles only when the client family is slash-delimited.
+- Select bundled and downloadable Xray cores from the Linux target
+  architecture instead of always assuming amd64.
+
 ## 0.2.2
 
 - Preserve complete multi-outbound Xray profiles as one logical location,
