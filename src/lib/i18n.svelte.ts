@@ -130,6 +130,7 @@ const EN: Dict = {
   "split.manualPlaceholder": "Process name (e.g. cs2)",
   "split.chooseFile": "Choose from file…",
   "split.addSelected": "Add ({n})",
+  "split.appsProxyUnavailable": "Per-app split tunnelling is unavailable in Proxy mode. Switch to TUN mode.",
 
   // settings
   "settings.title": "Settings",
@@ -331,6 +332,7 @@ const RU: Dict = {
   "split.manualPlaceholder": "Имя процесса (например cs2)",
   "split.chooseFile": "Выбрать файл…",
   "split.addSelected": "Добавить ({n})",
+  "split.appsProxyUnavailable": "Per-app split-туннелинг недоступен в режиме Proxy. Переключитесь на режим TUN.",
 
   "settings.title": "Настройки",
   "settings.appearance": "Оформление",
