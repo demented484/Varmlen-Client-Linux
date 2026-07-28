@@ -201,7 +201,7 @@ pub fn validate_proxy_ping_request(request: &ProxyPingRequest) -> Result<(), Dae
         || ports.is_empty()
         || ports.len() > MAX_SERVER_IPS
         || ports[0] != request.socks_port
-        || ports.iter().any(|port| *port == 0)
+        || ports.contains(&0)
         || ports
             .iter()
             .enumerate()
