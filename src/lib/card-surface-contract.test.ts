@@ -88,8 +88,17 @@ describe("card surface contract", () => {
     expect(editor).toContain('{#if draft.kind === "json"}');
     expect(editor).toContain("{:else}");
     expect(editor).toContain("rawParams");
+    expect(editor).toContain('import Dropdown from "./Dropdown.svelte";');
+    expect(editor).not.toContain("<select");
     expect(home).toContain('import LocationEditor from "$lib/components/LocationEditor.svelte";');
-    expect(home).toContain("detailFor?.id === server.id ? null : server");
+    expect(home).toContain('class="modal card location-modal"');
+    expect(home).toContain('class="location-editor-scroll"');
+    expect(home).toContain("type ModalKind =");
+    expect(home).toContain('let activeModal = $state<ModalKind>("none")');
+    expect(home).toContain("function closeModal()");
+    expect(home).not.toContain("onclick={() => (jsonFor = null)}");
+    expect(home).not.toContain("onclick={() => (detailFor = null)}");
+    expect(home).not.toContain("onclick={() => (showImport = false)}");
     expect(home).not.toContain("detailRows");
     expect(home).not.toContain("formatLocationJson");
   });

@@ -4,6 +4,8 @@
   import { subs } from "$lib/subs.svelte";
   import { t } from "$lib/i18n.svelte";
   import { readClipboard } from "$lib/api";
+  import { releaseActiveControl } from "$lib/modal-lifecycle";
+  import { modalActionFromTarget } from "$lib/modal-events";
   import { isAndroid } from "$lib/platform";
   import { placePopup, portal } from "$lib/popup";
   import FlagIcon from "$lib/components/FlagIcon.svelte";
@@ -13,11 +15,22 @@
     formatJson,
     isJsonInput,
   } from "$lib/subscription-json";
-  import type { LocationEditDraft } from "$lib/location-draft";
+  import {
+    createLocationDraft,
+    type LocationEditDraft,
+  } from "$lib/location-draft";
 
   import type { Subscription, ServerEntry } from "$lib/subs.svelte";
 
-  let showImport = $state(false);
+  type ModalKind =
+    | "none"
+    | "info"
+    | "details"
+    | "subscription-json"
+    | "rename"
+    | "import";
+
+  let activeModal = $state<ModalKind>("none");
   let importMode = $state<"choose" | "link" | "json">("choose");
   let subUrl = $state("");
   let importError = $state<string | null>(null);
@@ -30,6 +43,9 @@
   let jsonError = $state<string | null>(null);
   let jsonSaving = $state(false);
   let detailFor = $state<ServerEntry | null>(null);
+  let locationDraft = $state<LocationEditDraft>({ kind: "json", source: "" });
+  let locationSaving = $state(false);
+  let locationSaveError = $state<string | null>(null);
   // Fixed-position coords for the "…" menu so it escapes the card's overflow:hidden.
   let menuPos = $state({ top: 0, right: 0 });
 
@@ -65,24 +81,44 @@
     };
   });
 
-  function openInfo(sub: Subscription) {
-    infoFor = sub;
+  function openModal(kind: Exclude<ModalKind, "none">): void {
+    releaseActiveControl();
     openMenuFor = null;
+    activeModal = kind;
   }
-  function openRename(sub: Subscription) {
+
+  function closeModal(): void {
+    releaseActiveControl();
+    activeModal = "none";
+    infoFor = null;
+    renameFor = null;
+    jsonFor = null;
+    detailFor = null;
+  }
+
+  function setImportMode(mode: "choose" | "link" | "json"): void {
+    releaseActiveControl();
+    importMode = mode;
+  }
+
+  function openInfo(sub: Subscription): void {
+    infoFor = sub;
+    openModal("info");
+  }
+  function openRename(sub: Subscription): void {
     renameFor = sub;
     renameDraft = sub.name;
-    openMenuFor = null;
+    openModal("rename");
   }
-  function commitRename() {
+  function commitRename(): void {
     if (renameFor) subs.rename(renameFor.id, renameDraft);
-    renameFor = null;
+    closeModal();
   }
-  function openJson(sub: Subscription) {
+  function openJson(sub: Subscription): void {
     jsonFor = sub;
     jsonDraft = formatJson(sub.sourceJson ?? "{}");
     jsonError = null;
-    openMenuFor = null;
+    openModal("subscription-json");
   }
   async function saveJson(): Promise<void> {
     if (!jsonFor || !jsonDraft.trim()) return;
@@ -90,7 +126,7 @@
     jsonSaving = true;
     try {
       await subs.updateJson(jsonFor.id, jsonDraft);
-      jsonFor = null;
+      closeModal();
     } catch (e) {
       jsonError = e instanceof Error ? e.message : String(e);
     } finally {
@@ -98,12 +134,78 @@
     }
   }
   function openDetails(server: ServerEntry): void {
-    detailFor = detailFor?.id === server.id ? null : server;
+    locationDraft = structuredClone(
+      $state.snapshot(server.editDraft ?? createLocationDraft(server.raw)),
+    );
+    detailFor = server;
+    locationSaveError = null;
+    openModal("details");
   }
-  async function saveLocationDraft(draft: LocationEditDraft): Promise<void> {
+  async function saveLocationDraft(): Promise<void> {
     if (!detailFor) return;
-    await subs.saveServerDraft(detailFor.id, draft);
-    detailFor = null;
+    locationSaveError = null;
+    locationSaving = true;
+    try {
+      await subs.saveServerDraft(
+        detailFor.id,
+        structuredClone($state.snapshot(locationDraft)),
+      );
+      closeModal();
+    } catch (error) {
+      locationSaveError =
+        error instanceof Error ? error.message : String(error);
+    } finally {
+      locationSaving = false;
+    }
+  }
+
+  function handleModalAction(action: string): void {
+    switch (action) {
+      case "close":
+        closeModal();
+        break;
+      case "save-location":
+        void saveLocationDraft();
+        break;
+      case "save-subscription-json":
+        void saveJson();
+        break;
+      case "save-rename":
+        commitRename();
+        break;
+      case "import-clipboard":
+        void importFromClipboard();
+        break;
+      case "import-link":
+        setImportMode("link");
+        break;
+      case "import-json":
+        setImportMode("json");
+        break;
+      case "import-back":
+        setImportMode("choose");
+        break;
+      case "import-submit":
+        void importSubscription();
+        break;
+    }
+  }
+
+  function handleRootClick(event: MouseEvent): void {
+    const boundary = event.currentTarget as HTMLElement;
+    const action = modalActionFromTarget(event.target, boundary);
+    if (action) handleModalAction(action);
+  }
+
+  function handleRootKeydown(event: KeyboardEvent): void {
+    if (event.key === "Escape") {
+      if (activeModal !== "none") closeModal();
+      return;
+    }
+    if (event.key !== "Enter") return;
+    const target = event.target as HTMLElement | null;
+    const action = target?.dataset.enterAction;
+    if (action) handleModalAction(action);
   }
 
   // Subscription headers (support / web-page URLs) are attacker-controlled, so
@@ -127,10 +229,10 @@
 
 
   function openImport(): void {
-    importMode = "choose";
+    setImportMode("choose");
     subUrl = "";
     importError = null;
-    showImport = true;
+    openModal("import");
   }
 
   async function importSubscription(): Promise<void> {
@@ -139,10 +241,10 @@
     try {
       await subs.importFromUrl(subUrl);
       subUrl = "";
-      showImport = false;
+      closeModal();
     } catch (e) {
       importError = e instanceof Error ? e.message : String(e);
-      importMode = isJsonInput(subUrl) ? "json" : "link";
+      setImportMode(isJsonInput(subUrl) ? "json" : "link");
     }
   }
 
@@ -155,12 +257,12 @@
       text = (isAndroid ? await readClipboard() : await navigator.clipboard.readText())?.trim() ?? "";
     } catch {
       // Clipboard blocked — fall back to the compact link entry.
-      importMode = "link";
+      setImportMode("link");
       importError = t("import.clipboardFail");
       return;
     }
     if (!text) {
-      importMode = "link";
+      setImportMode("link");
       importError = t("import.clipboardEmpty");
       return;
     }
@@ -175,6 +277,12 @@
   }
 </script>
 
+<div
+  class="page-root"
+  role="presentation"
+  onclick={handleRootClick}
+  onkeydown={handleRootKeydown}
+>
 <div class="home">
 <header class="topbar">
   <button class="icon-btn" onclick={openImport} aria-label="Add subscription">
@@ -363,12 +471,11 @@
 </main>
 </div>
 
-{#if infoFor}
-  <div class="modal-backdrop" onclick={() => (infoFor = null)} role="presentation">
+{#if activeModal === "info" && infoFor}
+  <div class="modal-backdrop" data-modal-action="close" role="presentation">
     <div
       class="modal card"
-      onclick={(e) => e.stopPropagation()}
-      onkeydown={(e) => e.key === "Escape" && (infoFor = null)}
+      data-modal-surface
       role="dialog"
       tabindex="-1"
       aria-modal="true"
@@ -376,7 +483,7 @@
     >
       <header class="modal-head">
         <h2>{infoFor.name}</h2>
-        <button class="icon-btn" onclick={() => (infoFor = null)} aria-label={t("common.close")}>
+        <button type="button" class="icon-btn" data-modal-action="close" aria-label={t("common.close")}>
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
             <path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
           </svg>
@@ -417,12 +524,11 @@
   </div>
 {/if}
 
-{#if detailFor}
-  <div class="modal-backdrop" onclick={() => (detailFor = null)} role="presentation">
+{#if activeModal === "details" && detailFor}
+  <div class="modal-backdrop" data-modal-action="close" role="presentation">
     <div
-      class="modal card"
-      onclick={(e) => e.stopPropagation()}
-      onkeydown={(e) => e.key === "Escape" && (detailFor = null)}
+      class="modal card location-modal"
+      data-modal-surface
       role="dialog"
       tabindex="-1"
       aria-modal="true"
@@ -433,27 +539,35 @@
           <FlagIcon flag={detailFor.flag ?? ""} />
           <span>{detailFor.name}</span>
         </h2>
-        <button class="icon-btn" onclick={() => (detailFor = null)} aria-label={t("common.close")}>
+        <button type="button" class="icon-btn" data-modal-action="close" aria-label={t("common.close")}>
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
             <path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
           </svg>
         </button>
       </header>
-      <LocationEditor
-        server={detailFor}
-        onSave={saveLocationDraft}
-        onCancel={() => (detailFor = null)}
-      />
+      <div class="location-editor-scroll">
+        <LocationEditor draft={locationDraft} />
+      </div>
+      {#if locationSaveError}
+        <div class="error">{locationSaveError}</div>
+      {/if}
+      <div class="modal-actions location-actions">
+        <button type="button" class="btn btn-ghost" data-modal-action="close" disabled={locationSaving}>
+          {t("common.cancel")}
+        </button>
+        <button type="button" class="btn btn-primary" data-modal-action="save-location" disabled={locationSaving}>
+          {locationSaving ? t("json.saving") : t("common.save")}
+        </button>
+      </div>
     </div>
   </div>
 {/if}
 
-{#if jsonFor}
-  <div class="modal-backdrop" onclick={() => (jsonFor = null)} role="presentation">
+{#if activeModal === "subscription-json" && jsonFor}
+  <div class="modal-backdrop" data-modal-action="close" role="presentation">
     <div
       class="modal card json-modal"
-      onclick={(e) => e.stopPropagation()}
-      onkeydown={(e) => e.key === "Escape" && (jsonFor = null)}
+      data-modal-surface
       role="dialog"
       tabindex="-1"
       aria-modal="true"
@@ -461,7 +575,7 @@
     >
       <header class="modal-head">
         <h2>{t("json.title")}</h2>
-        <button class="icon-btn" onclick={() => (jsonFor = null)} aria-label={t("common.close")}>
+        <button type="button" class="icon-btn" data-modal-action="close" aria-label={t("common.close")}>
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
             <path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
           </svg>
@@ -480,10 +594,10 @@
         <div class="error">{jsonError}</div>
       {/if}
       <div class="modal-actions">
-        <button class="btn btn-ghost" onclick={() => (jsonFor = null)} disabled={jsonSaving}>
+        <button type="button" class="btn btn-ghost" data-modal-action="close" disabled={jsonSaving}>
           {t("common.cancel")}
         </button>
-        <button class="btn btn-primary" onclick={saveJson} disabled={jsonSaving || !jsonDraft.trim()}>
+        <button type="button" class="btn btn-primary" data-modal-action="save-subscription-json" disabled={jsonSaving || !jsonDraft.trim()}>
           {jsonSaving ? t("json.saving") : t("json.save")}
         </button>
       </div>
@@ -491,12 +605,11 @@
   </div>
 {/if}
 
-{#if renameFor}
-  <div class="modal-backdrop" onclick={() => (renameFor = null)} role="presentation">
+{#if activeModal === "rename" && renameFor}
+  <div class="modal-backdrop" data-modal-action="close" role="presentation">
     <div
       class="modal card"
-      onclick={(e) => e.stopPropagation()}
-      onkeydown={(e) => e.key === "Escape" && (renameFor = null)}
+      data-modal-surface
       role="dialog"
       tabindex="-1"
       aria-modal="true"
@@ -506,11 +619,11 @@
       <input
         type="text"
         bind:value={renameDraft}
-        onkeydown={(e) => e.key === "Enter" && commitRename()}
+        data-enter-action="save-rename"
       />
       <div class="modal-actions">
-        <button class="btn btn-ghost" onclick={() => (renameFor = null)}>{t("common.cancel")}</button>
-        <button class="btn btn-primary" onclick={commitRename} disabled={!renameDraft.trim()}>
+        <button type="button" class="btn btn-ghost" data-modal-action="close">{t("common.cancel")}</button>
+        <button type="button" class="btn btn-primary" data-modal-action="save-rename" disabled={!renameDraft.trim()}>
           {t("common.save")}
         </button>
       </div>
@@ -518,12 +631,11 @@
   </div>
 {/if}
 
-{#if showImport}
-  <div class="modal-backdrop" onclick={() => (showImport = false)} role="presentation">
+{#if activeModal === "import"}
+  <div class="modal-backdrop" data-modal-action="close" role="presentation">
     <div
       class="modal card"
-      onclick={(e) => e.stopPropagation()}
-      onkeydown={(e) => e.key === "Escape" && (showImport = false)}
+      data-modal-surface
       role="dialog"
       tabindex="-1"
       aria-modal="true"
@@ -531,7 +643,7 @@
     >
       <header class="modal-head">
         <h2>{t("import.title")}</h2>
-        <button class="icon-btn" onclick={() => (showImport = false)} aria-label={t("common.close")}>
+        <button type="button" class="icon-btn" data-modal-action="close" aria-label={t("common.close")}>
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
             <path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
           </svg>
@@ -540,13 +652,13 @@
       {#if importMode === "choose"}
         <p class="muted">{t("import.hint")}</p>
         <div class="import-choice">
-          <button class="btn btn-primary" onclick={importFromClipboard} disabled={subs.importing}>
+          <button type="button" class="btn btn-primary" data-modal-action="import-clipboard" disabled={subs.importing}>
             {subs.importing ? t("import.importing") : t("import.fromClipboard")}
           </button>
-          <button class="btn" onclick={() => (importMode = "link")} disabled={subs.importing}>
+          <button type="button" class="btn" data-modal-action="import-link" disabled={subs.importing}>
             {t("import.link")}
           </button>
-          <button class="btn" onclick={() => (importMode = "json")} disabled={subs.importing}>
+          <button type="button" class="btn" data-modal-action="import-json" disabled={subs.importing}>
             {t("import.json")}
           </button>
         </div>
@@ -560,17 +672,17 @@
           class="import-link"
           placeholder="https://…"
           bind:value={subUrl}
-          onkeydown={(e) => e.key === "Enter" && void importSubscription()}
+          data-enter-action="import-submit"
           disabled={subs.importing}
         />
         {#if importError}
           <div class="error">{importError}</div>
         {/if}
         <div class="modal-actions">
-          <button class="btn btn-ghost" onclick={() => (importMode = "choose")} disabled={subs.importing}>
+          <button type="button" class="btn btn-ghost" data-modal-action="import-back" disabled={subs.importing}>
             {t("import.back")}
           </button>
-          <button class="btn btn-primary" onclick={importSubscription} disabled={subs.importing || !subUrl.trim()}>
+          <button type="button" class="btn btn-primary" data-modal-action="import-submit" disabled={subs.importing || !subUrl.trim()}>
             {subs.importing ? t("import.importing") : t("import.add")}
           </button>
         </div>
@@ -587,10 +699,10 @@
           <div class="error">{importError}</div>
         {/if}
         <div class="modal-actions">
-          <button class="btn btn-ghost" onclick={() => (importMode = "choose")} disabled={subs.importing}>
+          <button type="button" class="btn btn-ghost" data-modal-action="import-back" disabled={subs.importing}>
             {t("import.back")}
           </button>
-          <button class="btn btn-primary" onclick={importSubscription} disabled={subs.importing || !subUrl.trim()}>
+          <button type="button" class="btn btn-primary" data-modal-action="import-submit" disabled={subs.importing || !subUrl.trim()}>
             {subs.importing ? t("import.importing") : t("import.add")}
           </button>
         </div>
@@ -598,8 +710,12 @@
     </div>
   </div>
 {/if}
+</div>
 
 <style>
+  .page-root {
+    display: contents;
+  }
   /* Flex column so the top bar + power-button hero stay fixed and only the
      subscriptions list scrolls. */
   .home {
@@ -981,6 +1097,16 @@
     max-height: calc(100dvh - 24px);
     overflow-y: auto;
   }
+  .location-modal {
+    overflow: hidden;
+  }
+  .location-editor-scroll {
+    min-height: 0;
+    overflow-x: hidden;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    padding-right: 2px;
+  }
   .modal h2 {
     margin: 0;
     font-size: 17px;
@@ -992,6 +1118,10 @@
     justify-content: flex-end;
     gap: 8px;
     margin-top: 4px;
+  }
+  .location-actions {
+    flex-shrink: 0;
+    margin-top: 16px;
   }
   .import-choice {
     display: flex;

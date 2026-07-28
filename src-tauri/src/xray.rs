@@ -37,6 +37,112 @@ const PROXY_PROTOCOLS: &[&str] = &[
 ];
 const RESERVED_OUTBOUND_TAGS: &[&str] = &["direct", "dns-out", "block"];
 
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub struct EditorChoice {
+    pub value: &'static str,
+    pub label: &'static str,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocationEditorOptions {
+    pub protocols: Vec<EditorChoice>,
+    pub transports: Vec<EditorChoice>,
+    pub securities: Vec<EditorChoice>,
+    pub fingerprints: Vec<EditorChoice>,
+    pub flows: Vec<EditorChoice>,
+    pub xhttp_modes: Vec<EditorChoice>,
+    pub grpc_modes: Vec<EditorChoice>,
+    pub packet_encodings: Vec<EditorChoice>,
+    pub shadowsocks_methods: Vec<EditorChoice>,
+    pub wireguard_domain_strategies: Vec<EditorChoice>,
+}
+
+fn choices(values: &[(&'static str, &'static str)]) -> Vec<EditorChoice> {
+    values
+        .iter()
+        .map(|(value, label)| EditorChoice { value, label })
+        .collect()
+}
+
+/// Finite values supported by Varmlen's Xray outbound builders. Xray does not
+/// expose a runtime schema, so this catalogue lives beside the builders and is
+/// covered by a parity test instead of being duplicated in the frontend.
+#[tauri::command]
+pub fn location_editor_options() -> LocationEditorOptions {
+    let protocol_label = |protocol| match protocol {
+        "http" => "HTTP",
+        "socks" => "SOCKS",
+        "shadowsocks" => "Shadowsocks",
+        "vmess" => "VMess",
+        "vless" => "VLESS",
+        "trojan" => "Trojan",
+        "hysteria" => "Hysteria2",
+        "wireguard" => "WireGuard",
+        _ => protocol,
+    };
+    LocationEditorOptions {
+        protocols: PROXY_PROTOCOLS
+            .iter()
+            .map(|value| EditorChoice {
+                value,
+                label: protocol_label(value),
+            })
+            .collect(),
+        transports: choices(&[
+            ("tcp", "RAW / TCP"),
+            ("xhttp", "XHTTP"),
+            ("grpc", "gRPC"),
+            ("ws", "WebSocket"),
+            ("httpupgrade", "HTTPUpgrade"),
+            ("kcp", "mKCP"),
+            ("hysteria", "Hysteria"),
+        ]),
+        securities: choices(&[("none", "None"), ("tls", "TLS"), ("reality", "REALITY")]),
+        fingerprints: choices(&[
+            ("chrome", "Chrome"),
+            ("firefox", "Firefox"),
+            ("safari", "Safari"),
+            ("ios", "iOS"),
+            ("android", "Android"),
+            ("edge", "Edge"),
+            ("360", "360"),
+            ("qq", "QQ"),
+            ("random", "Random browser"),
+            ("randomized", "Randomized"),
+            ("unsafe", "Native Go TLS"),
+        ]),
+        flows: choices(&[("", "None"), ("xtls-rprx-vision", "XTLS Vision")]),
+        xhttp_modes: choices(&[
+            ("auto", "Auto"),
+            ("packet-up", "Packet up"),
+            ("stream-up", "Stream up"),
+            ("stream-one", "Stream one"),
+        ]),
+        grpc_modes: choices(&[("", "Standard"), ("multi", "Multi")]),
+        packet_encodings: choices(&[("", "None"), ("packetaddr", "PacketAddr"), ("xudp", "XUDP")]),
+        shadowsocks_methods: choices(&[
+            ("2022-blake3-aes-128-gcm", "2022 BLAKE3 AES-128-GCM"),
+            ("2022-blake3-aes-256-gcm", "2022 BLAKE3 AES-256-GCM"),
+            (
+                "2022-blake3-chacha20-poly1305",
+                "2022 BLAKE3 ChaCha20-Poly1305",
+            ),
+            ("aes-128-gcm", "AES-128-GCM"),
+            ("aes-256-gcm", "AES-256-GCM"),
+            ("chacha20-poly1305", "ChaCha20-Poly1305"),
+            ("none", "None"),
+        ]),
+        wireguard_domain_strategies: choices(&[
+            ("ForceIP", "Force IP"),
+            ("ForceIPv4", "Force IPv4"),
+            ("ForceIPv6", "Force IPv6"),
+            ("ForceIPv4v6", "Prefer IPv4"),
+            ("ForceIPv6v4", "Prefer IPv6"),
+        ]),
+    }
+}
+
 /// Local SOCKS port xray listens on in `Tun2socks`/proxy mode.
 pub const XRAY_SOCKS_PORT: u16 = 2081;
 
@@ -979,6 +1085,29 @@ mod tests {
     use super::*;
     use crate::subscription::{parse_proxy_uri, parse_subscription};
     use base64::Engine;
+
+    #[test]
+    fn editor_catalog_covers_every_remote_proxy_builder() {
+        let options = location_editor_options();
+        for protocol in [
+            "vless",
+            "vmess",
+            "trojan",
+            "shadowsocks",
+            "hysteria",
+            "wireguard",
+            "http",
+            "socks",
+        ] {
+            assert!(
+                options
+                    .protocols
+                    .iter()
+                    .any(|option| option.value == protocol),
+                "missing editor protocol {protocol}"
+            );
+        }
+    }
 
     fn split() -> SplitInput {
         SplitInput::default()
