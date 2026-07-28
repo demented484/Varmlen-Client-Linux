@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::split::SplitInput;
 use crate::subscription::VlessServer;
-use crate::xray::{build_xray_config, TunMode};
+use crate::xray::{build_xray_config, validate_server, TunMode};
 
 #[derive(Serialize, Deserialize)]
 pub struct HelperResponse {
@@ -104,6 +104,7 @@ pub async fn vpn_connect(
     log_level: Option<String>,
 ) -> Result<HelperResponse, String> {
     let level = log_level.unwrap_or_else(|| "warn".to_string());
+    validate_server(&server)?;
 
     #[cfg(target_os = "android")]
     {
@@ -429,6 +430,7 @@ pub async fn proxy_get_ping(
     {
         use varmlend::protocol::{DaemonCommand, ProxyPingRequest};
 
+        validate_server(&server)?;
         let socks_port = free_local_port()?;
         let xray_config =
             serde_json::to_string(&crate::xray::build_ping_config(&server, socks_port))

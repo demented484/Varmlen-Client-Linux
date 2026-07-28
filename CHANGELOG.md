@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.2.1
+
+- Use a stable platform-specific Varmlen subscription user agent without
+  treating the app version as a separate device.
+- Preserve provider location names, editable source JSON, and the exact Xray
+  proxy outbound instead of flattening JSON subscriptions into a lossy model.
+- Preserve Proxen XHTTP `extra`, mode, and XMUX settings.
+- Group primary and backup variants under one expandable location.
+- Accept Xray JSON outbounds for VMess, Trojan, Shadowsocks, Hysteria,
+  WireGuard, HTTP, and SOCKS in addition to VLESS.
+- Reject unsupported normalized protocols and transports instead of silently
+  falling back to TCP.
+- Reparse JSON already stored by 0.2.0 locally, without downloading the
+  subscription again.
+- Restore the AppImage for systems that already have Varmlen's privileged
+  backend installed by the DEB or RPM package.
+
 ## 0.2.0
 
 ### Corrected Linux reissue

@@ -81,8 +81,7 @@ fn target_arch() -> &'static str {
 
 fn subscription_user_agent() -> String {
     format!(
-        "Varmlen/{} ({}; {})",
-        env!("CARGO_PKG_VERSION"),
+        "Varmlen ({}; {})",
         target_platform(),
         target_arch()
     )
@@ -381,11 +380,10 @@ mod tests {
 
     #[test]
     fn subscription_ua_identifies_target() {
-        let ua = subscription_user_agent();
-        assert!(ua.starts_with(concat!("Varmlen/", env!("CARGO_PKG_VERSION"), " (")));
-        assert!(ua.ends_with(')'));
-        assert!(ua.contains(target_platform()));
-        assert!(ua.contains(target_arch()));
+        assert_eq!(
+            subscription_user_agent(),
+            format!("Varmlen ({}; {})", target_platform(), target_arch())
+        );
     }
 
     #[test]
