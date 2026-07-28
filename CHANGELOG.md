@@ -15,6 +15,15 @@
   location toggle its details closed.
 - Simplify protocol labels: show only Hysteria or Hysteria2 for those protocols
   and omit redundant REALITY suffixes.
+- Rebuild the location editor around one modal lifecycle so JSON and structured
+  editors can always be closed and reopened without stale touch layers.
+- Populate finite editor fields from the Xray-supported protocol catalogue,
+  including VMess, Trojan, Shadowsocks, Hysteria, WireGuard, HTTP, and SOCKS.
+- Probe all locations concurrently and use the first healthy outbound from a
+  composite JSON location instead of waiting on slower fallback paths.
+- Keep long log lines inside the diagnostics dialog and draw a full-width
+  divider above every location, including the first one.
+- Build native DEB, RPM, and AppImage artifacts for both amd64 and arm64.
 
 ## 0.2.4
 
