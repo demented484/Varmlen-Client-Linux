@@ -1,7 +1,8 @@
 #!/bin/sh
 set -eu
 
-DEB="${1:-target/release/bundle/deb/Varmlen_0.2.5_amd64.deb}"
+VERSION="$(sed -n 's/.*"version": "\([^"]*\)".*/\1/p' package.json | head -n 1)"
+DEB="${1:-target/release/bundle/deb/Varmlen_${VERSION}_amd64.deb}"
 EXPECTED_ARCH="${2:-}"
 
 if [ ! -f "$DEB" ]; then

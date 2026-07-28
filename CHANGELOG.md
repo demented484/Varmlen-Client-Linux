@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.6
+
+- Disable per-app split controls in Proxy mode and explain on hover, focus, or
+  press that application routing requires TUN.
+- Apply General and Selective website split rules to traffic sent through the
+  local SOCKS proxy while keeping process rules out of Proxy mode.
+- Remove the misleading manual Network permissions setup; privileged daemon
+  startup remains lazy and is requested only by real operations.
+- Correct the Proxy label and description to the actual SOCKS endpoint at
+  `127.0.0.1:2081`.
+
 ## 0.2.5
 
 - Add editable location details: exact source JSON for JSON profiles and

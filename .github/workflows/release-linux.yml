@@ -89,6 +89,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p "dist/${{ matrix.asset_arch }}"
+          version="$(jq -r .version package.json)"
           deb="$(find target/release/bundle/deb -maxdepth 1 -type f -name '*.deb' -print -quit)"
           rpm="$(find target/release/bundle/rpm -maxdepth 1 -type f -name '*.rpm' -print -quit)"
           appimage="$(find target/release/bundle/appimage -maxdepth 1 -type f -name '*.AppImage' -print -quit)"
@@ -96,21 +97,25 @@ jobs:
           test -n "$rpm"
           test -n "$appimage"
 
+          deb_asset="dist/${{ matrix.asset_arch }}/Varmlen_${version}_${{ matrix.asset_arch }}.deb"
+          rpm_asset="dist/${{ matrix.asset_arch }}/Varmlen-${version}-1.${{ matrix.rpm_arch }}.rpm"
+          appimage_asset="dist/${{ matrix.asset_arch }}/Varmlen_${version}_${{ matrix.asset_arch }}.AppImage"
+
           install -m 0644 "$deb" \
-            "dist/${{ matrix.asset_arch }}/Varmlen_0.2.5_${{ matrix.asset_arch }}.deb"
+            "$deb_asset"
           install -m 0644 "$rpm" \
-            "dist/${{ matrix.asset_arch }}/Varmlen-0.2.5-1.${{ matrix.rpm_arch }}.rpm"
+            "$rpm_asset"
           install -m 0755 "$appimage" \
-            "dist/${{ matrix.asset_arch }}/Varmlen_0.2.5_${{ matrix.asset_arch }}.AppImage"
+            "$appimage_asset"
 
           bash scripts/test-linux-package.sh \
-            "dist/${{ matrix.asset_arch }}/Varmlen_0.2.5_${{ matrix.asset_arch }}.deb" \
+            "$deb_asset" \
             "${{ matrix.deb_arch }}"
           test "$(rpm -qp --queryformat '%{ARCH}' \
-            "dist/${{ matrix.asset_arch }}/Varmlen-0.2.5-1.${{ matrix.rpm_arch }}.rpm")" \
+            "$rpm_asset")" \
             = "${{ matrix.rpm_arch }}"
 
-          file "dist/${{ matrix.asset_arch }}/Varmlen_0.2.5_${{ matrix.asset_arch }}.AppImage" \
+          file "$appimage_asset" \
             > "dist/${{ matrix.asset_arch }}/appimage-file.txt"
           case "${{ matrix.asset_arch }}" in
             amd64) grep -q "x86-64" "dist/${{ matrix.asset_arch }}/appimage-file.txt" ;;
