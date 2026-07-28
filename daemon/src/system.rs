@@ -26,6 +26,11 @@ const TUN_INTERFACE: &str = "varmlen0";
 const PROXY_PORT: u16 = 2081;
 const XRAY_DIAL_MARK: u64 = 0x2024;
 static PING_CONFIG_ID: AtomicU64 = AtomicU64::new(1);
+const PROXY_PING_URL: &str = "http://www.gstatic.com/generate_204";
+
+fn build_proxy_ping_request(client: &reqwest::Client) -> reqwest::RequestBuilder {
+    client.head(PROXY_PING_URL)
+}
 
 pub async fn run_tcp_ping(request: &TcpPingRequest) -> Result<u32, DaemonError> {
     let helper = Path::new(INSTALLED_NET_HELPER);
@@ -150,8 +155,7 @@ pub async fn run_proxy_ping(
                 )
             })?;
         let started = Instant::now();
-        let response = client
-            .get("http://cp.cloudflare.com/generate_204")
+        let response = build_proxy_ping_request(&client)
             .send()
             .await
             .map_err(|error| {
@@ -1050,7 +1054,10 @@ fn contains_forbidden_file_key(value: &Value) -> bool {
 mod tests {
     use serde_json::json;
 
-    use super::{validate_ping_xray_document, validate_xray_document};
+    use super::{
+        build_proxy_ping_request, validate_ping_xray_document, validate_xray_document,
+        PROXY_PING_URL,
+    };
     use crate::protocol::DaemonErrorCode;
 
     fn config(data: serde_json::Value) -> String {
@@ -1193,5 +1200,18 @@ mod tests {
         });
 
         assert!(validate_ping_xray_document(&raw.to_string(), 32_000).is_ok());
+    }
+
+    #[test]
+    fn proxy_ping_matches_xray_health_check_request() {
+        let client = reqwest::Client::new();
+        let request = build_proxy_ping_request(&client).build().unwrap();
+
+        assert_eq!(request.method(), reqwest::Method::HEAD);
+        assert_eq!(request.url().as_str(), PROXY_PING_URL);
+        assert_eq!(
+            request.url().as_str(),
+            "http://www.gstatic.com/generate_204"
+        );
     }
 }

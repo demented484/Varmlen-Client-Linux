@@ -411,9 +411,9 @@ pub async fn tcp_ping_host(
             .await
             .map_err(|error| error.to_string())?;
         let _ = app;
-        return state
+        state
             .rtt_ms
-            .ok_or_else(|| "daemon did not return a TCP RTT".to_string());
+            .ok_or_else(|| "daemon did not return a TCP RTT".to_string())
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -457,9 +457,9 @@ pub async fn proxy_get_ping(
             .await
             .map_err(|error| error.to_string())?;
         let _ = app;
-        return state
+        state
             .rtt_ms
-            .ok_or_else(|| "daemon did not return an HTTP RTT".to_string());
+            .ok_or_else(|| "daemon did not return an HTTP RTT".to_string())
     }
 
     #[cfg(not(target_os = "linux"))]
