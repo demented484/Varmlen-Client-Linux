@@ -4,7 +4,7 @@ use std::net::IpAddr;
 pub const PROTOCOL_VERSION: u16 = 2;
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_CONFIG_BYTES: usize = 384 * 1024;
-const MAX_SERVER_IPS: usize = 16;
+pub const MAX_SERVER_IPS: usize = 64;
 const MAX_EXCLUDED_APPS: usize = 256;
 const MAX_APP_SELECTOR_BYTES: usize = 4096;
 const MAX_PING_HOST_BYTES: usize = 253;

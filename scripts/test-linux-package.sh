@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-DEB="${1:-target/release/bundle/deb/Varmlen_0.2.1_amd64.deb}"
+DEB="${1:-target/release/bundle/deb/Varmlen_0.2.2_amd64.deb}"
 
 if [ ! -f "$DEB" ]; then
   echo "missing Debian package: $DEB" >&2

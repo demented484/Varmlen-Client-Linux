@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.2.2
+
+- Preserve complete multi-outbound Xray profiles as one logical location,
+  including provider balancers and observatories.
+- Route every profile endpoint safely outside the Linux TUN and support
+  balanced profiles in real HTTP latency checks.
+- Add selectable Varmlen, Happ, INCY, and v2rayTun subscription User-Agents
+  with a platform header and no app-version device churn.
+- Keep provider JSON lossless and editable while retaining Varmlen's own DNS,
+  split-tunnel, and kill-switch policy.
+- Support Xray JSON outbounds for VLESS, VMess, Trojan, Shadowsocks, Hysteria,
+  WireGuard, HTTP, and SOCKS; omit forbidden WireGuard stream settings.
+- Stop grouping similarly named locations. Migrate local Configuration N cards
+  into one flat Configuration/Configurations card without a network request.
+
 ## 0.2.1
 
 - Use a stable platform-specific Varmlen subscription user agent without

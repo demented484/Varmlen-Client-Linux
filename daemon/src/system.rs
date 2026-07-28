@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -13,6 +14,7 @@ use crate::dns::{DnsBackend, DnsGuard, SystemDnsBackend};
 use crate::lifecycle::LifecycleBackend;
 use crate::protocol::{
     ConnectRequest, ConnectionMode, DaemonError, DaemonErrorCode, ProxyPingRequest, TcpPingRequest,
+    MAX_SERVER_IPS,
 };
 use crate::recovery::ProcessIdentity;
 use crate::split::system::SystemSplitBackend;
@@ -789,10 +791,12 @@ pub fn validate_ping_xray_document(raw: &str, socks_port: u16) -> Result<(), Dae
             "ping Xray configuration must be an object",
         )
     })?;
-    if object
-        .keys()
-        .any(|key| !matches!(key.as_str(), "log" | "inbounds" | "outbounds" | "routing"))
-    {
+    if object.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "log" | "inbounds" | "outbounds" | "routing" | "observatory" | "burstObservatory"
+        )
+    }) {
         return Err(DaemonError::new(
             DaemonErrorCode::InvalidRequest,
             "ping Xray configuration contains an unsupported privileged section",
@@ -849,32 +853,131 @@ pub fn validate_ping_xray_document(raw: &str, socks_port: u16) -> Result<(), Dae
                 "ping Xray outbounds are missing",
             )
         })?;
-    let proxy_protocol = outbounds
-        .first()
-        .and_then(|outbound| outbound.get("protocol"))
-        .and_then(Value::as_str);
-    let proxy_mark = outbounds
-        .first()
-        .and_then(|outbound| outbound.pointer("/streamSettings/sockopt/mark"))
-        .and_then(Value::as_u64);
-    if outbounds.len() != 2
-        || !matches!(
-            proxy_protocol,
-            Some("vless" | "vmess" | "trojan" | "shadowsocks")
-        )
-        || outbounds[0].get("tag").and_then(Value::as_str) != Some("proxy")
-        || proxy_mark != Some(XRAY_DIAL_MARK)
-        || outbounds[1].get("tag").and_then(Value::as_str) != Some("direct")
-        || outbounds[1].get("protocol").and_then(Value::as_str) != Some("freedom")
+    if !(2..=MAX_SERVER_IPS + 1).contains(&outbounds.len())
+        || outbounds
+            .last()
+            .and_then(|outbound| outbound.get("tag"))
+            .and_then(Value::as_str)
+            != Some("direct")
+        || outbounds
+            .last()
+            .and_then(|outbound| outbound.get("protocol"))
+            .and_then(Value::as_str)
+            != Some("freedom")
     {
         return Err(DaemonError::new(
             DaemonErrorCode::InvalidRequest,
             "ping Xray outbound set or bypass mark is not permitted",
         ));
     }
+    let mut proxy_tags = HashSet::new();
+    for outbound in &outbounds[..outbounds.len() - 1] {
+        let protocol = outbound.get("protocol").and_then(Value::as_str);
+        let tag = outbound
+            .get("tag")
+            .and_then(Value::as_str)
+            .filter(|tag| !tag.is_empty());
+        let marked = outbound
+            .pointer("/streamSettings/sockopt/mark")
+            .and_then(Value::as_u64)
+            == Some(XRAY_DIAL_MARK);
+        if !matches!(
+            protocol,
+            Some(
+                "http"
+                    | "socks"
+                    | "shadowsocks"
+                    | "vmess"
+                    | "vless"
+                    | "trojan"
+                    | "hysteria"
+                    | "wireguard"
+            )
+        ) || tag.is_none()
+            || !proxy_tags.insert(tag.unwrap())
+            || (protocol != Some("wireguard") && !marked)
+        {
+            return Err(DaemonError::new(
+                DaemonErrorCode::InvalidRequest,
+                "ping Xray proxy outbound or bypass mark is not permitted",
+            ));
+        }
+    }
 
-    let rules = document
-        .pointer("/routing/rules")
+    let routing = document
+        .get("routing")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            DaemonError::new(
+                DaemonErrorCode::InvalidRequest,
+                "ping Xray routing section is missing",
+            )
+        })?;
+    if routing
+        .keys()
+        .any(|key| !matches!(key.as_str(), "rules" | "balancers"))
+    {
+        return Err(DaemonError::new(
+            DaemonErrorCode::InvalidRequest,
+            "ping Xray routing contains unsupported policy",
+        ));
+    }
+    let balancer_tags = routing
+        .get("balancers")
+        .map(|value| {
+            let items = value.as_array().ok_or_else(|| {
+                DaemonError::new(
+                    DaemonErrorCode::InvalidRequest,
+                    "ping Xray balancers must be an array",
+                )
+            })?;
+            if items.len() > MAX_SERVER_IPS {
+                return Err(DaemonError::new(
+                    DaemonErrorCode::InvalidRequest,
+                    "ping Xray has too many balancers",
+                ));
+            }
+            let mut tags = HashSet::new();
+            for balancer in items {
+                let tag = balancer
+                    .get("tag")
+                    .and_then(Value::as_str)
+                    .filter(|tag| !tag.is_empty())
+                    .ok_or_else(|| {
+                        DaemonError::new(
+                            DaemonErrorCode::InvalidRequest,
+                            "ping Xray balancer tag is missing",
+                        )
+                    })?;
+                let selectors = balancer
+                    .get("selector")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| {
+                        DaemonError::new(
+                            DaemonErrorCode::InvalidRequest,
+                            "ping Xray balancer selector is missing",
+                        )
+                    })?;
+                if !tags.insert(tag)
+                    || selectors.is_empty()
+                    || !selectors.iter().filter_map(Value::as_str).any(|selector| {
+                        proxy_tags
+                            .iter()
+                            .any(|proxy_tag| proxy_tag.starts_with(selector))
+                    })
+                {
+                    return Err(DaemonError::new(
+                        DaemonErrorCode::InvalidRequest,
+                        "ping Xray balancer does not select a proxy",
+                    ));
+                }
+            }
+            Ok(tags)
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let rules = routing
+        .get("rules")
         .and_then(Value::as_array)
         .ok_or_else(|| {
             DaemonError::new(
@@ -882,10 +985,20 @@ pub fn validate_ping_xray_document(raw: &str, socks_port: u16) -> Result<(), Dae
                 "ping Xray routing rule is missing",
             )
         })?;
+    let target_is_proxy = rules
+        .first()
+        .and_then(|rule| rule.get("outboundTag"))
+        .and_then(Value::as_str)
+        .is_some_and(|tag| proxy_tags.contains(tag));
+    let target_is_balancer = rules
+        .first()
+        .and_then(|rule| rule.get("balancerTag"))
+        .and_then(Value::as_str)
+        .is_some_and(|tag| balancer_tags.contains(tag));
     if rules.len() != 1
         || rules[0].get("type").and_then(Value::as_str) != Some("field")
         || rules[0].get("network").and_then(Value::as_str) != Some("tcp,udp")
-        || rules[0].get("outboundTag").and_then(Value::as_str) != Some("proxy")
+        || target_is_proxy == target_is_balancer
     {
         return Err(DaemonError::new(
             DaemonErrorCode::InvalidRequest,
@@ -1031,5 +1144,54 @@ mod tests {
         exposed["inbounds"][0]["listen"] = json!("0.0.0.0");
         let error = validate_ping_xray_document(&exposed.to_string(), 32_000).unwrap_err();
         assert_eq!(error.code, DaemonErrorCode::InvalidRequest);
+    }
+
+    #[test]
+    fn ping_config_accepts_a_bounded_balanced_profile() {
+        let proxy = |tag: &str| {
+            json!({
+                "tag": tag,
+                "protocol": "vless",
+                "streamSettings": {"sockopt": {"mark": 0x2024}}
+            })
+        };
+        let raw = json!({
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+                "tag": "socks-in",
+                "listen": "127.0.0.1",
+                "port": 32000,
+                "protocol": "socks",
+                "settings": {"udp": false, "auth": "noauth"}
+            }],
+            "outbounds": [
+                proxy("estonia-1"),
+                proxy("estonia-2"),
+                {"tag": "direct", "protocol": "freedom"}
+            ],
+            "routing": {
+                "balancers": [{
+                    "tag": "estonia-balancer",
+                    "selector": ["estonia-"],
+                    "strategy": {"type": "leastPing"}
+                }],
+                "rules": [{
+                    "type": "field",
+                    "network": "tcp,udp",
+                    "balancerTag": "estonia-balancer"
+                }]
+            },
+            "burstObservatory": {
+                "subjectSelector": ["estonia-"],
+                "pingConfig": {
+                    "destination": "https://example.com/generate_204",
+                    "interval": "1m",
+                    "timeout": "5s",
+                    "sampling": 3
+                }
+            }
+        });
+
+        assert!(validate_ping_xray_document(&raw.to_string(), 32_000).is_ok());
     }
 }

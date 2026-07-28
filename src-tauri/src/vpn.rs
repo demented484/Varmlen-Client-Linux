@@ -10,7 +10,7 @@ use std::sync::OnceLock;
 use serde::{Deserialize, Serialize};
 
 use crate::split::SplitInput;
-use crate::subscription::VlessServer;
+use crate::subscription::{server_endpoints, VlessServer};
 use crate::xray::{build_xray_config, validate_server, TunMode};
 
 #[derive(Serialize, Deserialize)]
@@ -80,17 +80,27 @@ fn response_from_daemon(state: varmlend::protocol::DaemonState) -> HelperRespons
 
 #[cfg(target_os = "linux")]
 async fn resolve_server_ips(server: &VlessServer) -> Result<Vec<std::net::IpAddr>, String> {
-    let addresses = tokio::net::lookup_host((server.host.as_str(), server.port))
-        .await
-        .map_err(|error| format!("could not resolve VPN server: {error}"))?;
-    let unique: BTreeSet<_> = addresses.map(|address| address.ip()).collect();
+    let mut unique = BTreeSet::new();
+    for (host, port) in server_endpoints(server) {
+        let addresses = tokio::net::lookup_host((host.as_str(), port))
+            .await
+            .map_err(|error| format!("could not resolve VPN endpoint {host}:{port}: {error}"))?;
+        unique.extend(addresses.map(|address| address.ip()));
+    }
     if unique.is_empty() {
         return Err(format!(
-            "VPN server {} did not resolve to an address",
-            server.host
+            "VPN location {} did not resolve to an address",
+            server.label
         ));
     }
-    Ok(unique.into_iter().take(16).collect())
+    if unique.len() > varmlend::protocol::MAX_SERVER_IPS {
+        return Err(format!(
+            "VPN location resolves to {} addresses; the safe limit is {}",
+            unique.len(),
+            varmlend::protocol::MAX_SERVER_IPS
+        ));
+    }
+    Ok(unique.into_iter().collect())
 }
 
 #[tauri::command]

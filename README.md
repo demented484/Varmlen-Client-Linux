@@ -25,7 +25,7 @@ Grab a release `.deb` or `.rpm` from [Releases](https://github.com/demented484/V
 For a terminal-driven Debian/Ubuntu install without a terminal password prompt:
 
 ```bash
-pkexec dpkg -i Varmlen_0.2.1_amd64.deb
+pkexec dpkg -i Varmlen_0.2.2_amd64.deb
 ```
 
 The networking daemon is started on demand through polkit and does not require
@@ -52,7 +52,7 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 npm test
 npm run check
 scripts/test-install-layout.sh
-scripts/test-linux-package.sh target/release/bundle/deb/Varmlen_0.2.1_amd64.deb
+scripts/test-linux-package.sh target/release/bundle/deb/Varmlen_0.2.2_amd64.deb
 ```
 
 These automated checks do not disconnect the host VPN, modify host routes, or
