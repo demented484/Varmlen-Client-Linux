@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.5
+
+- Add editable location details: exact source JSON for JSON profiles and
+  structured parameters for URI-based locations.
+- Refresh subscriptions only when their configured interval is due, allow
+  automatic refresh to be disabled, and let provider updates replace local
+  location edits.
+- Add location dividers and a neutral globe for entries without a country flag,
+  and remove the selected-location stripe.
+- Simplify protocol labels: show only Hysteria or Hysteria2 for those protocols
+  and omit redundant REALITY suffixes.
+
 ## 0.2.4
 
 - Make one-shot HTTP latency checks use a composite location's deterministic
