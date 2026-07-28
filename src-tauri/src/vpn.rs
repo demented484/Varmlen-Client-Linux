@@ -438,24 +438,53 @@ pub async fn proxy_get_ping(
 ) -> Result<u32, String> {
     #[cfg(target_os = "linux")]
     {
-        use varmlend::protocol::{DaemonCommand, ProxyPingRequest};
+        use varmlend::protocol::{DaemonCommand, DaemonErrorCode, ProxyPingRequest};
 
         validate_server(&server)?;
-        let socks_port = free_local_port()?;
+        let proxy_count = crate::xray::ping_proxy_count(&server)?;
+        let mut socks_ports = Vec::with_capacity(proxy_count);
+        while socks_ports.len() < proxy_count {
+            let port = free_local_port()?;
+            if !socks_ports.contains(&port) {
+                socks_ports.push(port);
+            }
+        }
+        let socks_port = socks_ports[0];
         let xray_config =
-            serde_json::to_string(&crate::xray::build_ping_config(&server, socks_port))
+            serde_json::to_string(&crate::xray::build_ping_config(&server, &socks_ports)?)
                 .map_err(|error| error.to_string())?;
+        let timeout_ms = timeout_ms.unwrap_or(5000);
         let mut daemon = crate::daemon_client::DaemonClient::connect_or_start_installed()
             .await
             .map_err(|error| error.to_string())?;
-        let state = daemon
-            .request(DaemonCommand::ProxyPing(ProxyPingRequest {
-                xray_config,
-                socks_port,
-                timeout_ms: timeout_ms.unwrap_or(5000),
-            }))
+        let request = ProxyPingRequest {
+            xray_config,
+            socks_port,
+            socks_ports: socks_ports.clone(),
+            timeout_ms,
+        };
+        let state = match daemon
+            .request(DaemonCommand::ProxyPing(ProxyPingRequest { ..request }))
             .await
-            .map_err(|error| error.to_string())?;
+        {
+            Ok(state) => state,
+            Err(crate::daemon_client::ClientError::Daemon(DaemonErrorCode::InvalidRequest, _)) => {
+                let xray_config = serde_json::to_string(&crate::xray::build_legacy_ping_config(
+                    &server, socks_port,
+                )?)
+                .map_err(|error| error.to_string())?;
+                daemon
+                    .request(DaemonCommand::ProxyPing(ProxyPingRequest {
+                        xray_config,
+                        socks_port,
+                        socks_ports: Vec::new(),
+                        timeout_ms,
+                    }))
+                    .await
+                    .map_err(|error| error.to_string())?
+            }
+            Err(error) => return Err(error.to_string()),
+        };
         let _ = app;
         state
             .rtt_ms

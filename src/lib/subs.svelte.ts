@@ -23,6 +23,7 @@ import {
 } from "$lib/location-draft";
 import { transportSummary } from "$lib/server-label";
 import { nextRefreshBatch } from "$lib/subscription-refresh";
+import { runPingsInParallel } from "$lib/ping-scheduler";
 export { transportSummary } from "$lib/server-label";
 
 /** Ping result for a server entry. `null` = unknown / not yet measured,
@@ -683,26 +684,19 @@ class SubsStore {
     }
   }
 
-  /** Probe a batch with bounded concurrency. Proxy pings each spin a throwaway
-   *  xray, so they run far fewer at a time than the cheap TCP probes. The
-   *  method is captured once so a mid-batch settings change stays consistent. */
+  /** Probe every location in the batch concurrently. Each composite JSON
+   *  location uses one temporary Xray process for all of its concrete paths,
+   *  so an additional frontend queue makes large subscriptions unnecessarily
+   *  slow. The method is captured once for a consistent batch. */
   private async pingMany(servers: ServerEntry[]): Promise<void> {
     const method = settings.pingMethod;
-    // TCP probes are cheap (a connect) so run them all but for a sanity cap.
-    // Proxy probes each spin a throwaway xray, so keep that more bounded.
-    const limit = method === "proxy" ? 8 : 32;
     // Mark the whole batch in-flight up front so every old result clears at
-    // once, instead of one-by-one as the bounded-concurrency workers reach
-    // each server (the actual probing stays rate-limited below).
+    // once instead of one-by-one as the probes finish.
     const next = { ...this.pings };
     for (const s of servers) next[s.id] = "pinging";
     this.pings = next;
-    let i = 0;
-    const worker = async () => {
-      while (i < servers.length) await this.pingServer(servers[i++], method);
-    };
-    await Promise.all(
-      Array.from({ length: Math.min(limit, servers.length) }, worker),
+    await runPingsInParallel(servers, (server) =>
+      this.pingServer(server, method),
     );
   }
 

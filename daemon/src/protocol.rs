@@ -40,7 +40,19 @@ pub struct TcpPingRequest {
 pub struct ProxyPingRequest {
     pub xray_config: String,
     pub socks_port: u16,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub socks_ports: Vec<u16>,
     pub timeout_ms: u32,
+}
+
+impl ProxyPingRequest {
+    pub fn effective_socks_ports(&self) -> Vec<u16> {
+        if self.socks_ports.is_empty() {
+            vec![self.socks_port]
+        } else {
+            self.socks_ports.clone()
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -182,9 +194,18 @@ pub fn validate_tcp_ping_request(request: &TcpPingRequest) -> Result<(), DaemonE
 }
 
 pub fn validate_proxy_ping_request(request: &ProxyPingRequest) -> Result<(), DaemonErrorCode> {
+    let ports = request.effective_socks_ports();
     if request.xray_config.is_empty()
         || request.xray_config.len() > MAX_CONFIG_BYTES
         || request.socks_port == 0
+        || ports.is_empty()
+        || ports.len() > MAX_SERVER_IPS
+        || ports[0] != request.socks_port
+        || ports.iter().any(|port| *port == 0)
+        || ports
+            .iter()
+            .enumerate()
+            .any(|(index, port)| ports[..index].contains(port))
         || !(MIN_PING_TIMEOUT_MS..=MAX_PING_TIMEOUT_MS).contains(&request.timeout_ms)
     {
         return Err(DaemonErrorCode::InvalidRequest);
@@ -302,6 +323,7 @@ mod tests {
         let proxy = ProxyPingRequest {
             xray_config: r#"{"log":{"loglevel":"warning"}}"#.into(),
             socks_port: 32_000,
+            socks_ports: vec![32_000, 32_001],
             timeout_ms: 5_000,
         };
         assert_eq!(validate_proxy_ping_request(&proxy), Ok(()));

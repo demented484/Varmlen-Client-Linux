@@ -4615,6 +4615,7 @@ name = "varmlend"
 version = "0.2.5"
 dependencies = [
  "async-trait",
+ "futures-util",
  "libc",
  "nix",
  "reqwest 0.12.28",
