@@ -6,9 +6,18 @@ The Android client lives in a separate repo: [Varmlen-Client-Android](https://gi
 
 ## Screenshots
 
-| Home | Split tunneling | Settings |
-| --- | --- | --- |
-| ![Varmlen Linux home with AegisVPN locations](docs/screenshots/home.png) | ![Varmlen Linux per-app split tunneling](docs/screenshots/split.png) | ![Varmlen Linux settings in English](docs/screenshots/settings.png) |
+<table>
+  <tr>
+    <th width="33.333%">Home</th>
+    <th width="33.333%">Split tunneling</th>
+    <th width="33.333%">Settings</th>
+  </tr>
+  <tr>
+    <td><img src="docs/screenshots/home.png" width="100%" alt="Varmlen Linux home with AegisVPN locations"></td>
+    <td><img src="docs/screenshots/split.png" width="100%" alt="Varmlen Linux per-app split tunneling"></td>
+    <td><img src="docs/screenshots/settings.png" width="100%" alt="Varmlen Linux settings in English"></td>
+  </tr>
+</table>
 
 ## Features
 
