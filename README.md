@@ -4,6 +4,12 @@ Open-source xray-core VPN client for Linux, with per-app and per-domain split tu
 
 The Android client lives in a separate repo: [Varmlen-Client-Android](https://github.com/demented484/Varmlen-Client-Android). It shares the UI, the subscription parser and the xray config generator.
 
+## Screenshots
+
+| Home | Split tunneling | Settings |
+| --- | --- | --- |
+| ![Varmlen Linux home with AegisVPN locations](docs/screenshots/home.png) | ![Varmlen Linux per-app split tunneling](docs/screenshots/split.png) | ![Varmlen Linux settings in English](docs/screenshots/settings.png) |
+
 ## Features
 
 - Bundles xray-core as the protocol engine (native TUN and routing). Compatible with any xray or v2ray (vless, vmess, trojan, shadowsocks) subscription, a single share-link, several links, or a raw xray/v2ray JSON config.
