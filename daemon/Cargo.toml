@@ -2,7 +2,7 @@
 name = "varmlend"
 version = "0.2.6"
 edition = "2021"
-license = "MIT"
+license = "GPL-3.0-only"
 description = "Privileged networking daemon for Varmlen"
 
 [lib]
