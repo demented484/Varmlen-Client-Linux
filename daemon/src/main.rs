@@ -5,11 +5,16 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio::net::UnixListener;
-use tokio::time::{sleep, Duration};
+use tokio::{
+    sync::Semaphore,
+    time::{sleep, Duration},
+};
 use varmlend::controller::SystemController;
 use varmlend::protocol::ConnectionPhase;
 use varmlend::recovery::{RecoveryManager, SystemCleanupBackend};
-use varmlend::server::{parse_owner_uid, serve_connection, CommandHandler, PeerPolicy};
+use varmlend::server::{
+    parse_owner_uid, serve_connection, CommandHandler, PeerPolicy, MAX_CONCURRENT_CLIENTS,
+};
 use varmlend::state::{PersistedState, StateStore};
 
 fn runtime_paths(uid: u32) -> (PathBuf, PathBuf) {
@@ -70,10 +75,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let handler: Arc<dyn CommandHandler> = controller;
 
     let policy = PeerPolicy::new(owner_uid);
+    let client_slots = Arc::new(Semaphore::new(MAX_CONCURRENT_CLIENTS));
     loop {
         let (stream, _) = listener.accept().await?;
+        let Ok(slot) = Arc::clone(&client_slots).try_acquire_owned() else {
+            drop(stream);
+            continue;
+        };
         let handler = Arc::clone(&handler);
         tokio::spawn(async move {
+            let _slot = slot;
             let _ = serve_connection(stream, policy, handler).await;
         });
     }

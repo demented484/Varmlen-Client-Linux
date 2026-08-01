@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_CONFIG_BYTES: usize = 384 * 1024;
 pub const MAX_SERVER_IPS: usize = 64;
@@ -63,6 +63,8 @@ pub enum DaemonCommand {
     Disconnect,
     TcpPing(TcpPingRequest),
     ProxyPing(ProxyPingRequest),
+    LogTail,
+    ClearLog,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -100,6 +102,8 @@ pub struct DaemonState {
     pub dns_protected: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rtt_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_tail: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -156,7 +160,10 @@ pub fn validate_request(request: &RequestEnvelope) -> Result<(), DaemonErrorCode
         DaemonCommand::Connect(connect) => validate_connect_request(connect)?,
         DaemonCommand::TcpPing(ping) => validate_tcp_ping_request(ping)?,
         DaemonCommand::ProxyPing(ping) => validate_proxy_ping_request(ping)?,
-        DaemonCommand::Status | DaemonCommand::Disconnect => {}
+        DaemonCommand::Status
+        | DaemonCommand::Disconnect
+        | DaemonCommand::LogTail
+        | DaemonCommand::ClearLog => {}
     }
     Ok(())
 }
@@ -253,8 +260,8 @@ mod tests {
     };
 
     #[test]
-    fn protocol_version_rejects_withdrawn_port_based_release() {
-        assert_eq!(PROTOCOL_VERSION, 2);
+    fn protocol_version_includes_bounded_log_commands() {
+        assert_eq!(PROTOCOL_VERSION, 3);
     }
 
     fn valid_connect() -> ConnectRequest {

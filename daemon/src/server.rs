@@ -6,11 +6,17 @@ use async_trait::async_trait;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::sync::RwLock;
+use tokio::time::{timeout, Duration};
 
 use crate::protocol::{
     decode_request_frame, encode_frame, DaemonCommand, DaemonError, DaemonErrorCode, DaemonState,
     ResponseEnvelope, MAX_FRAME_BYTES, PROTOCOL_VERSION,
 };
+
+pub const MAX_CONCURRENT_CLIENTS: usize = 16;
+const FRAME_IO_TIMEOUT: Duration = Duration::from_secs(5);
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_REQUESTS_PER_CONNECTION: usize = 32;
 
 #[derive(Debug, Clone, Copy)]
 pub struct PeerPolicy {
@@ -114,7 +120,9 @@ impl CommandHandler for SnapshotHandler {
             DaemonCommand::Connect(_)
             | DaemonCommand::Disconnect
             | DaemonCommand::TcpPing(_)
-            | DaemonCommand::ProxyPing(_) => Err(DaemonError::new(
+            | DaemonCommand::ProxyPing(_)
+            | DaemonCommand::LogTail
+            | DaemonCommand::ClearLog => Err(DaemonError::new(
                 DaemonErrorCode::Internal,
                 "VPN lifecycle controller is unavailable",
             )),
@@ -123,17 +131,37 @@ impl CommandHandler for SnapshotHandler {
 }
 
 pub async fn serve_connection(
+    stream: UnixStream,
+    policy: PeerPolicy,
+    handler: Arc<dyn CommandHandler>,
+) -> Result<(), DaemonErrorCode> {
+    serve_connection_with_limits(
+        stream,
+        policy,
+        handler,
+        FRAME_IO_TIMEOUT,
+        MAX_REQUESTS_PER_CONNECTION,
+    )
+    .await
+}
+
+pub async fn serve_connection_with_limits(
     mut stream: UnixStream,
     policy: PeerPolicy,
     handler: Arc<dyn CommandHandler>,
+    io_timeout: Duration,
+    max_requests: usize,
 ) -> Result<(), DaemonErrorCode> {
     let uid = peer_uid(&stream).map_err(|_| DaemonErrorCode::Unauthorized)?;
     if !policy.authorize(uid) {
         return Err(DaemonErrorCode::Unauthorized);
     }
 
-    loop {
-        let bytes = match read_frame(&mut stream).await {
+    for _ in 0..max_requests {
+        let bytes = match timeout(io_timeout, read_frame(&mut stream))
+            .await
+            .map_err(|_| DaemonErrorCode::InvalidFrame)?
+        {
             Ok(bytes) => bytes,
             Err(DaemonErrorCode::InvalidFrame) => return Ok(()),
             Err(error) => return Err(error),
@@ -149,17 +177,32 @@ pub async fn serve_connection(
                         message: "invalid daemon request".to_string(),
                     }),
                 };
-                write_response(&mut stream, &response).await?;
+                timeout(io_timeout, write_response(&mut stream, &response))
+                    .await
+                    .map_err(|_| DaemonErrorCode::Internal)??;
                 continue;
             }
         };
+        let operation = request.operation_id;
+        let command_handler = Arc::clone(&handler);
+        let command = request.command;
+        let result = timeout(
+            COMMAND_TIMEOUT,
+            tokio::spawn(async move { command_handler.handle(command).await }),
+        )
+        .await
+        .map_err(|_| DaemonErrorCode::Internal)?
+        .map_err(|_| DaemonErrorCode::Internal)?;
         let response = ResponseEnvelope {
             version: PROTOCOL_VERSION,
-            operation_id: request.operation_id,
-            result: handler.handle(request.command).await,
+            operation_id: operation,
+            result,
         };
-        write_response(&mut stream, &response).await?;
+        timeout(io_timeout, write_response(&mut stream, &response))
+            .await
+            .map_err(|_| DaemonErrorCode::Internal)??;
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -170,7 +213,10 @@ mod tests {
     use tokio::net::UnixStream;
     use tokio::sync::RwLock;
 
-    use super::{serve_connection, PeerPolicy, SnapshotHandler};
+    use super::{
+        serve_connection, serve_connection_with_limits, PeerPolicy, SnapshotHandler,
+        MAX_CONCURRENT_CLIENTS,
+    };
     use crate::protocol::{
         decode_response_frame, encode_frame, ConnectionPhase, DaemonCommand, DaemonState,
         RequestEnvelope, PROTOCOL_VERSION,
@@ -184,6 +230,7 @@ mod tests {
             split_active: false,
             dns_protected: false,
             rtt_ms: None,
+            log_tail: None,
         }));
         let handler = Arc::new(SnapshotHandler::new(state));
         let server_task = tokio::spawn(serve_connection(
@@ -205,5 +252,31 @@ mod tests {
         );
         drop(client);
         server_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn idle_clients_are_timed_out_and_connection_count_is_bounded() {
+        assert!((1..=32).contains(&MAX_CONCURRENT_CLIENTS));
+        let (_client, server) = UnixStream::pair().unwrap();
+        let state = Arc::new(RwLock::new(DaemonState {
+            phase: ConnectionPhase::Disconnected,
+            split_active: false,
+            dns_protected: false,
+            rtt_ms: None,
+            log_tail: None,
+        }));
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            serve_connection_with_limits(
+                server,
+                PeerPolicy::new(unsafe { libc::getuid() }),
+                Arc::new(SnapshotHandler::new(state)),
+                std::time::Duration::from_millis(25),
+                1,
+            ),
+        )
+        .await
+        .expect("server enforced its own deadline");
+        assert_eq!(result, Err(crate::protocol::DaemonErrorCode::InvalidFrame));
     }
 }

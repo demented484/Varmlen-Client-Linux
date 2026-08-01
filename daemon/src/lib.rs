@@ -1,6 +1,7 @@
 pub mod controller;
 pub mod dns;
 pub mod lifecycle;
+pub mod log_store;
 pub mod nft;
 pub mod protocol;
 pub mod recovery;

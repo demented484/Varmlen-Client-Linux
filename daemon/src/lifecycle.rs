@@ -32,6 +32,7 @@ impl<B: LifecycleBackend> LifecycleManager<B> {
                 split_active: false,
                 dns_protected: false,
                 rtt_ms: None,
+                log_tail: None,
             },
             block_on_failure: false,
         }
@@ -143,6 +144,7 @@ impl<B: LifecycleBackend> LifecycleManager<B> {
             split_active: !request.excluded_apps.is_empty(),
             dns_protected: guarded,
             rtt_ms: None,
+            log_tail: None,
         };
         self.block_on_failure = guarded && request.killswitch;
         Ok(self.state.clone())
@@ -163,6 +165,7 @@ impl<B: LifecycleBackend> LifecycleManager<B> {
             split_active: false,
             dns_protected: false,
             rtt_ms: None,
+            log_tail: None,
         };
         self.block_on_failure = false;
         Ok(self.state.clone())
@@ -189,6 +192,7 @@ impl<B: LifecycleBackend> LifecycleManager<B> {
             split_active: false,
             dns_protected: false,
             rtt_ms: None,
+            log_tail: None,
         };
         Ok(self.state.clone())
     }

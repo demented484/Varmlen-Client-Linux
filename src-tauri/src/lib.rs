@@ -28,9 +28,44 @@ fn parse_subscription_body(body: String) -> Vec<VlessServer> {
     parse_subscription(&body)
 }
 
-/// True for hosts we refuse to fetch (SSRF guard): localhost and literal
-/// loopback / private / link-local / CGNAT addresses. A domain that *resolves*
-/// to a private IP isn't caught here — an accepted residual for now.
+fn is_blocked_ip(address: std::net::IpAddr) -> bool {
+    match address {
+        std::net::IpAddr::V4(v4) => {
+            let octets = v4.octets();
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_multicast()
+                || octets[0] == 0
+                || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+                || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
+                || (octets[0] == 192 && octets[1] == 0 && octets[2] == 2)
+                || (octets[0] == 198 && (octets[1] == 18 || octets[1] == 19))
+                || (octets[0] == 198 && octets[1] == 51 && octets[2] == 100)
+                || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113)
+                || octets[0] >= 240
+        }
+        std::net::IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_blocked_ip(std::net::IpAddr::V4(v4));
+            }
+            let octets = v6.octets();
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || (octets[0] & 0xfe) == 0xfc
+                || (octets[0] == 0xfe && (octets[1] & 0xc0) == 0x80)
+                || (octets[0] == 0x20
+                    && octets[1] == 0x01
+                    && octets[2] == 0x0d
+                    && octets[3] == 0xb8)
+        }
+    }
+}
+
+/// True for hosts we refuse to fetch before DNS resolution.
 fn is_blocked_host(host: &str) -> bool {
     let h = host
         .trim()
@@ -40,22 +75,66 @@ fn is_blocked_host(host: &str) -> bool {
     if h == "localhost" || h.ends_with(".localhost") {
         return true;
     }
-    match h.parse::<std::net::IpAddr>() {
-        Ok(std::net::IpAddr::V4(v4)) => {
-            v4.is_loopback()
-                || v4.is_private()
-                || v4.is_link_local()
-                || v4.is_unspecified()
-                || (v4.octets()[0] == 100 && (64..=127).contains(&v4.octets()[1]))
+    h.parse::<std::net::IpAddr>().is_ok_and(is_blocked_ip)
+}
+
+async fn fetch_subscription_response(
+    mut url: url::Url,
+    user_agent: &str,
+    device_os: &str,
+) -> Result<reqwest::Response, String> {
+    const MAX_REDIRECTS: usize = 5;
+    for redirect_count in 0..=MAX_REDIRECTS {
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(format!("unsupported URL scheme: {}", url.scheme()));
         }
-        Ok(std::net::IpAddr::V6(v6)) => {
-            v6.is_loopback()
-                || v6.is_unspecified()
-                || (v6.octets()[0] & 0xfe) == 0xfc
-                || (v6.octets()[0] == 0xfe && (v6.octets()[1] & 0xc0) == 0x80)
+        if !url.username().is_empty() || url.password().is_some() {
+            return Err("subscription URLs with embedded credentials are not permitted".into());
         }
-        Err(_) => false,
+        let host = url
+            .host_str()
+            .filter(|host| !is_blocked_host(host))
+            .ok_or_else(|| "refusing to fetch a loopback/private address".to_string())?;
+        let port = url
+            .port_or_known_default()
+            .ok_or_else(|| "subscription URL has no usable port".to_string())?;
+        let addresses = tokio::net::lookup_host((host, port))
+            .await
+            .map_err(|error| format!("subscription host resolution failed: {error}"))?
+            .collect::<Vec<_>>();
+        if addresses.is_empty() || addresses.iter().any(|address| is_blocked_ip(address.ip())) {
+            return Err("refusing to fetch a host that resolves to a non-public address".into());
+        }
+
+        let client = reqwest::Client::builder()
+            .user_agent(user_agent)
+            .timeout(Duration::from_secs(15))
+            .redirect(reqwest::redirect::Policy::none())
+            .resolve_to_addrs(host, &addresses)
+            .build()
+            .map_err(|error| format!("http client: {error}"))?;
+        let response = client
+            .get(url.clone())
+            .header("X-Device-OS", device_os)
+            .send()
+            .await
+            .map_err(|error| format!("request failed: {error}"))?;
+        if !response.status().is_redirection() {
+            return Ok(response);
+        }
+        if redirect_count == MAX_REDIRECTS {
+            return Err("too many redirects".into());
+        }
+        let location = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .ok_or_else(|| "redirect response has no valid Location header".to_string())?;
+        url = url
+            .join(location)
+            .map_err(|error| format!("invalid redirect URL: {error}"))?;
     }
+    Err("too many redirects".into())
 }
 
 fn target_platform() -> &'static str {
@@ -154,44 +233,9 @@ async fn fetch_subscription(
             .map_err(|e| e.to_string());
     }
 
-    // SSRF guard: web schemes only, and reject loopback/private/link-local
-    // targets (a benign-looking URL could otherwise 30x into LAN/metadata).
     let parsed = url::Url::parse(trimmed).map_err(|e| format!("bad URL: {e}"))?;
-    if !matches!(parsed.scheme(), "http" | "https") {
-        return Err(format!("unsupported URL scheme: {}", parsed.scheme()));
-    }
-    if parsed.host_str().map(is_blocked_host).unwrap_or(true) {
-        return Err("refusing to fetch a loopback/private address".to_string());
-    }
-
     let (user_agent, device_os) = subscription_headers(subscription_user_agent.as_deref())?;
-    let client = reqwest::Client::builder()
-        .user_agent(user_agent)
-        .timeout(Duration::from_secs(15))
-        // Validate every redirect hop too, so a 30x can't escape the guard.
-        .redirect(reqwest::redirect::Policy::custom(|attempt| {
-            if attempt.previous().len() >= 5 {
-                attempt.error("too many redirects")
-            } else if attempt
-                .url()
-                .host_str()
-                .map(is_blocked_host)
-                .unwrap_or(true)
-            {
-                attempt.error("redirect to a loopback/private address")
-            } else {
-                attempt.follow()
-            }
-        }))
-        .build()
-        .map_err(|e| format!("http client: {e}"))?;
-
-    let resp = client
-        .get(trimmed)
-        .header("X-Device-OS", device_os)
-        .send()
-        .await
-        .map_err(|e| format!("request failed: {e}"))?;
+    let resp = fetch_subscription_response(parsed, &user_agent, &device_os).await?;
 
     if !resp.status().is_success() {
         return Err(format!("HTTP {}", resp.status()));
@@ -388,6 +432,25 @@ pub fn run() {
 mod tests {
     use super::*;
 
+    #[test]
+    fn subscription_fetch_rejects_non_public_address_ranges() {
+        for address in [
+            "127.0.0.1",
+            "10.0.0.1",
+            "100.64.0.1",
+            "169.254.1.1",
+            "224.0.0.1",
+            "::1",
+            "fc00::1",
+            "fe80::1",
+            "ff02::1",
+            "::ffff:127.0.0.1",
+        ] {
+            assert!(is_blocked_ip(address.parse().unwrap()), "{address}");
+        }
+        assert!(!is_blocked_ip("1.1.1.1".parse().unwrap()));
+        assert!(!is_blocked_ip("2606:4700:4700::1111".parse().unwrap()));
+    }
     #[test]
     fn subscription_ua_choices_are_bounded_and_platform_specific() {
         for (choice, brand) in [

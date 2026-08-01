@@ -1,9 +1,11 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 
 use crate::lifecycle::LifecycleManager;
+use crate::log_store::{LogStore, MAX_LOG_TAIL_BYTES};
 use crate::protocol::{ConnectionPhase, DaemonCommand, DaemonError, DaemonErrorCode, DaemonState};
 use crate::server::CommandHandler;
 use crate::state::{PersistedState, StateStore};
@@ -13,17 +15,18 @@ pub struct SystemController {
     owner_uid: u32,
     manager: Mutex<LifecycleManager<SystemLifecycleBackend>>,
     state_path: PathBuf,
+    log_store: Arc<Mutex<LogStore>>,
 }
 
 impl SystemController {
     pub fn new(owner_uid: u32, phase: ConnectionPhase, state_path: PathBuf) -> Self {
+        let backend = SystemLifecycleBackend::installed(owner_uid);
+        let log_store = backend.log_store();
         Self {
             owner_uid,
-            manager: Mutex::new(LifecycleManager::new(
-                SystemLifecycleBackend::installed(owner_uid),
-                phase,
-            )),
+            manager: Mutex::new(LifecycleManager::new(backend, phase)),
             state_path,
+            log_store,
         }
     }
 
@@ -58,6 +61,31 @@ impl SystemController {
 impl CommandHandler for SystemController {
     async fn handle(&self, command: DaemonCommand) -> Result<DaemonState, DaemonError> {
         match command {
+            DaemonCommand::LogTail => {
+                let log_tail = self
+                    .log_store
+                    .lock()
+                    .await
+                    .tail(MAX_LOG_TAIL_BYTES)
+                    .map_err(|error| {
+                        DaemonError::new(
+                            DaemonErrorCode::Internal,
+                            format!("could not read Xray log: {error}"),
+                        )
+                    })?;
+                let mut state = self.manager.lock().await.state().clone();
+                state.log_tail = Some(log_tail);
+                return Ok(state);
+            }
+            DaemonCommand::ClearLog => {
+                self.log_store.lock().await.clear().map_err(|error| {
+                    DaemonError::new(
+                        DaemonErrorCode::Internal,
+                        format!("could not clear Xray log: {error}"),
+                    )
+                })?;
+                return Ok(self.manager.lock().await.state().clone());
+            }
             DaemonCommand::TcpPing(request) => {
                 let rtt = crate::system::run_tcp_ping(&request).await?;
                 let mut state = self.manager.lock().await.state().clone();
@@ -78,7 +106,10 @@ impl CommandHandler for SystemController {
             DaemonCommand::Status => manager.reconcile_health().await,
             DaemonCommand::Connect(request) => manager.connect(request).await,
             DaemonCommand::Disconnect => manager.disconnect().await,
-            DaemonCommand::TcpPing(_) | DaemonCommand::ProxyPing(_) => unreachable!(),
+            DaemonCommand::TcpPing(_)
+            | DaemonCommand::ProxyPing(_)
+            | DaemonCommand::LogTail
+            | DaemonCommand::ClearLog => unreachable!(),
         };
         self.persist(&mut manager)?;
         result

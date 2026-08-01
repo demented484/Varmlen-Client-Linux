@@ -268,9 +268,17 @@ pub async fn vpn_log(app: tauri::AppHandle) -> Result<String, String> {
     }
     #[cfg(target_os = "linux")]
     {
+        use varmlend::protocol::DaemonCommand;
+
         let _ = app;
-        let path = format!("/run/varmlen/xray-{}.log", unsafe { libc::getuid() });
-        Ok(std::fs::read_to_string(path).unwrap_or_default())
+        let Ok(mut daemon) = crate::daemon_client::DaemonClient::connect_installed().await else {
+            return Ok(String::new());
+        };
+        let state = daemon
+            .request(DaemonCommand::LogTail)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(state.log_tail.unwrap_or_default())
     }
     #[cfg(not(any(target_os = "android", target_os = "linux")))]
     {
@@ -287,9 +295,17 @@ pub async fn clear_vpn_log(app: tauri::AppHandle) -> Result<(), String> {
     }
     #[cfg(target_os = "linux")]
     {
+        use varmlend::protocol::DaemonCommand;
+
         let _ = app;
-        let path = format!("/run/varmlen/xray-{}.log", unsafe { libc::getuid() });
-        std::fs::write(path, "").map_err(|error| error.to_string())
+        let mut daemon = crate::daemon_client::DaemonClient::connect_installed()
+            .await
+            .map_err(|error| error.to_string())?;
+        daemon
+            .request(DaemonCommand::ClearLog)
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
     }
     #[cfg(not(any(target_os = "android", target_os = "linux")))]
     {

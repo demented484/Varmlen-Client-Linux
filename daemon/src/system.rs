@@ -4,15 +4,20 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use serde_json::Value;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
+use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout, Duration, Instant};
 
 use crate::dns::{DnsBackend, DnsGuard, SystemDnsBackend};
 use crate::lifecycle::LifecycleBackend;
+use crate::log_store::LogStore;
 use crate::protocol::{
     ConnectRequest, ConnectionMode, DaemonError, DaemonErrorCode, ProxyPingRequest, TcpPingRequest,
     MAX_SERVER_IPS,
@@ -253,6 +258,8 @@ pub struct SystemLifecycleBackend {
     mode: Option<ConnectionMode>,
     dns_active: bool,
     split: Option<SplitManager<SystemSplitBackend>>,
+    log_store: Arc<Mutex<LogStore>>,
+    log_tasks: Vec<JoinHandle<()>>,
 }
 
 impl SystemLifecycleBackend {
@@ -281,11 +288,17 @@ impl SystemLifecycleBackend {
             mode: None,
             dns_active: false,
             split: None,
+            log_store: Arc::new(Mutex::new(LogStore::for_owner(owner_uid))),
+            log_tasks: Vec::new(),
         }
     }
 
     pub fn xray_identity(&self) -> Option<ProcessIdentity> {
         self.xray_identity.clone()
+    }
+
+    pub fn log_store(&self) -> Arc<Mutex<LogStore>> {
+        Arc::clone(&self.log_store)
     }
 
     pub fn child_is_running(&mut self) -> bool {
@@ -300,10 +313,6 @@ impl SystemLifecycleBackend {
 
     fn validation_path(&self) -> PathBuf {
         self.runtime_dir.join("xray-validation.json")
-    }
-
-    fn log_path(&self) -> PathBuf {
-        PathBuf::from(format!("/run/varmlen/xray-{}.log", self.owner_uid))
     }
 
     fn prepare_runtime_dir(&self) -> Result<(), DaemonError> {
@@ -333,10 +342,10 @@ impl SystemLifecycleBackend {
         result.map_err(internal_io("write private Xray configuration"))
     }
 
-    async fn run_xray_validation(&self) -> Result<(), DaemonError> {
+    async fn run_xray_validation(&self, path: &Path) -> Result<(), DaemonError> {
         let output = Command::new(&self.xray_path)
             .args(["run", "-test", "-c"])
-            .arg(self.validation_path())
+            .arg(path)
             .env_clear()
             .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
             .output()
@@ -358,6 +367,88 @@ impl SystemLifecycleBackend {
                 stderr.trim()
             ),
         ))
+    }
+
+    async fn run_validation_egress_probe(&self, config: &str) -> Result<(), DaemonError> {
+        let mut last_error = None;
+        for _ in 0..4 {
+            let reservation = std::net::TcpListener::bind("127.0.0.1:0").map_err(|error| {
+                DaemonError::new(
+                    DaemonErrorCode::XrayValidationFailed,
+                    format!("could not reserve a validation port: {error}"),
+                )
+            })?;
+            let port = reservation
+                .local_addr()
+                .map_err(internal_io("read validation port"))?
+                .port();
+            let config = validation_config_with_port(config, port)?;
+            self.write_private(&self.validation_path(), &config)?;
+            self.run_xray_validation(&self.validation_path()).await?;
+            drop(reservation);
+
+            let mut child = Command::new(&self.xray_path)
+                .args(["run", "-c"])
+                .arg(self.validation_path())
+                .env_clear()
+                .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(|error| {
+                    DaemonError::new(
+                        DaemonErrorCode::XrayValidationFailed,
+                        format!("could not start Xray egress validation: {error}"),
+                    )
+                })?;
+            let result = timeout(Duration::from_secs(12), async {
+                loop {
+                    if child.try_wait().is_ok_and(|status| status.is_some()) {
+                        return Err(DaemonError::new(
+                            DaemonErrorCode::XrayValidationFailed,
+                            "validation Xray exited before its proxy became ready",
+                        ));
+                    }
+                    if tokio::net::TcpStream::connect(("127.0.0.1", port))
+                        .await
+                        .is_ok()
+                    {
+                        break;
+                    }
+                    sleep(Duration::from_millis(50)).await;
+                }
+                probe_proxy_port(port, Duration::from_secs(8))
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| {
+                        DaemonError::new(
+                            DaemonErrorCode::XrayValidationFailed,
+                            format!("candidate has no verified remote egress: {}", error.message),
+                        )
+                    })
+            })
+            .await
+            .map_err(|_| {
+                DaemonError::new(
+                    DaemonErrorCode::XrayValidationFailed,
+                    "candidate remote egress validation timed out",
+                )
+            })
+            .and_then(|result| result);
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            match result {
+                Ok(()) => return Ok(()),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| {
+            DaemonError::new(
+                DaemonErrorCode::XrayValidationFailed,
+                "candidate remote egress validation failed",
+            )
+        }))
     }
 
     async fn run_net_helper(&self, arguments: &[String]) -> Result<(), DaemonError> {
@@ -401,6 +492,7 @@ impl SystemLifecycleBackend {
     async fn terminate_xray(&mut self) -> Result<(), DaemonError> {
         let Some(mut child) = self.xray.take() else {
             self.xray_identity = None;
+            self.stop_log_tasks().await;
             return Ok(());
         };
         if let Some(pid) = child.id() {
@@ -417,8 +509,16 @@ impl SystemLifecycleBackend {
             })?;
             let _ = child.wait().await;
         }
+        self.stop_log_tasks().await;
         self.xray_identity = None;
         Ok(())
+    }
+
+    async fn stop_log_tasks(&mut self) {
+        for task in self.log_tasks.drain(..) {
+            task.abort();
+            let _ = task.await;
+        }
     }
 
     async fn wait_until_ready(&mut self, mode: ConnectionMode) -> Result<(), DaemonError> {
@@ -482,7 +582,10 @@ impl LifecycleBackend for SystemLifecycleBackend {
         validate_xray_document(&request.validation_config, false)?;
         self.prepare_runtime_dir()?;
         self.write_private(&self.validation_path(), &request.validation_config)?;
-        self.run_xray_validation().await
+        self.write_private(&self.config_path(), &request.xray_config)?;
+        self.run_xray_validation(&self.config_path()).await?;
+        self.run_validation_egress_probe(&request.validation_config)
+            .await
     }
 
     async fn install_hold_block(&mut self, request: &ConnectRequest) -> Result<(), DaemonError> {
@@ -551,25 +654,19 @@ impl LifecycleBackend for SystemLifecycleBackend {
     async fn start_data_plane(&mut self, request: &ConnectRequest) -> Result<(), DaemonError> {
         self.prepare_runtime_dir()?;
         self.write_private(&self.config_path(), &request.xray_config)?;
-        let log = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(self.log_path())
-            .map_err(internal_io("open Xray log"))?;
-        let stderr = log.try_clone().map_err(internal_io("clone Xray log"))?;
-        std::os::unix::fs::chown(self.log_path(), Some(self.owner_uid), Some(self.owner_uid))
-            .map_err(internal_io("assign Xray log ownership"))?;
-        let child = Command::new(&self.xray_path)
+        self.log_store
+            .lock()
+            .await
+            .clear()
+            .map_err(internal_io("clear Xray log"))?;
+        let mut child = Command::new(&self.xray_path)
             .args(["run", "-c"])
             .arg(self.config_path())
             .env_clear()
             .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
             .stdin(Stdio::null())
-            .stdout(Stdio::from(log))
-            .stderr(Stdio::from(stderr))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .spawn()
             .map_err(|error| {
                 DaemonError::new(
@@ -577,6 +674,14 @@ impl LifecycleBackend for SystemLifecycleBackend {
                     format!("could not start installed Xray: {error}"),
                 )
             })?;
+        if let Some(stdout) = child.stdout.take() {
+            self.log_tasks
+                .push(tokio::spawn(pump_xray_log(stdout, self.log_store())));
+        }
+        if let Some(stderr) = child.stderr.take() {
+            self.log_tasks
+                .push(tokio::spawn(pump_xray_log(stderr, self.log_store())));
+        }
         let pid = child.id().ok_or_else(|| {
             DaemonError::new(
                 DaemonErrorCode::XrayStartFailed,
@@ -707,6 +812,43 @@ pub fn ensure_trusted_binary(path: &Path) -> Result<(), DaemonError> {
     Ok(())
 }
 
+fn validation_config_with_port(raw: &str, port: u16) -> Result<String, DaemonError> {
+    if port < 1024 {
+        return Err(DaemonError::new(
+            DaemonErrorCode::InvalidRequest,
+            "validation port must be unprivileged",
+        ));
+    }
+    let mut document: Value = serde_json::from_str(raw).map_err(|error| {
+        DaemonError::new(
+            DaemonErrorCode::InvalidRequest,
+            format!("invalid validation Xray JSON: {error}"),
+        )
+    })?;
+    let inbound = document
+        .get_mut("inbounds")
+        .and_then(Value::as_array_mut)
+        .and_then(|inbounds| (inbounds.len() == 1).then(|| &mut inbounds[0]))
+        .filter(|inbound| {
+            inbound.get("tag").and_then(Value::as_str) == Some("socks-in")
+                && inbound.get("protocol").and_then(Value::as_str) == Some("socks")
+                && inbound.get("listen").and_then(Value::as_str) == Some("127.0.0.1")
+        })
+        .ok_or_else(|| {
+            DaemonError::new(
+                DaemonErrorCode::InvalidRequest,
+                "validation config has no fixed loopback SOCKS inbound",
+            )
+        })?;
+    inbound["port"] = serde_json::json!(port);
+    serde_json::to_string(&document).map_err(|error| {
+        DaemonError::new(
+            DaemonErrorCode::Internal,
+            format!("could not serialize validation Xray JSON: {error}"),
+        )
+    })
+}
+
 pub fn validate_xray_document(raw: &str, expects_tun: bool) -> Result<(), DaemonError> {
     let document: Value = serde_json::from_str(raw).map_err(|error| {
         DaemonError::new(
@@ -723,7 +865,13 @@ pub fn validate_xray_document(raw: &str, expects_tun: bool) -> Result<(), Daemon
     if object.keys().any(|key| {
         !matches!(
             key.as_str(),
-            "log" | "dns" | "inbounds" | "outbounds" | "routing"
+            "log"
+                | "dns"
+                | "inbounds"
+                | "outbounds"
+                | "routing"
+                | "observatory"
+                | "burstObservatory"
         )
     }) {
         return Err(DaemonError::new(
@@ -786,15 +934,50 @@ pub fn validate_xray_document(raw: &str, expects_tun: bool) -> Result<(), Daemon
                 "Xray outbounds are missing",
             )
         })?;
-    if outbounds.len() != 4
-        || outbounds.iter().any(|outbound| {
-            !matches!(
+    let mut tags = HashSet::new();
+    let valid_tags = outbounds.iter().all(|outbound| {
+        outbound
+            .get("tag")
+            .and_then(Value::as_str)
+            .is_some_and(|tag| !tag.is_empty() && tags.insert(tag))
+    });
+    let proxy_count = outbounds
+        .iter()
+        .filter(|outbound| {
+            matches!(
                 outbound.get("protocol").and_then(Value::as_str),
                 Some(
-                    "vless" | "vmess" | "trojan" | "shadowsocks" | "freedom" | "dns" | "blackhole"
+                    "http"
+                        | "socks"
+                        | "shadowsocks"
+                        | "vmess"
+                        | "vless"
+                        | "trojan"
+                        | "hysteria"
+                        | "wireguard"
                 )
             )
         })
+        .count();
+    let required_system_outbounds = [
+        ("direct", "freedom"),
+        ("dns-out", "dns"),
+        ("block", "blackhole"),
+    ];
+    let system_outbounds_are_exact = required_system_outbounds.iter().all(|(tag, protocol)| {
+        outbounds
+            .iter()
+            .filter(|outbound| {
+                outbound.get("tag").and_then(Value::as_str) == Some(*tag)
+                    && outbound.get("protocol").and_then(Value::as_str) == Some(*protocol)
+            })
+            .count()
+            == 1
+    });
+    if !valid_tags
+        || !(1..=MAX_SERVER_IPS).contains(&proxy_count)
+        || outbounds.len() != proxy_count + required_system_outbounds.len()
+        || !system_outbounds_are_exact
     {
         return Err(DaemonError::new(
             DaemonErrorCode::InvalidRequest,
@@ -1105,6 +1288,22 @@ fn contains_forbidden_file_key(value: &Value) -> bool {
     }
 }
 
+async fn pump_xray_log<R>(mut reader: R, store: Arc<Mutex<LogStore>>)
+where
+    R: AsyncRead + Unpin,
+{
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let count = match reader.read(&mut buffer).await {
+            Ok(0) | Err(_) => break,
+            Ok(count) => count,
+        };
+        if store.lock().await.append(&buffer[..count]).is_err() {
+            break;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -1113,7 +1312,7 @@ mod tests {
 
     use super::{
         build_proxy_ping_request, first_success, validate_ping_xray_document,
-        validate_xray_document, PROXY_PING_URL,
+        validate_xray_document, validation_config_with_port, PROXY_PING_URL,
     };
     use crate::protocol::DaemonErrorCode;
 
@@ -1134,6 +1333,21 @@ mod tests {
     }
 
     #[test]
+    fn daemon_owns_the_ephemeral_validation_port() {
+        let original = config(json!({
+            "tag": "socks-in",
+            "listen": "127.0.0.1",
+            "port": 2081,
+            "protocol": "socks",
+            "settings": {"auth":"noauth", "udp":true}
+        }));
+        let rewritten = validation_config_with_port(&original, 43123).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&rewritten).unwrap();
+        assert_eq!(value["inbounds"][0]["port"], 43123);
+        assert_eq!(value["inbounds"][0]["listen"], "127.0.0.1");
+    }
+
+    #[test]
     fn accepts_fixed_tun_with_no_local_dns_inbound() {
         let raw = config(json!({
             "tag": "tun-in",
@@ -1141,6 +1355,31 @@ mod tests {
             "settings": {"name": "varmlen0", "mtu": 1500}
         }));
         assert!(validate_xray_document(&raw, true).is_ok());
+    }
+
+    #[test]
+    fn accepts_composite_profiles_with_every_supported_xray_proxy() {
+        let mut value: serde_json::Value = serde_json::from_str(&config(json!({
+            "tag": "tun-in",
+            "protocol": "tun",
+            "settings": {"name": "varmlen0", "mtu": 1500}
+        })))
+        .unwrap();
+        value["outbounds"] = json!([
+            {"tag":"p-http", "protocol":"http"},
+            {"tag":"p-socks", "protocol":"socks"},
+            {"tag":"p-ss", "protocol":"shadowsocks"},
+            {"tag":"p-vmess", "protocol":"vmess"},
+            {"tag":"p-vless", "protocol":"vless"},
+            {"tag":"p-trojan", "protocol":"trojan"},
+            {"tag":"p-hysteria", "protocol":"hysteria"},
+            {"tag":"p-wireguard", "protocol":"wireguard"},
+            {"tag":"direct", "protocol":"freedom"},
+            {"tag":"dns-out", "protocol":"dns"},
+            {"tag":"block", "protocol":"blackhole"}
+        ]);
+        value["observatory"] = json!({"subjectSelector":["p-"]});
+        assert!(validate_xray_document(&value.to_string(), true).is_ok());
     }
 
     #[test]

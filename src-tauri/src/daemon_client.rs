@@ -4,7 +4,7 @@ use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::process::Command;
-use tokio::time::{sleep, Duration};
+use tokio::time::{sleep, timeout, Duration};
 use varmlend::protocol::{
     decode_response_frame, encode_frame, DaemonCommand, DaemonError, DaemonState, RequestEnvelope,
     MAX_FRAME_BYTES, PROTOCOL_VERSION,
@@ -24,6 +24,8 @@ pub enum ClientError {
     Unavailable(String),
     #[error("restart required: {0}")]
     RestartRequired(String),
+    #[error("daemon request timed out while {0}")]
+    Timeout(&'static str),
 }
 
 impl From<DaemonError> for ClientError {
@@ -47,7 +49,9 @@ impl DaemonClient {
 
     pub async fn connect(path: &Path) -> Result<Self, ClientError> {
         Ok(Self {
-            stream: UnixStream::connect(path).await?,
+            stream: timeout(Duration::from_secs(5), UnixStream::connect(path))
+                .await
+                .map_err(|_| ClientError::Timeout("connecting"))??,
             next_operation_id: 1,
         })
     }
@@ -121,17 +125,29 @@ impl DaemonClient {
         let request = RequestEnvelope::new(PROTOCOL_VERSION, operation_id, command);
         let bytes = encode_frame(&request).map_err(ClientError::Protocol)?;
 
-        self.stream.write_u32(bytes.len() as u32).await?;
-        self.stream.write_all(&bytes).await?;
+        timeout(Duration::from_secs(5), async {
+            self.stream.write_u32(bytes.len() as u32).await?;
+            self.stream.write_all(&bytes).await
+        })
+        .await
+        .map_err(|_| ClientError::Timeout("writing"))??;
 
-        let length = self.stream.read_u32().await? as usize;
+        let length = timeout(Duration::from_secs(60), self.stream.read_u32())
+            .await
+            .map_err(|_| ClientError::Timeout("waiting for a response"))??
+            as usize;
         if length > MAX_FRAME_BYTES {
             return Err(ClientError::Protocol(
                 varmlend::protocol::DaemonErrorCode::FrameTooLarge,
             ));
         }
         let mut response_bytes = vec![0; length];
-        self.stream.read_exact(&mut response_bytes).await?;
+        timeout(
+            Duration::from_secs(5),
+            self.stream.read_exact(&mut response_bytes),
+        )
+        .await
+        .map_err(|_| ClientError::Timeout("reading a response"))??;
         let response = decode_response_frame(&response_bytes).map_err(ClientError::Protocol)?;
         if response.operation_id != operation_id {
             return Err(ClientError::OperationMismatch);
@@ -171,6 +187,7 @@ mod tests {
                         split_active: false,
                         dns_protected: false,
                         rtt_ms: None,
+                        log_tail: None,
                     }),
                 },
             )
