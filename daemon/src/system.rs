@@ -370,22 +370,32 @@ impl SystemLifecycleBackend {
     }
 
     async fn run_validation_egress_probe(&self, config: &str) -> Result<(), DaemonError> {
+        let template_ports = validation_config_ports(config)?;
         let mut last_error = None;
         for _ in 0..4 {
-            let reservation = std::net::TcpListener::bind("127.0.0.1:0").map_err(|error| {
-                DaemonError::new(
-                    DaemonErrorCode::XrayValidationFailed,
-                    format!("could not reserve a validation port: {error}"),
-                )
-            })?;
-            let port = reservation
-                .local_addr()
-                .map_err(internal_io("read validation port"))?
-                .port();
-            let config = validation_config_with_port(config, port)?;
+            let reservations = (0..template_ports.len())
+                .map(|_| std::net::TcpListener::bind("127.0.0.1:0"))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| {
+                    DaemonError::new(
+                        DaemonErrorCode::XrayValidationFailed,
+                        format!("could not reserve validation ports: {error}"),
+                    )
+                })?;
+            let ports = reservations
+                .iter()
+                .map(|reservation| {
+                    reservation
+                        .local_addr()
+                        .map(|address| address.port())
+                        .map_err(internal_io("read validation port"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let config = validation_config_with_ports(config, &ports)?;
+            validate_ping_xray_document(&config, &ports)?;
             self.write_private(&self.validation_path(), &config)?;
             self.run_xray_validation(&self.validation_path()).await?;
-            drop(reservation);
+            drop(reservations);
 
             let mut child = Command::new(&self.xray_path)
                 .args(["run", "-c"])
@@ -410,23 +420,50 @@ impl SystemLifecycleBackend {
                             "validation Xray exited before its proxy became ready",
                         ));
                     }
-                    if tokio::net::TcpStream::connect(("127.0.0.1", port))
+                    let readiness = ports.iter().copied().map(|port| async move {
+                        timeout(
+                            Duration::from_millis(100),
+                            tokio::net::TcpStream::connect(("127.0.0.1", port)),
+                        )
                         .await
-                        .is_ok()
+                        .is_ok_and(|result| result.is_ok())
+                    });
+                    if futures_util::future::join_all(readiness)
+                        .await
+                        .into_iter()
+                        .all(|ready| ready)
                     {
                         break;
                     }
                     sleep(Duration::from_millis(50)).await;
                 }
-                probe_proxy_port(port, Duration::from_secs(8))
-                    .await
-                    .map(|_| ())
-                    .map_err(|error| {
-                        DaemonError::new(
-                            DaemonErrorCode::XrayValidationFailed,
-                            format!("candidate has no verified remote egress: {}", error.message),
-                        )
-                    })
+                let results = futures_util::future::join_all(
+                    ports
+                        .iter()
+                        .copied()
+                        .map(|port| probe_proxy_port(port, Duration::from_secs(8))),
+                )
+                .await;
+                let failed = results
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, result)| result.as_ref().err().map(|_| index + 1))
+                    .collect::<Vec<_>>();
+                if failed.is_empty() {
+                    Ok(())
+                } else {
+                    Err(DaemonError::new(
+                        DaemonErrorCode::XrayValidationFailed,
+                        format!(
+                            "candidate has no verified remote egress on outbound path(s): {}",
+                            failed
+                                .iter()
+                                .map(ToString::to_string)
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                    ))
+                }
             })
             .await
             .map_err(|_| {
@@ -579,7 +616,8 @@ impl LifecycleBackend for SystemLifecycleBackend {
         ensure_trusted_binary(&self.xray_path)?;
         ensure_trusted_binary(&self.net_helper_path)?;
         validate_xray_document(&request.xray_config, request.mode == ConnectionMode::Tun)?;
-        validate_xray_document(&request.validation_config, false)?;
+        let validation_ports = validation_config_ports(&request.validation_config)?;
+        validate_ping_xray_document(&request.validation_config, &validation_ports)?;
         self.prepare_runtime_dir()?;
         self.write_private(&self.validation_path(), &request.validation_config)?;
         self.write_private(&self.config_path(), &request.xray_config)?;
@@ -812,11 +850,50 @@ pub fn ensure_trusted_binary(path: &Path) -> Result<(), DaemonError> {
     Ok(())
 }
 
-fn validation_config_with_port(raw: &str, port: u16) -> Result<String, DaemonError> {
-    if port < 1024 {
+fn validation_config_ports(raw: &str) -> Result<Vec<u16>, DaemonError> {
+    let document: Value = serde_json::from_str(raw).map_err(|error| {
+        DaemonError::new(
+            DaemonErrorCode::InvalidRequest,
+            format!("invalid validation Xray JSON: {error}"),
+        )
+    })?;
+    let inbounds = document
+        .get("inbounds")
+        .and_then(Value::as_array)
+        .filter(|inbounds| (1..=MAX_SERVER_IPS).contains(&inbounds.len()))
+        .ok_or_else(|| {
+            DaemonError::new(
+                DaemonErrorCode::InvalidRequest,
+                "validation config must contain one inbound per proxy path",
+            )
+        })?;
+    inbounds
+        .iter()
+        .map(|inbound| {
+            inbound
+                .get("port")
+                .and_then(Value::as_u64)
+                .and_then(|port| u16::try_from(port).ok())
+                .filter(|port| *port >= 1024)
+                .ok_or_else(|| {
+                    DaemonError::new(
+                        DaemonErrorCode::InvalidRequest,
+                        "validation config contains an invalid port",
+                    )
+                })
+        })
+        .collect()
+}
+
+fn validation_config_with_ports(raw: &str, ports: &[u16]) -> Result<String, DaemonError> {
+    if ports.is_empty()
+        || ports.len() > MAX_SERVER_IPS
+        || ports.iter().any(|port| *port < 1024)
+        || ports.iter().collect::<HashSet<_>>().len() != ports.len()
+    {
         return Err(DaemonError::new(
             DaemonErrorCode::InvalidRequest,
-            "validation port must be unprivileged",
+            "validation ports must be unique and unprivileged",
         ));
     }
     let mut document: Value = serde_json::from_str(raw).map_err(|error| {
@@ -825,22 +902,19 @@ fn validation_config_with_port(raw: &str, port: u16) -> Result<String, DaemonErr
             format!("invalid validation Xray JSON: {error}"),
         )
     })?;
-    let inbound = document
+    let inbounds = document
         .get_mut("inbounds")
         .and_then(Value::as_array_mut)
-        .and_then(|inbounds| (inbounds.len() == 1).then(|| &mut inbounds[0]))
-        .filter(|inbound| {
-            inbound.get("tag").and_then(Value::as_str) == Some("socks-in")
-                && inbound.get("protocol").and_then(Value::as_str) == Some("socks")
-                && inbound.get("listen").and_then(Value::as_str) == Some("127.0.0.1")
-        })
+        .filter(|inbounds| inbounds.len() == ports.len())
         .ok_or_else(|| {
             DaemonError::new(
                 DaemonErrorCode::InvalidRequest,
-                "validation config has no fixed loopback SOCKS inbound",
+                "validation config port count does not match its inbounds",
             )
         })?;
-    inbound["port"] = serde_json::json!(port);
+    for (inbound, port) in inbounds.iter_mut().zip(ports) {
+        inbound["port"] = serde_json::json!(port);
+    }
     serde_json::to_string(&document).map_err(|error| {
         DaemonError::new(
             DaemonErrorCode::Internal,
@@ -1312,7 +1386,8 @@ mod tests {
 
     use super::{
         build_proxy_ping_request, first_success, validate_ping_xray_document,
-        validate_xray_document, validation_config_with_port, PROXY_PING_URL,
+        validate_xray_document, validation_config_ports, validation_config_with_ports,
+        PROXY_PING_URL,
     };
     use crate::protocol::DaemonErrorCode;
 
@@ -1333,17 +1408,34 @@ mod tests {
     }
 
     #[test]
-    fn daemon_owns_the_ephemeral_validation_port() {
-        let original = config(json!({
-            "tag": "socks-in",
-            "listen": "127.0.0.1",
-            "port": 2081,
-            "protocol": "socks",
-            "settings": {"auth":"noauth", "udp":true}
-        }));
-        let rewritten = validation_config_with_port(&original, 43123).unwrap();
+    fn daemon_owns_every_ephemeral_validation_port() {
+        let original = json!({
+            "log": {"loglevel": "warning"},
+            "inbounds": [
+                {"tag":"socks-in-0", "listen":"127.0.0.1", "port":2081,
+                 "protocol":"socks", "settings":{"auth":"noauth", "udp":false}},
+                {"tag":"socks-in-1", "listen":"127.0.0.1", "port":2082,
+                 "protocol":"socks", "settings":{"auth":"noauth", "udp":false}}
+            ],
+            "outbounds": [
+                {"tag":"proxy", "protocol":"vless", "streamSettings":{"sockopt":{"mark":0x2024}}},
+                {"tag":"proxy-2", "protocol":"vless", "streamSettings":{"sockopt":{"mark":0x2024}}},
+                {"tag":"direct", "protocol":"freedom"}
+            ],
+            "routing": {"rules": [
+                {"type":"field", "inboundTag":["socks-in-0"], "outboundTag":"proxy"},
+                {"type":"field", "inboundTag":["socks-in-1"], "outboundTag":"proxy-2"}
+            ]}
+        })
+        .to_string();
+        assert_eq!(
+            validation_config_ports(&original).unwrap(),
+            vec![2081, 2082]
+        );
+        let rewritten = validation_config_with_ports(&original, &[43123, 43124]).unwrap();
         let value: serde_json::Value = serde_json::from_str(&rewritten).unwrap();
         assert_eq!(value["inbounds"][0]["port"], 43123);
+        assert_eq!(value["inbounds"][1]["port"], 43124);
         assert_eq!(value["inbounds"][0]["listen"], "127.0.0.1");
     }
 

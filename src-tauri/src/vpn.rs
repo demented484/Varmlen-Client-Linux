@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::split::SplitInput;
 use crate::subscription::{server_endpoints, VlessServer};
-use crate::xray::{build_xray_config, validate_server, TunMode};
+use crate::xray::{build_connection_probe_config, build_xray_config, validate_server, TunMode};
 
 #[derive(Serialize, Deserialize)]
 pub struct HelperResponse {
@@ -159,15 +159,8 @@ pub async fn vpn_connect(
             &level,
         ))
         .map_err(|error| error.to_string())?;
-        let validation_config = serde_json::to_string(&build_xray_config(
-            &server,
-            &split,
-            &mode,
-            TunMode::Tun2socks,
-            allow_lan,
-            &level,
-        ))
-        .map_err(|error| error.to_string())?;
+        let validation_config = serde_json::to_string(&build_connection_probe_config(&server)?)
+            .map_err(|error| error.to_string())?;
         let excluded_apps = if connection_mode == ConnectionMode::Tun && !split.apps_selective() {
             split.enabled_apps()
         } else {

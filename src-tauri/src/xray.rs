@@ -233,6 +233,9 @@ fn is_proxy_protocol(protocol: &str) -> bool {
 }
 
 fn sanitize_raw_outbound(outbound: &Value, preserve_tag_and_chains: bool) -> Result<Value, String> {
+    if contains_forbidden_provider_file_reference(outbound) {
+        return Err("JSON proxy outbound may not reference local files".into());
+    }
     let mut object = outbound
         .as_object()
         .cloned()
@@ -275,6 +278,20 @@ fn sanitize_raw_outbound(outbound: &Value, preserve_tag_and_chains: bool) -> Res
     }
     sockopt.insert("mark".into(), json!(XRAY_DIAL_MARK));
     Ok(Value::Object(object))
+}
+
+fn contains_forbidden_provider_file_reference(value: &Value) -> bool {
+    match value {
+        Value::Object(object) => object.iter().any(|(key, value)| {
+            let key = key.to_ascii_lowercase();
+            key.ends_with("file")
+                || key.ends_with("filepath")
+                || key == "masterkeylog"
+                || contains_forbidden_provider_file_reference(value)
+        }),
+        Value::Array(items) => items.iter().any(contains_forbidden_provider_file_reference),
+        _ => false,
+    }
 }
 
 fn provider_proxy_outbounds(profile: &Value) -> Result<Vec<Value>, String> {
@@ -504,11 +521,18 @@ pub fn validate_server(server: &VlessServer) -> Result<(), String> {
     }
 
     let protocol = server.protocol.to_ascii_lowercase();
-    if !matches!(
-        protocol.as_str(),
-        "vless" | "vmess" | "trojan" | "shadowsocks"
-    ) {
+    if !is_proxy_protocol(&protocol) {
         return Err(format!("unsupported protocol: {}", server.protocol));
+    }
+
+    if protocol == "wireguard" {
+        if server.uuid.trim().is_empty() {
+            return Err("WireGuard private key is required".into());
+        }
+        if server.public_key.as_deref().unwrap_or("").trim().is_empty() {
+            return Err("WireGuard peer public key is required".into());
+        }
+        return Ok(());
     }
 
     let transport = server.transport.to_ascii_lowercase();
@@ -528,8 +552,15 @@ pub fn validate_server(server: &VlessServer) -> Result<(), String> {
             | "h3"
             | "kcp"
             | "mkcp"
+            | "hysteria"
     ) {
         return Err(format!("unsupported transport: {}", server.transport));
+    }
+    if protocol == "hysteria"
+        && (!matches!(transport.as_str(), "hysteria")
+            || !server.security.eq_ignore_ascii_case("tls"))
+    {
+        return Err("Hysteria2 requires the Hysteria transport with TLS".into());
     }
 
     Ok(())
@@ -546,6 +577,7 @@ fn xray_network(transport: &str) -> &str {
         "httpupgrade" => "httpupgrade",
         "http" | "h2" | "h3" => "http",
         "kcp" | "mkcp" => "kcp",
+        "hysteria" => "hysteria",
         "raw" | "tcp" | "" => "tcp",
         _ => "tcp",
     }
@@ -690,6 +722,12 @@ fn build_stream_settings(s: &VlessServer) -> Value {
             }
             stream.insert("kcpSettings".into(), Value::Object(k));
         }
+        "hysteria" => {
+            stream.insert(
+                "hysteriaSettings".into(),
+                json!({ "version": 2, "auth": s.uuid }),
+            );
+        }
         "tcp" if s.raw_params.get("headerType").map(String::as_str) == Some("http") => {
             // TCP with HTTP header obfuscation (headerType=http) needs a
             // tcpSettings.header so xray frames requests as fake HTTP.
@@ -714,6 +752,80 @@ fn build_stream_settings(s: &VlessServer) -> Value {
     Value::Object(stream)
 }
 
+fn build_wireguard_outbound(s: &VlessServer) -> Value {
+    let addresses = s
+        .raw_params
+        .get("localAddress")
+        .map(|value| split_list(value))
+        .filter(|items| !items.is_empty())
+        .unwrap_or_else(|| vec!["10.0.0.1/32".into()]);
+    let mut peer = serde_json::Map::new();
+    peer.insert("endpoint".into(), json!(format!("{}:{}", s.host, s.port)));
+    peer.insert(
+        "publicKey".into(),
+        json!(s.public_key.clone().unwrap_or_default()),
+    );
+    if let Some(value) = s
+        .raw_params
+        .get("preSharedKey")
+        .filter(|value| !value.is_empty())
+    {
+        peer.insert("preSharedKey".into(), json!(value));
+    }
+    let mut settings = serde_json::Map::new();
+    settings.insert("secretKey".into(), json!(s.uuid));
+    settings.insert("address".into(), json!(addresses));
+    settings.insert("peers".into(), json!([Value::Object(peer)]));
+    settings.insert("noKernelTun".into(), json!(true));
+    if let Some(mtu) = s
+        .raw_params
+        .get("mtu")
+        .and_then(|value| value.parse::<u32>().ok())
+    {
+        settings.insert("mtu".into(), json!(mtu));
+    }
+    if let Some(reserved) = s.raw_params.get("reserved") {
+        let bytes = reserved
+            .split(',')
+            .filter_map(|value| value.trim().parse::<u8>().ok())
+            .collect::<Vec<_>>();
+        if !bytes.is_empty() {
+            settings.insert("reserved".into(), json!(bytes));
+        }
+    }
+    settings.insert(
+        "domainStrategy".into(),
+        json!(s
+            .raw_params
+            .get("domainStrategy")
+            .cloned()
+            .unwrap_or_else(|| "ForceIP".into())),
+    );
+    json!({
+        "tag": "proxy",
+        "protocol": "wireguard",
+        "settings": Value::Object(settings),
+    })
+}
+
+fn build_simple_proxy_outbound(s: &VlessServer, stream: Value) -> Value {
+    let mut settings = serde_json::Map::new();
+    settings.insert("address".into(), json!(s.host));
+    settings.insert("port".into(), json!(s.port));
+    if !s.uuid.is_empty() {
+        settings.insert("user".into(), json!(s.uuid));
+    }
+    if let Some(password) = s.password.as_ref().filter(|value| !value.is_empty()) {
+        settings.insert("pass".into(), json!(password));
+    }
+    json!({
+        "tag": "proxy",
+        "protocol": s.protocol,
+        "settings": Value::Object(settings),
+        "streamSettings": stream,
+    })
+}
+
 /// Build the `proxy` outbound for the selected server, branching on protocol.
 /// The parsed model (`VlessServer`) carries every field; only the JSON shape
 /// differs (vnext for vless/vmess, servers for trojan/shadowsocks).
@@ -721,6 +833,10 @@ fn build_proxy_outbound(s: &VlessServer) -> Value {
     if let Some(outbound) = s.raw_outbound.as_ref() {
         return sanitize_raw_outbound(outbound, false)
             .expect("raw outbound was validated before config generation");
+    }
+
+    if s.protocol == "wireguard" {
+        return build_wireguard_outbound(s);
     }
 
     let stream = build_stream_settings(s);
@@ -771,6 +887,13 @@ fn build_proxy_outbound(s: &VlessServer) -> Value {
             },
             "streamSettings": stream,
         }),
+        "hysteria" => json!({
+            "tag": "proxy",
+            "protocol": "hysteria",
+            "settings": { "version": 2, "address": s.host, "port": s.port },
+            "streamSettings": stream,
+        }),
+        "http" | "socks" => build_simple_proxy_outbound(s, stream),
         // vless (default).
         _ => json!({
             "tag": "proxy",
@@ -1089,6 +1212,20 @@ pub fn build_ping_config(server: &VlessServer, socks_ports: &[u16]) -> Result<Va
     }))
 }
 
+const CONNECTION_PROBE_PORT_BASE: u16 = 20_810;
+
+/// Device-free connection preflight. It deliberately contains one loopback
+/// SOCKS inbound per concrete proxy outbound, with an explicit route between
+/// each pair. The daemon replaces these placeholder ports with reservations it
+/// owns, then requires every path to return the expected HTTP 204 response.
+pub fn build_connection_probe_config(server: &VlessServer) -> Result<Value, String> {
+    let count = ping_proxy_count(server)?;
+    let ports = (0..count)
+        .map(|index| CONNECTION_PROBE_PORT_BASE + index as u16)
+        .collect::<Vec<_>>();
+    build_ping_config(server, &ports)
+}
+
 /// Compatibility config for a still-running 0.2.5 daemon. Package upgrades do
 /// not interrupt a 24/7 tunnel, so the GUI retries this single-path shape until
 /// that daemon is naturally restarted.
@@ -1164,6 +1301,31 @@ mod tests {
                     .any(|option| option.value == protocol),
                 "missing editor protocol {protocol}"
             );
+        }
+    }
+
+    #[test]
+    fn normalized_editor_locations_build_every_catalogued_protocol() {
+        for protocol in PROXY_PROTOCOLS {
+            let mut server = parse_proxy_uri("vless://user@1.2.3.4:443?security=tls#X").unwrap();
+            server.protocol = (*protocol).into();
+            server.password = Some("password".into());
+            server.method = Some("aes-128-gcm".into());
+            if *protocol == "hysteria" {
+                server.transport = "hysteria".into();
+                server.security = "tls".into();
+            }
+            if *protocol == "wireguard" {
+                server.transport = "wireguard".into();
+                server.security = "none".into();
+                server.public_key = Some("peer-public-key".into());
+                server
+                    .raw_params
+                    .insert("localAddress".into(), "10.0.0.2/32".into());
+            }
+            validate_server(&server)
+                .unwrap_or_else(|error| panic!("{protocol} editor server was rejected: {error}"));
+            assert_eq!(build_proxy_outbound(&server)["protocol"], *protocol);
         }
     }
 
@@ -1390,6 +1552,27 @@ mod tests {
     }
 
     #[test]
+    fn json_location_rejects_local_certificate_and_key_files() {
+        let body = r#"{
+          "remarks": "Unsafe",
+          "outbounds": [{
+            "tag": "proxy",
+            "protocol": "vless",
+            "settings": {"vnext": [{"address": "vpn.example", "port": 443,
+              "users": [{"id": "uuid"}]}]},
+            "streamSettings": {"security": "tls", "tlsSettings": {
+              "certificates": [{"certificateFile": "/tmp/provider.pem",
+                "keyFile": "/tmp/provider.key"}]
+            }}
+          }]
+        }"#;
+        let server = parse_subscription(body).remove(0);
+        assert!(validate_server(&server)
+            .unwrap_err()
+            .contains("may not reference local files"));
+    }
+
+    #[test]
     fn tcp_reality_vision_keeps_flow() {
         let s = parse_proxy_uri(
             "vless://uuid-1@1.2.3.4:443?type=tcp&security=reality&flow=xtls-rprx-vision&sni=icloud.com&pbk=K&sid=ab&fp=chrome#X",
@@ -1571,6 +1754,26 @@ mod tests {
         assert!(cfg["routing"].get("balancers").is_none());
         assert!(cfg.get("observatory").is_none());
         assert!(cfg.get("burstObservatory").is_none());
+        varmlend::system::validate_ping_xray_document(
+            &serde_json::to_string(&cfg).unwrap(),
+            &ports,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn connection_probe_config_requires_every_composite_outbound() {
+        let server = estonia_profile_server();
+        let cfg = build_connection_probe_config(&server).unwrap();
+        let ports = cfg["inbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|inbound| inbound["port"].as_u64().unwrap() as u16)
+            .collect::<Vec<_>>();
+
+        assert_eq!(ports.len(), 7);
+        assert_eq!(cfg["routing"]["rules"].as_array().unwrap().len(), 7);
         varmlend::system::validate_ping_xray_document(
             &serde_json::to_string(&cfg).unwrap(),
             &ports,
