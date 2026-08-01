@@ -394,13 +394,6 @@ pub async fn tcp_ping_host(
     }
 }
 
-fn free_local_port() -> Result<u16, String> {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .and_then(|listener| listener.local_addr())
-        .map(|address| address.port())
-        .map_err(|error| format!("could not allocate ping port: {error}"))
-}
-
 #[tauri::command]
 pub async fn proxy_get_ping(
     app: tauri::AppHandle,
@@ -412,14 +405,7 @@ pub async fn proxy_get_ping(
         use varmlend::protocol::{DaemonCommand, DaemonErrorCode, ProxyPingRequest};
 
         validate_server(&server)?;
-        let proxy_count = crate::xray::ping_proxy_count(&server)?;
-        let mut socks_ports = Vec::with_capacity(proxy_count);
-        while socks_ports.len() < proxy_count {
-            let port = free_local_port()?;
-            if !socks_ports.contains(&port) {
-                socks_ports.push(port);
-            }
-        }
+        let socks_ports = crate::xray::ping_placeholder_ports(&server)?;
         let socks_port = socks_ports[0];
         let xray_config =
             serde_json::to_string(&crate::xray::build_ping_config(&server, &socks_ports)?)
@@ -481,5 +467,11 @@ mod tests {
         assert!(!source.contains(concat!("set", "cap")));
         assert!(!source.contains(concat!("Command", "::new")));
         assert!(!source.contains(concat!("varmlen", "-probe")));
+    }
+
+    #[test]
+    fn gui_never_allocates_daemon_listener_ports() {
+        let source = include_str!("vpn.rs");
+        assert!(!source.contains(concat!("TcpListener", "::bind")));
     }
 }

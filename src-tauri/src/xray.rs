@@ -1214,15 +1214,22 @@ pub fn build_ping_config(server: &VlessServer, socks_ports: &[u16]) -> Result<Va
 
 const CONNECTION_PROBE_PORT_BASE: u16 = 20_810;
 
+pub fn ping_placeholder_ports(server: &VlessServer) -> Result<Vec<u16>, String> {
+    let count = ping_proxy_count(server)?;
+    if !(1..=64).contains(&count) {
+        return Err(format!("invalid proxy path count: {count}"));
+    }
+    Ok((0..count)
+        .map(|index| CONNECTION_PROBE_PORT_BASE + index as u16)
+        .collect())
+}
+
 /// Device-free connection preflight. It deliberately contains one loopback
 /// SOCKS inbound per concrete proxy outbound, with an explicit route between
 /// each pair. The daemon replaces these placeholder ports with reservations it
 /// owns, then requires every path to return the expected HTTP 204 response.
 pub fn build_connection_probe_config(server: &VlessServer) -> Result<Value, String> {
-    let count = ping_proxy_count(server)?;
-    let ports = (0..count)
-        .map(|index| CONNECTION_PROBE_PORT_BASE + index as u16)
-        .collect::<Vec<_>>();
+    let ports = ping_placeholder_ports(server)?;
     build_ping_config(server, &ports)
 }
 

@@ -140,68 +140,111 @@ pub async fn run_proxy_ping(
 ) -> Result<u32, DaemonError> {
     let xray = Path::new(INSTALLED_XRAY);
     ensure_trusted_binary(xray)?;
-    let ports = request.effective_socks_ports();
-    validate_ping_xray_document(&request.xray_config, &ports)?;
+    let template_ports = request.effective_socks_ports();
+    validate_ping_xray_document(&request.xray_config, &template_ports)?;
 
     let runtime_dir = PathBuf::from(format!("/run/varmlen/user-{owner_uid}"));
     fs::create_dir_all(&runtime_dir).map_err(internal_io("create ping runtime directory"))?;
     fs::set_permissions(&runtime_dir, fs::Permissions::from_mode(0o700))
         .map_err(internal_io("secure ping runtime directory"))?;
     let sequence = PING_CONFIG_ID.fetch_add(1, Ordering::Relaxed);
-    let config_path = runtime_dir.join(format!(
-        "ping-{}-{}-{sequence}.json",
-        ports[0],
-        std::process::id()
-    ));
-    write_private_file(&config_path, &request.xray_config)?;
+    let mut last_start_error = None;
+    for attempt in 0..4 {
+        let reservations = (0..template_ports.len())
+            .map(|_| std::net::TcpListener::bind("127.0.0.1:0"))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| {
+                DaemonError::new(
+                    DaemonErrorCode::PingFailed,
+                    format!("could not reserve ping ports: {error}"),
+                )
+            })?;
+        let ports = reservations
+            .iter()
+            .map(|listener| listener.local_addr().map(|address| address.port()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(internal_io("read reserved ping port"))?;
+        let config = validation_config_with_ports(&request.xray_config, &ports)?;
+        validate_ping_xray_document(&config, &ports)?;
+        let config_path = runtime_dir.join(format!(
+            "ping-{}-{}-{sequence}-{attempt}.json",
+            ports[0],
+            std::process::id()
+        ));
+        write_private_file(&config_path, &config)?;
 
-    let mut child = match Command::new(xray)
-        .args(["run", "-c"])
-        .arg(&config_path)
-        .env_clear()
-        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(error) => {
-            let _ = fs::remove_file(&config_path);
-            return Err(DaemonError::new(
-                DaemonErrorCode::PingFailed,
-                format!("could not start ping Xray: {error}"),
-            ));
-        }
-    };
-
-    let operation =
-        async {
-            loop {
-                if child.try_wait().is_ok_and(|status| status.is_some()) {
-                    return Err(DaemonError::new(
-                        DaemonErrorCode::PingFailed,
-                        "ping Xray exited before its SOCKS listener was ready",
-                    ));
-                }
-                let checks = ports.iter().copied().map(|port| async move {
-                    timeout(
-                        Duration::from_millis(100),
-                        tokio::net::TcpStream::connect(("127.0.0.1", port)),
-                    )
-                    .await
-                    .is_ok_and(|result| result.is_ok())
-                });
-                if futures_util::future::join_all(checks)
-                    .await
-                    .into_iter()
-                    .all(|ready| ready)
-                {
-                    break;
-                }
-                sleep(Duration::from_millis(50)).await;
+        // Xray cannot inherit the reserved sockets. If another local process
+        // wins the tiny release/spawn window, Xray exits and the daemon owns
+        // the complete retry instead of trusting stale ports from the GUI.
+        drop(reservations);
+        let mut child = match Command::new(xray)
+            .args(["run", "-c"])
+            .arg(&config_path)
+            .env_clear()
+            .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) => {
+                let _ = fs::remove_file(&config_path);
+                last_start_error = Some(DaemonError::new(
+                    DaemonErrorCode::PingFailed,
+                    format!("could not start ping Xray: {error}"),
+                ));
+                continue;
             }
+        };
 
+        let readiness = timeout(
+            Duration::from_millis(request.timeout_ms.min(2_000).into()),
+            async {
+                loop {
+                    if child.try_wait().is_ok_and(|status| status.is_some()) {
+                        return Err(DaemonError::new(
+                            DaemonErrorCode::PingFailed,
+                            "ping Xray exited before its SOCKS listeners were ready",
+                        ));
+                    }
+                    let checks = ports.iter().copied().map(|port| async move {
+                        timeout(
+                            Duration::from_millis(100),
+                            tokio::net::TcpStream::connect(("127.0.0.1", port)),
+                        )
+                        .await
+                        .is_ok_and(|result| result.is_ok())
+                    });
+                    if futures_util::future::join_all(checks)
+                        .await
+                        .into_iter()
+                        .all(|ready| ready)
+                    {
+                        return Ok(());
+                    }
+                    sleep(Duration::from_millis(50)).await;
+                }
+            },
+        )
+        .await
+        .map_err(|_| {
+            DaemonError::new(
+                DaemonErrorCode::PingFailed,
+                "ping Xray listener startup timed out",
+            )
+        })
+        .and_then(|result| result);
+
+        if let Err(error) = readiness {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            let _ = fs::remove_file(&config_path);
+            last_start_error = Some(error);
+            continue;
+        }
+
+        let result =
             first_success(ports.iter().copied().map(|port| {
                 probe_proxy_port(port, Duration::from_millis(request.timeout_ms.into()))
             }))
@@ -211,17 +254,19 @@ pub async fn run_proxy_ping(
                     DaemonErrorCode::PingFailed,
                     "HTTP ping failed through every proxy path",
                 )
-            })
-        };
+            });
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        let _ = fs::remove_file(&config_path);
+        return result;
+    }
 
-    let result = timeout(Duration::from_millis(request.timeout_ms.into()), operation)
-        .await
-        .map_err(|_| DaemonError::new(DaemonErrorCode::PingFailed, "HTTP ping timed out"))
-        .and_then(|result| result);
-    let _ = child.kill().await;
-    let _ = child.wait().await;
-    let _ = fs::remove_file(&config_path);
-    result
+    Err(last_start_error.unwrap_or_else(|| {
+        DaemonError::new(
+            DaemonErrorCode::PingFailed,
+            "could not start ping Xray on daemon-owned ports",
+        )
+    }))
 }
 
 fn write_private_file(path: &Path, content: &str) -> Result<(), DaemonError> {
