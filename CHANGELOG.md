@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.3.0 Preview
+
+- Treat every successful subscription response as authoritative: quota, usage,
+  and expiry values omitted by the provider are now cleared instead of showing
+  stale data from an earlier refresh.
+- Harden the privileged daemon, subscription fetching, and IPC limits.
+- Validate the final native Xray configuration and every proxy path before
+  switching traffic.
+- Move validation-port ownership into the daemon, bound rotated logs, and keep
+  protocol builders synchronized.
+- Keep AppImage publishing paused until a safe standalone root-daemon bootstrap
+  is available.
+
 ## 0.2.6
 
 - Disable per-app split controls in Proxy mode and explain on hover, focus, or
