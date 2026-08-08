@@ -12,6 +12,7 @@ describe("Linux permission setup", () => {
     const i18n = read("./i18n.svelte.ts");
     const vpn = read("../../src-tauri/src/vpn.rs");
     const tauriLib = read("../../src-tauri/src/lib.rs");
+    const policy = read("../../packaging/varmlend/app.varmlen.client.policy");
 
     expect(settingsPage).not.toContain("capsGranted");
     expect(settingsPage).not.toContain("grantCaps");
@@ -24,5 +25,7 @@ describe("Linux permission setup", () => {
     expect(tauriLib).not.toContain("vpn::grant_caps");
     expect(i18n).toContain('"mode.proxy": "Proxy (SOCKS)"');
     expect(i18n).toContain('"mode.proxy": "Прокси (SOCKS)"');
+    expect(policy).toContain("<allow_active>yes</allow_active>");
+    expect(policy).not.toContain("<allow_active>auth_admin_keep</allow_active>");
   });
 });

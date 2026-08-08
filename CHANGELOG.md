@@ -2,6 +2,8 @@
 
 ## 0.3.0 Preview
 
+- Start the installed, root-owned networking daemon without asking the active
+  desktop user for an administrator password again after every reboot.
 - Treat every successful subscription response as authoritative: quota, usage,
   and expiry values omitted by the provider are now cleared instead of showing
   stale data from an earlier refresh.

@@ -44,7 +44,11 @@ pkexec dpkg -i Varmlen_0.3.0_amd64.deb
 ```
 
 The networking daemon is started on demand through polkit and does not require
-systemd. On minimal installations without polkit, install the fixed components
+systemd. The packaged policy allows the active local desktop user to start the
+fixed, root-owned daemon without entering an administrator password after each
+reboot; its authenticated socket still accepts only that user's bounded VPN
+commands. Installing or removing the package still requires administrator
+approval. On minimal installations without polkit, install the fixed components
 with `scripts/install-varmlend.sh` as root before starting the client.
 
 The AppImage is temporarily not published: a portable GUI cannot safely provide

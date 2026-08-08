@@ -11,7 +11,10 @@
     <defaults>
       <allow_any>auth_admin</allow_any>
       <allow_inactive>auth_admin</allow_inactive>
-      <allow_active>auth_admin_keep</allow_active>
+      <!-- The installed daemon exposes only a bounded, peer-credential-checked
+           protocol to the active desktop user. Starting that fixed root-owned
+           binary must not require a password again after every reboot. -->
+      <allow_active>yes</allow_active>
     </defaults>
     <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/varmlen/varmlend</annotate>
     <annotate key="org.freedesktop.policykit.exec.allow_gui">false</annotate>
