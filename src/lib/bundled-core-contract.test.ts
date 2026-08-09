@@ -8,8 +8,11 @@ const read = (relative: string) =>
 describe("Linux bundled Xray fallback", () => {
   it("is seeded into the menu even when another core is already active", () => {
     const core = read("../../src-tauri/src/core.rs");
+    const fetchScript = read("../../scripts/fetch-xray.sh");
     const settings = read("../routes/settings/+page.svelte");
 
+    expect(fetchScript).toContain('VERSION="26.3.27"');
+    expect(fetchScript).toContain('"$VERSION:$asset"');
     expect(core).toContain('PathBuf::from("/usr/libexec/varmlen/xray")');
     expect(core).toContain("let had_usable_active = binary_path(app, kind).is_ok()");
     expect(core).toContain("if !dest.is_file()");

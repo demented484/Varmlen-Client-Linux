@@ -148,7 +148,7 @@ fn bundled_core_tag(app: &AppHandle, kind: CoreKind) -> Option<String> {
         .filter(|tag| valid_tag(tag))
 }
 
-/// Read a core binary's own version (`xray version` → "26.6.27"), so the seeded
+/// Read a core binary's own version (`xray version` → "26.3.27"), so the seeded
 /// version dir is named correctly without a hardcoded tag to keep in sync.
 fn core_version_of(bin: &PathBuf) -> Option<String> {
     let out = std::process::Command::new(bin)
@@ -156,7 +156,7 @@ fn core_version_of(bin: &PathBuf) -> Option<String> {
         .output()
         .ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
-    // First line: "Xray 26.6.27 (Xray, Penetrates Everything.) <hash> ..."
+    // First line: "Xray 26.3.27 (Xray, Penetrates Everything.) <hash> ..."
     text.lines()
         .next()?
         .split_whitespace()

@@ -9,7 +9,7 @@
 # tauri beforeBuildCommand invokes it there).
 set -euo pipefail
 
-VERSION="26.6.27"
+VERSION="26.3.27"
 DEST="src-tauri/cores/xray"
 MARKER="${DEST}.asset"
 
@@ -46,7 +46,7 @@ if [ "${1:-}" = "--print-asset" ]; then
   exit 0
 fi
 
-if [ -f "$DEST" ] && [ -f "$MARKER" ] && [ "$(cat "$MARKER")" = "$asset" ]; then
+if [ -f "$DEST" ] && [ -f "$MARKER" ] && [ "$(cat "$MARKER")" = "$VERSION:$asset" ]; then
   echo "xray already present for $target_triple: $DEST"
   exit 0
 fi
@@ -60,5 +60,5 @@ echo "fetching xray v${VERSION} for ${target_triple} (${asset})…"
 curl -fsSL "$URL" -o "$TMP/xray.zip"
 unzip -o -q "$TMP/xray.zip" xray -d "$TMP"
 install -m 0755 "$TMP/xray" "$DEST"
-printf '%s\n' "$asset" >"$MARKER"
+printf '%s:%s\n' "$VERSION" "$asset" >"$MARKER"
 echo "xray v${VERSION} -> $DEST"
