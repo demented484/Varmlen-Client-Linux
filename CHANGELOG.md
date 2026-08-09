@@ -2,6 +2,8 @@
 
 ## 0.3.0 Preview
 
+- Always seed and display the package-bundled Xray version as a non-removable
+  offline fallback, even when a newer downloaded core is active.
 - Start the installed, root-owned networking daemon without asking the active
   desktop user for an administrator password again after every reboot.
 - Treat every successful subscription response as authoritative: quota, usage,

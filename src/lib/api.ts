@@ -128,6 +128,8 @@ export interface InstalledVersion {
   tag: string;
   /** True iff this is the currently active version. */
   active: boolean;
+  /** Shipped with Varmlen and retained as the offline fallback. */
+  bundled: boolean;
 }
 
 export interface CoreInfo {

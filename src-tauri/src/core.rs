@@ -56,6 +56,9 @@ impl CoreKind {
 pub struct InstalledVersion {
     pub tag: String,
     pub active: bool,
+    /// Shipped by the installed Varmlen package and therefore restored on
+    /// startup rather than treated as a removable download.
+    pub bundled: bool,
 }
 
 #[derive(Serialize)]
@@ -128,8 +131,21 @@ fn bundled_core_path(app: &AppHandle, kind: CoreKind) -> Option<PathBuf> {
     if kind != CoreKind::Xray {
         return None;
     }
-    let p = app.path().resource_dir().ok()?.join("xray");
-    p.exists().then_some(p)
+    let mut candidates = Vec::new();
+    if let Ok(resources) = app.path().resource_dir() {
+        candidates.push(resources.join("xray"));
+        candidates.push(resources.join("cores").join("xray"));
+    }
+    // DEB/RPM packages deliberately keep privileged networking components out
+    // of the WebView resource directory.
+    candidates.push(PathBuf::from("/usr/libexec/varmlen/xray"));
+    candidates.into_iter().find(|path| path.is_file())
+}
+
+fn bundled_core_tag(app: &AppHandle, kind: CoreKind) -> Option<String> {
+    bundled_core_path(app, kind)
+        .and_then(|path| core_version_of(&path))
+        .filter(|tag| valid_tag(tag))
 }
 
 /// Read a core binary's own version (`xray version` → "26.6.27"), so the seeded
@@ -148,15 +164,13 @@ fn core_version_of(bin: &PathBuf) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// Seed the bundled core into the versions dir if NOTHING is installed yet, so
-/// the app works offline on first launch. Idempotent + best-effort: a no-op
-/// when a usable core already exists or no bundled binary is present. The
-/// seeded binary still gets its caps via the normal grant flow.
+/// Ensure the package-pinned core is always represented in the versions menu,
+/// even after the user downloads and activates a newer core. Existing cached
+/// copies are left untouched; the bundled version becomes active only when no
+/// usable active version exists.
 pub fn seed_bundled_core(app: &AppHandle) {
     let kind = CoreKind::Xray;
-    if binary_path(app, kind).is_ok() {
-        return; // already have a usable, active core
-    }
+    let had_usable_active = binary_path(app, kind).is_ok();
     let Some(src) = bundled_core_path(app, kind) else {
         return;
     };
@@ -166,20 +180,24 @@ pub fn seed_bundled_core(app: &AppHandle) {
     let Ok(dest) = version_binary(app, kind, &tag) else {
         return;
     };
-    if let Some(parent) = dest.parent() {
-        if std::fs::create_dir_all(parent).is_err() {
+    if !dest.is_file() {
+        if let Some(parent) = dest.parent() {
+            if std::fs::create_dir_all(parent).is_err() {
+                return;
+            }
+        }
+        if std::fs::copy(&src, &dest).is_err() {
             return;
         }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755));
+        }
     }
-    if std::fs::copy(&src, &dest).is_err() {
-        return;
+    if !had_usable_active {
+        let _ = write_active(app, kind, &tag);
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755));
-    }
-    let _ = write_active(app, kind, &tag);
 }
 
 pub fn binary_path(app: &AppHandle, kind: CoreKind) -> Result<PathBuf, String> {
@@ -631,11 +649,14 @@ fn extract_binary_zip(zip_bytes: &[u8], dest: &PathBuf, member: &str) -> Result<
 #[tauri::command]
 pub async fn core_info(app: AppHandle, kind: String) -> Result<CoreInfo, String> {
     let kind = CoreKind::parse(&kind)?;
+    seed_bundled_core(&app);
     let active = active_tag(&app, kind);
+    let bundled = bundled_core_tag(&app, kind);
     let installed: Vec<InstalledVersion> = installed_tags(&app, kind)
         .into_iter()
         .map(|tag| InstalledVersion {
             active: active.as_deref() == Some(tag.as_str()),
+            bundled: bundled.as_deref() == Some(tag.as_str()),
             tag,
         })
         .collect();
@@ -694,6 +715,9 @@ pub async fn core_uninstall(app: AppHandle, kind: String, tag: String) -> Result
     let kind = CoreKind::parse(&kind)?;
     if !valid_tag(&tag) {
         return Err(format!("invalid version tag: {tag}"));
+    }
+    if bundled_core_tag(&app, kind).as_deref() == Some(strip_v(&tag)) {
+        return Err("the Xray version bundled with Varmlen cannot be removed".into());
     }
     let was_active = active_tag(&app, kind).as_deref() == Some(strip_v(&tag));
     let dir = versions_dir(&app, kind)?.join(strip_v(&tag));
