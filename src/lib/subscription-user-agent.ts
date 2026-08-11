@@ -2,7 +2,6 @@ export const SUBSCRIPTION_USER_AGENTS = [
   "varmlen",
   "happ",
   "incy",
-  "v2raytun",
 ] as const;
 
 export type SubscriptionUserAgent =

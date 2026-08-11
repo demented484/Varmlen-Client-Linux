@@ -489,24 +489,12 @@ impl SystemLifecycleBackend {
                         .map(|port| probe_proxy_port(port, Duration::from_secs(8))),
                 )
                 .await;
-                let failed = results
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(index, result)| result.as_ref().err().map(|_| index + 1))
-                    .collect::<Vec<_>>();
-                if failed.is_empty() {
+                if results.iter().all(Result::is_ok) {
                     Ok(())
                 } else {
                     Err(DaemonError::new(
                         DaemonErrorCode::XrayValidationFailed,
-                        format!(
-                            "candidate has no verified remote egress on outbound path(s): {}",
-                            failed
-                                .iter()
-                                .map(ToString::to_string)
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        ),
+                        "candidate's effective route has no verified remote egress",
                     ))
                 }
             })
@@ -909,7 +897,7 @@ fn validation_config_ports(raw: &str) -> Result<Vec<u16>, DaemonError> {
         .ok_or_else(|| {
             DaemonError::new(
                 DaemonErrorCode::InvalidRequest,
-                "validation config must contain one inbound per proxy path",
+                "validation config must contain between one and 64 loopback inbounds",
             )
         })?;
     inbounds

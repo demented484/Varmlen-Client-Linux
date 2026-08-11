@@ -160,7 +160,6 @@
     { value: "varmlen", label: "Varmlen" },
     { value: "happ", label: "Happ" },
     { value: "incy", label: "INCY" },
-    { value: "v2raytun", label: "v2rayTun" },
   ];
 
   // Refresh the core's status when Settings opens (cheap GitHub check).

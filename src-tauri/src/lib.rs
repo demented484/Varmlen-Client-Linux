@@ -163,7 +163,6 @@ fn subscription_headers(choice: Option<&str>) -> Result<(String, String), String
         "varmlen" => "Varmlen",
         "happ" => "Happ",
         "incy" => "INCY",
-        "v2raytun" => "v2rayTun",
         _ => return Err("unsupported subscription User-Agent".into()),
     };
     Ok((
@@ -457,7 +456,6 @@ mod tests {
             ("varmlen", "Varmlen"),
             ("happ", "Happ"),
             ("incy", "INCY"),
-            ("v2raytun", "v2rayTun"),
         ] {
             let (ua, os) = subscription_headers(Some(choice)).expect("known UA");
             assert_eq!(
@@ -472,6 +470,7 @@ mod tests {
             subscription_headers(None).expect("default").0,
             format!("Varmlen/{}/{}", target_platform(), target_arch())
         );
+        assert!(subscription_headers(Some("v2raytun")).is_err());
         assert!(subscription_headers(Some("header\r\ninjection")).is_err());
     }
 

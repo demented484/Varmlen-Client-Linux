@@ -54,8 +54,7 @@ export function getLocationEditorOptions(): Promise<LocationEditorOptions> {
 export type SubscriptionUserAgent =
   | "varmlen"
   | "happ"
-  | "incy"
-  | "v2raytun";
+  | "incy";
 
 export interface SubscriptionMeta {
   title: string | null;

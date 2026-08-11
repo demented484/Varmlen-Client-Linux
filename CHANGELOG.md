@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.0 Preview
+## 0.3.0
 
 - Pin the package fallback to stable Xray 26.3.27 and always display it as a
   non-removable option, even when a newer downloaded core is active.
@@ -10,8 +10,9 @@
   and expiry values omitted by the provider are now cleared instead of showing
   stale data from an earlier refresh.
 - Harden the privileged daemon, subscription fetching, and IPC limits.
-- Validate the final native Xray configuration and every proxy path before
-  switching traffic.
+- Validate the final native Xray configuration and the selected profile's
+  effective route before switching traffic; optional, fallback, balancer, and
+  chained outbounds are no longer independently mandatory.
 - Move validation-port ownership into the daemon, bound rotated logs, and keep
   protocol builders synchronized.
 - Keep AppImage publishing paused until a safe standalone root-daemon bootstrap

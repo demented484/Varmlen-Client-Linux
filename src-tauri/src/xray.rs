@@ -1224,13 +1224,45 @@ pub fn ping_placeholder_ports(server: &VlessServer) -> Result<Vec<u16>, String> 
         .collect())
 }
 
-/// Device-free connection preflight. It deliberately contains one loopback
-/// SOCKS inbound per concrete proxy outbound, with an explicit route between
-/// each pair. The daemon replaces these placeholder ports with reservations it
-/// owns, then requires every path to return the expected HTTP 204 response.
+/// Device-free connection preflight. Its single loopback SOCKS inbound follows
+/// the profile's effective target — either the selected outbound or its
+/// balancer. Optional, fallback, and chained outbounds are not independently
+/// mandatory. The daemon replaces the placeholder with a port it reserves,
+/// then requires the effective route to return the expected HTTP 204 response.
 pub fn build_connection_probe_config(server: &VlessServer) -> Result<Value, String> {
-    let ports = ping_placeholder_ports(server)?;
-    build_ping_config(server, &ports)
+    let mut plan = outbound_plan(server)?;
+    let mut route = json!({
+        "type": "field",
+        "inboundTag": ["socks-in-0"],
+        "network": "tcp,udp"
+    });
+    plan.target.apply(&mut route);
+
+    let mut proxies = std::mem::take(&mut plan.proxies);
+    proxies.push(json!({ "tag": "direct", "protocol": "freedom" }));
+    let mut routing = json!({ "rules": [route] });
+    if let Some(balancers) = plan.balancers {
+        routing["balancers"] = balancers;
+    }
+    let mut config = json!({
+        "log": { "loglevel": "warning" },
+        "inbounds": [{
+            "tag": "socks-in-0",
+            "listen": "127.0.0.1",
+            "port": CONNECTION_PROBE_PORT_BASE,
+            "protocol": "socks",
+            "settings": { "udp": false, "auth": "noauth" }
+        }],
+        "outbounds": proxies,
+        "routing": routing
+    });
+    if let Some(observatory) = plan.observatory {
+        config["observatory"] = observatory;
+    }
+    if let Some(burst_observatory) = plan.burst_observatory {
+        config["burstObservatory"] = burst_observatory;
+    }
+    Ok(config)
 }
 
 /// Compatibility config for a still-running 0.2.5 daemon. Package upgrades do
@@ -1769,7 +1801,7 @@ mod tests {
     }
 
     #[test]
-    fn connection_probe_config_requires_every_composite_outbound() {
+    fn connection_probe_config_checks_composite_effective_route_once() {
         let server = estonia_profile_server();
         let cfg = build_connection_probe_config(&server).unwrap();
         let ports = cfg["inbounds"]
@@ -1779,8 +1811,14 @@ mod tests {
             .map(|inbound| inbound["port"].as_u64().unwrap() as u16)
             .collect::<Vec<_>>();
 
-        assert_eq!(ports.len(), 7);
-        assert_eq!(cfg["routing"]["rules"].as_array().unwrap().len(), 7);
+        assert_eq!(ports, [CONNECTION_PROBE_PORT_BASE]);
+        assert_eq!(cfg["routing"]["rules"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            cfg["routing"]["rules"][0]["balancerTag"],
+            "estonia-balancer"
+        );
+        assert!(cfg["routing"]["rules"][0].get("outboundTag").is_none());
+        assert!(cfg.get("burstObservatory").is_some());
         varmlend::system::validate_ping_xray_document(
             &serde_json::to_string(&cfg).unwrap(),
             &ports,
