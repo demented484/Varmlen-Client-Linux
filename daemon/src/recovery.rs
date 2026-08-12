@@ -172,7 +172,12 @@ impl CleanupBackend for SystemCleanupBackend {
             String::from_utf8_lossy(&routes_v6.stdout)
         );
         resources.extend(route_resources(&rules_text, &routes_text));
-        for table in ["varmlen_dns", "varmlen_split", "varmlen_ks"] {
+        for table in [
+            "varmlen_dns",
+            "varmlen_split_dns",
+            "varmlen_split",
+            "varmlen_ks",
+        ] {
             if Self::nft_table_exists(table).await {
                 resources.insert(Resource::NftTable(table.into()));
             }
@@ -222,7 +227,7 @@ impl CleanupBackend for SystemCleanupBackend {
             Resource::NftTable(table)
                 if matches!(
                     table.as_str(),
-                    "varmlen_dns" | "varmlen_split" | "varmlen_ks"
+                    "varmlen_dns" | "varmlen_split_dns" | "varmlen_split" | "varmlen_ks"
                 ) =>
             {
                 command_success("nft", &["delete", "table", "inet", table]).await

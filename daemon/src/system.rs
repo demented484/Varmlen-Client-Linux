@@ -433,6 +433,7 @@ pub struct SystemLifecycleBackend {
     mode: Option<ConnectionMode>,
     dns_active: bool,
     split: Option<SplitManager<SystemSplitBackend>>,
+    split_apps: Vec<String>,
     log_store: Arc<Mutex<LogStore>>,
     log_tasks: Vec<JoinHandle<()>>,
 }
@@ -463,6 +464,7 @@ impl SystemLifecycleBackend {
             mode: None,
             dns_active: false,
             split: None,
+            split_apps: Vec::new(),
             log_store: Arc::new(Mutex::new(LogStore::for_owner(owner_uid))),
             log_tasks: Vec::new(),
         }
@@ -758,14 +760,17 @@ impl SystemLifecycleBackend {
 
     async fn remove_split(&mut self) -> Result<(), DaemonError> {
         let Some(mut split) = self.split.take() else {
+            self.split_apps.clear();
             return Ok(());
         };
-        split.backend_mut().rollback().await.map_err(|error| {
+        let result = split.backend_mut().rollback().await.map_err(|error| {
             DaemonError::new(
                 DaemonErrorCode::TunnelCleanupFailed,
                 format!("split-tunnel cleanup failed: {error}"),
             )
-        })
+        });
+        self.split_apps.clear();
+        result
     }
 }
 
@@ -901,10 +906,11 @@ impl LifecycleBackend for SystemLifecycleBackend {
         }
         self.route_up(request).await?;
 
-        if self.split.is_some() {
+        let split_changed = self.split_apps != request.excluded_apps;
+        if self.split.is_some() && (request.excluded_apps.is_empty() || split_changed) {
             self.remove_split().await?;
         }
-        if !request.excluded_apps.is_empty() {
+        if !request.excluded_apps.is_empty() && self.split.is_none() {
             let mut split = SplitManager::new(SystemSplitBackend::new(self.owner_uid));
             split
                 .apply(SplitPlan::new(
@@ -919,6 +925,7 @@ impl LifecycleBackend for SystemLifecycleBackend {
                     )
                 })?;
             self.split = Some(split);
+            self.split_apps = request.excluded_apps.clone();
         }
 
         let mut dns = DnsGuard::new(SystemDnsBackend::new());

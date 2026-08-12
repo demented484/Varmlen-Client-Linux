@@ -36,6 +36,8 @@ pub enum SplitError {
     BpfUnavailable,
     #[error("could not install split routing")]
     RoutingUnavailable,
+    #[error("could not start direct DNS for excluded applications")]
+    DirectDnsUnavailable,
     #[error("the application permission watcher is unavailable")]
     WatcherUnavailable,
     #[error("could not reconcile existing application processes")]

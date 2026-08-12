@@ -1,5 +1,7 @@
 use async_trait::async_trait;
 
+use crate::direct_dns::DirectDnsProxy;
+
 use super::bpf::{attach_socket_mark, detach_socket_mark};
 use super::cgroup::BypassCgroup;
 use super::process::{mark_existing_sockets, real_uid, snapshot, AppSelector};
@@ -13,6 +15,7 @@ pub struct SystemSplitBackend {
     selectors: Vec<AppSelector>,
     watcher: Option<PermissionWatcher>,
     routing_active: bool,
+    direct_dns: Option<DirectDnsProxy>,
 }
 
 impl SystemSplitBackend {
@@ -23,6 +26,7 @@ impl SystemSplitBackend {
             selectors: Vec::new(),
             watcher: None,
             routing_active: false,
+            direct_dns: None,
         }
     }
 
@@ -32,6 +36,10 @@ impl SystemSplitBackend {
 
     pub fn is_healthy(&self) -> bool {
         self.routing_active
+            && self
+                .direct_dns
+                .as_ref()
+                .is_some_and(DirectDnsProxy::is_healthy)
             && self
                 .watcher
                 .as_ref()
@@ -75,6 +83,7 @@ impl SplitBackend for SystemSplitBackend {
         let route = detect_default_route().await?;
         install_routing(&self.cgroup()?.relative_path(), &route).await?;
         self.routing_active = true;
+        self.direct_dns = Some(DirectDnsProxy::start().await?);
         Ok(())
     }
 
@@ -135,14 +144,22 @@ impl SplitBackend for SystemSplitBackend {
 
     async fn rollback(&mut self) -> Result<(), SplitError> {
         self.watcher.take();
+        let mut first_error = None;
+        if let Some(mut direct_dns) = self.direct_dns.take() {
+            if let Err(error) = direct_dns.stop().await {
+                first_error = Some(error);
+            }
+        }
         if self.routing_active {
-            remove_routing().await?;
+            if let Err(error) = remove_routing().await {
+                first_error.get_or_insert(error);
+            }
             self.routing_active = false;
         }
         if let Some(cgroup) = self.cgroup.as_ref() {
             let _ = detach_socket_mark(cgroup.directory());
         }
         self.selectors.clear();
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 }
