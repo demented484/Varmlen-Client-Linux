@@ -411,6 +411,7 @@ pub async fn proxy_get_ping(
             serde_json::to_string(&crate::xray::build_ping_config(&server, &socks_ports)?)
                 .map_err(|error| error.to_string())?;
         let timeout_ms = timeout_ms.unwrap_or(5000);
+        let dns_probe_urls = crate::xray::dns_probe_urls(&server);
         let mut daemon = crate::daemon_client::DaemonClient::connect_or_start_installed()
             .await
             .map_err(|error| error.to_string())?;
@@ -418,6 +419,7 @@ pub async fn proxy_get_ping(
             xray_config,
             socks_port,
             socks_ports: socks_ports.clone(),
+            dns_probe_urls: dns_probe_urls.clone(),
             timeout_ms,
         };
         let state = match daemon
@@ -435,6 +437,7 @@ pub async fn proxy_get_ping(
                         xray_config,
                         socks_port,
                         socks_ports: Vec::new(),
+                        dns_probe_urls,
                         timeout_ms,
                     }))
                     .await

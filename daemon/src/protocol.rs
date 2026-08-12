@@ -8,6 +8,8 @@ pub const MAX_SERVER_IPS: usize = 64;
 const MAX_EXCLUDED_APPS: usize = 256;
 const MAX_APP_SELECTOR_BYTES: usize = 4096;
 const MAX_PING_HOST_BYTES: usize = 253;
+const MAX_DNS_PROBE_URLS: usize = 8;
+const MAX_DNS_PROBE_URL_BYTES: usize = 2048;
 const MIN_PING_TIMEOUT_MS: u32 = 100;
 const MAX_PING_TIMEOUT_MS: u32 = 10_000;
 
@@ -42,6 +44,8 @@ pub struct ProxyPingRequest {
     pub socks_port: u16,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub socks_ports: Vec<u16>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dns_probe_urls: Vec<String>,
     pub timeout_ms: u32,
 }
 
@@ -53,6 +57,36 @@ impl ProxyPingRequest {
             self.socks_ports.clone()
         }
     }
+
+    pub fn effective_dns_probe_urls(&self) -> Vec<String> {
+        effective_dns_probe_urls(&self.dns_probe_urls)
+    }
+}
+
+fn effective_dns_probe_urls(urls: &[String]) -> Vec<String> {
+    if urls.is_empty() {
+        vec!["https://1.1.1.1/dns-query".into()]
+    } else {
+        urls.to_vec()
+    }
+}
+
+fn dns_probe_urls_are_valid(urls: &[String]) -> bool {
+    !urls.is_empty()
+        && urls.len() <= MAX_DNS_PROBE_URLS
+        && urls.iter().all(|raw| {
+            raw.len() <= MAX_DNS_PROBE_URL_BYTES
+                && reqwest::Url::parse(raw).is_ok_and(|url| {
+                    url.scheme() == "https"
+                        && url.username().is_empty()
+                        && url.password().is_none()
+                        && url.fragment().is_none()
+                        && url
+                            .host_str()
+                            .and_then(|host| host.parse::<IpAddr>().ok())
+                            .is_some()
+                })
+        })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -202,6 +236,7 @@ pub fn validate_tcp_ping_request(request: &TcpPingRequest) -> Result<(), DaemonE
 
 pub fn validate_proxy_ping_request(request: &ProxyPingRequest) -> Result<(), DaemonErrorCode> {
     let ports = request.effective_socks_ports();
+    let dns_probe_urls = request.effective_dns_probe_urls();
     if request.xray_config.is_empty()
         || request.xray_config.len() > MAX_CONFIG_BYTES
         || request.socks_port == 0
@@ -213,6 +248,7 @@ pub fn validate_proxy_ping_request(request: &ProxyPingRequest) -> Result<(), Dae
             .iter()
             .enumerate()
             .any(|(index, port)| ports[..index].contains(port))
+        || !dns_probe_urls_are_valid(&dns_probe_urls)
         || !(MIN_PING_TIMEOUT_MS..=MAX_PING_TIMEOUT_MS).contains(&request.timeout_ms)
     {
         return Err(DaemonErrorCode::InvalidRequest);
@@ -331,9 +367,17 @@ mod tests {
             xray_config: r#"{"log":{"loglevel":"warning"}}"#.into(),
             socks_port: 32_000,
             socks_ports: vec![32_000, 32_001],
+            dns_probe_urls: vec!["https://9.9.9.9/dns-query".into()],
             timeout_ms: 5_000,
         };
         assert_eq!(validate_proxy_ping_request(&proxy), Ok(()));
+
+        let mut invalid_dns = proxy.clone();
+        invalid_dns.dns_probe_urls = vec!["http://127.0.0.1/dns-query".into()];
+        assert_eq!(
+            validate_proxy_ping_request(&invalid_dns),
+            Err(DaemonErrorCode::InvalidRequest)
+        );
 
         let mut invalid_proxy = proxy;
         invalid_proxy.xray_config.clear();

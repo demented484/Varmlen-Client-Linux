@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.1
+
+- Preserve a full JSON location's safe public DNS-over-HTTPS resolver instead
+  of replacing it with Cloudflare, fixing Hysteria2 profiles whose tunnel can
+  reach the provider resolver but not `1.1.1.1`.
+- Require both HTTP and the location's effective resolver to work through the
+  same concrete outbound before reporting latency, without making that
+  synthetic probe a condition for connecting.
+- Keep non-site provider routing such as protocol, public-IP, and port policy;
+  Varmlen still owns website/app split, the final route, native TUN capture,
+  LAN permission, and DNS leak prevention.
+
 ## 0.3.0
 
 - Pin the package fallback to stable Xray 26.3.27 and always display it as a

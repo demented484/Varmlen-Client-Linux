@@ -33,13 +33,114 @@ const PROXY_PORT: u16 = 2081;
 const XRAY_DIAL_MARK: u64 = 0x2024;
 static PING_CONFIG_ID: AtomicU64 = AtomicU64::new(1);
 const PROXY_PING_URL: &str = "http://www.gstatic.com/generate_204";
+const DNS_PROBE_QUERY: &[u8] = &[
+    0x56, 0x4d, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, b'w', b'w', b'w',
+    0x07, b'g', b's', b't', b'a', b't', b'i', b'c', 0x03, b'c', b'o', b'm', 0x00, 0x00, 0x01, 0x00,
+    0x01,
+];
 
 fn build_proxy_ping_request(client: &reqwest::Client) -> reqwest::RequestBuilder {
     client.head(PROXY_PING_URL)
 }
 
-async fn probe_proxy_port(port: u16, timeout_duration: Duration) -> Result<u32, DaemonError> {
-    let client = reqwest::Client::builder()
+fn build_proxy_dns_probe_request(client: &reqwest::Client, url: &str) -> reqwest::RequestBuilder {
+    client
+        .post(url)
+        .header(reqwest::header::ACCEPT, "application/dns-message")
+        .header(reqwest::header::CONTENT_TYPE, "application/dns-message")
+        .body(DNS_PROBE_QUERY)
+}
+
+fn validate_dns_probe_response(body: &[u8]) -> Result<(), DaemonError> {
+    let failed = |message| DaemonError::new(DaemonErrorCode::PingFailed, message);
+    if body.len() < 12 {
+        return Err(failed("DNS probe returned a truncated response"));
+    }
+    if body[0..2] != DNS_PROBE_QUERY[0..2] {
+        return Err(failed("DNS probe returned a mismatched transaction"));
+    }
+    if body[2] & 0x80 == 0 {
+        return Err(failed("DNS probe did not return a response packet"));
+    }
+    if body[3] & 0x0f != 0 {
+        return Err(DaemonError::new(
+            DaemonErrorCode::PingFailed,
+            format!("DNS probe failed with RCODE {}", body[3] & 0x0f),
+        ));
+    }
+    Ok(())
+}
+
+async fn probe_http_through_proxy(client: &reqwest::Client) -> Result<u32, DaemonError> {
+    let started = Instant::now();
+    let response = build_proxy_ping_request(client)
+        .send()
+        .await
+        .map_err(|error| {
+            DaemonError::new(
+                DaemonErrorCode::PingFailed,
+                format!("HTTP ping failed: {error}"),
+            )
+        })?;
+    if response.status().as_u16() != 204 {
+        return Err(DaemonError::new(
+            DaemonErrorCode::PingFailed,
+            format!("HTTP ping returned status {}", response.status()),
+        ));
+    }
+    Ok(started.elapsed().as_millis().min(u32::MAX as u128) as u32)
+}
+
+async fn probe_dns_url_through_proxy(
+    client: &reqwest::Client,
+    url: &str,
+) -> Result<(), DaemonError> {
+    let response = build_proxy_dns_probe_request(client, url)
+        .send()
+        .await
+        .map_err(|error| {
+            DaemonError::new(
+                DaemonErrorCode::PingFailed,
+                format!("DNS probe {url} failed: {error}"),
+            )
+        })?;
+    if response.status().as_u16() != 200 {
+        return Err(DaemonError::new(
+            DaemonErrorCode::PingFailed,
+            format!("DNS probe returned HTTP {}", response.status()),
+        ));
+    }
+    let body = response.bytes().await.map_err(|error| {
+        DaemonError::new(
+            DaemonErrorCode::PingFailed,
+            format!("could not read DNS probe response: {error}"),
+        )
+    })?;
+    validate_dns_probe_response(&body)
+}
+
+async fn probe_dns_through_proxy(
+    client: &reqwest::Client,
+    urls: &[String],
+) -> Result<(), DaemonError> {
+    first_success(
+        urls.iter()
+            .map(|url| probe_dns_url_through_proxy(client, url)),
+    )
+    .await
+    .ok_or_else(|| {
+        DaemonError::new(
+            DaemonErrorCode::PingFailed,
+            "every configured DNS resolver failed through the proxy",
+        )
+    })
+}
+
+fn proxy_probe_client(
+    port: u16,
+    timeout_duration: Duration,
+) -> Result<reqwest::Client, DaemonError> {
+    reqwest::Client::builder()
         .proxy(
             reqwest::Proxy::all(format!("socks5h://127.0.0.1:{port}")).map_err(|error| {
                 DaemonError::new(
@@ -56,24 +157,25 @@ async fn probe_proxy_port(port: u16, timeout_duration: Duration) -> Result<u32, 
                 DaemonErrorCode::PingFailed,
                 format!("could not build ping HTTP client: {error}"),
             )
-        })?;
-    let started = Instant::now();
-    let response = build_proxy_ping_request(&client)
-        .send()
-        .await
-        .map_err(|error| {
-            DaemonError::new(
-                DaemonErrorCode::PingFailed,
-                format!("HTTP ping failed: {error}"),
-            )
-        })?;
-    if response.status().as_u16() != 204 {
-        return Err(DaemonError::new(
-            DaemonErrorCode::PingFailed,
-            format!("HTTP ping returned status {}", response.status()),
-        ));
-    }
-    Ok(started.elapsed().as_millis().min(u32::MAX as u128) as u32)
+        })
+}
+
+async fn probe_http_port(port: u16, timeout_duration: Duration) -> Result<u32, DaemonError> {
+    let client = proxy_probe_client(port, timeout_duration)?;
+    probe_http_through_proxy(&client).await
+}
+
+async fn probe_proxy_port(
+    port: u16,
+    timeout_duration: Duration,
+    dns_probe_urls: &[String],
+) -> Result<u32, DaemonError> {
+    let client = proxy_probe_client(port, timeout_duration)?;
+    let (http_rtt, ()) = tokio::try_join!(
+        probe_http_through_proxy(&client),
+        probe_dns_through_proxy(&client, dns_probe_urls),
+    )?;
+    Ok(http_rtt)
 }
 
 async fn first_success<T, E, I, F>(futures: I) -> Option<T>
@@ -141,6 +243,7 @@ pub async fn run_proxy_ping(
     let xray = Path::new(INSTALLED_XRAY);
     ensure_trusted_binary(xray)?;
     let template_ports = request.effective_socks_ports();
+    let dns_probe_urls = request.effective_dns_probe_urls();
     validate_ping_xray_document(&request.xray_config, &template_ports)?;
 
     let runtime_dir = PathBuf::from(format!("/run/varmlen/user-{owner_uid}"));
@@ -244,17 +347,20 @@ pub async fn run_proxy_ping(
             continue;
         }
 
-        let result =
-            first_success(ports.iter().copied().map(|port| {
-                probe_proxy_port(port, Duration::from_millis(request.timeout_ms.into()))
-            }))
-            .await
-            .ok_or_else(|| {
-                DaemonError::new(
-                    DaemonErrorCode::PingFailed,
-                    "HTTP ping failed through every proxy path",
-                )
-            });
+        let result = first_success(ports.iter().copied().map(|port| {
+            probe_proxy_port(
+                port,
+                Duration::from_millis(request.timeout_ms.into()),
+                &dns_probe_urls,
+            )
+        }))
+        .await
+        .ok_or_else(|| {
+            DaemonError::new(
+                DaemonErrorCode::PingFailed,
+                "HTTP ping failed through every proxy path",
+            )
+        });
         let _ = child.kill().await;
         let _ = child.wait().await;
         let _ = fs::remove_file(&config_path);
@@ -486,7 +592,7 @@ impl SystemLifecycleBackend {
                     ports
                         .iter()
                         .copied()
-                        .map(|port| probe_proxy_port(port, Duration::from_secs(8))),
+                        .map(|port| probe_http_port(port, Duration::from_secs(8))),
                 )
                 .await;
                 if results.iter().all(Result::is_ok) {
@@ -1418,9 +1524,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        build_proxy_ping_request, first_success, validate_ping_xray_document,
-        validate_xray_document, validation_config_ports, validation_config_with_ports,
-        PROXY_PING_URL,
+        build_proxy_dns_probe_request, build_proxy_ping_request, first_success,
+        validate_dns_probe_response, validate_ping_xray_document, validate_xray_document,
+        validation_config_ports, validation_config_with_ports, DNS_PROBE_QUERY, PROXY_PING_URL,
     };
     use crate::protocol::DaemonErrorCode;
 
@@ -1634,6 +1740,29 @@ mod tests {
             request.url().as_str(),
             "http://www.gstatic.com/generate_204"
         );
+    }
+
+    #[test]
+    fn proxy_ping_checks_the_effective_dns_path() {
+        let client = reqwest::Client::new();
+        let request = build_proxy_dns_probe_request(&client, "https://9.9.9.9/dns-query")
+            .build()
+            .unwrap();
+
+        assert_eq!(request.method(), reqwest::Method::POST);
+        assert_eq!(request.url().as_str(), "https://9.9.9.9/dns-query");
+        assert_eq!(
+            request.headers()[reqwest::header::CONTENT_TYPE],
+            "application/dns-message"
+        );
+        assert_eq!(request.body().unwrap().as_bytes().unwrap(), DNS_PROBE_QUERY);
+
+        let mut response = [0_u8; 12];
+        response[0..2].copy_from_slice(&DNS_PROBE_QUERY[0..2]);
+        response[2] = 0x80;
+        assert!(validate_dns_probe_response(&response).is_ok());
+        response[3] = 2;
+        assert!(validate_dns_probe_response(&response).is_err());
     }
 
     #[tokio::test]
