@@ -2,6 +2,12 @@
 
 ## 0.3.1
 
+- Use hostname-based Cloudflare and Google DoH with static bootstrap addresses
+  and parallel fallback, avoiding DNS stalls on routes that reject HTTPS to a
+  bare IP while keeping every resolver connection inside the VPN.
+- Accept provider hostname DNS only with an explicit public-IP bootstrap,
+  preserve compatible provider DNS fields, and apply the Google APIs hostname
+  compatibility mapping used by established Xray clients.
 - Measure Hysteria2, WireGuard, mKCP and QUIC locations through their real
   proxy path instead of failing an inapplicable TCP-connect probe.
 - Replace the obsolete Xray 26.3.27 package fallback with 26.7.28 and migrate

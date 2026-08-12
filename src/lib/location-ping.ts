@@ -9,6 +9,7 @@ type PingDependencies = {
 
 const UDP_ONLY_PROTOCOLS = new Set(["hysteria", "hysteria2", "hy2", "wireguard"]);
 const UDP_ONLY_TRANSPORTS = new Set(["hysteria", "hysteria2", "hy2", "kcp", "quic"]);
+const UDP_PROXY_TIMEOUT_MS = 15_000;
 
 export function supportsTcpEndpointPing(server: VlessServer): boolean {
   return !(
@@ -26,7 +27,12 @@ export async function measureLocationPing(
 ): Promise<number> {
   const tcpEndpoint = supportsTcpEndpointPing(server);
   if (method === "proxy" || !tcpEndpoint) {
-    return dependencies.proxyGetPing(server, tcpEndpoint ? 5000 : 8000);
+    return dependencies.proxyGetPing(server, tcpEndpoint ? 5000 : UDP_PROXY_TIMEOUT_MS);
   }
-  return dependencies.tcpPingHost(server.host, server.port, 2500);
+
+  const [tcpRtt] = await Promise.all([
+    dependencies.tcpPingHost(server.host, server.port, 2500),
+    dependencies.proxyGetPing(server, 5000),
+  ]);
+  return tcpRtt;
 }

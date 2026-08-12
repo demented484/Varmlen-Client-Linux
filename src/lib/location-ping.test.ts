@@ -23,10 +23,10 @@ describe("location ping transport selection", () => {
       measureLocationPing(location, "tcp", { tcpPingHost, proxyGetPing }),
     ).resolves.toBe(87);
     expect(tcpPingHost).not.toHaveBeenCalled();
-    expect(proxyGetPing).toHaveBeenCalledWith(location, 8000);
+    expect(proxyGetPing).toHaveBeenCalledWith(location, 15_000);
   });
 
-  it("keeps raw TCP ping for TCP transports", async () => {
+  it("keeps TCP RTT only after a TCP location passes the proxy probe", async () => {
     const tcpPingHost = vi.fn().mockResolvedValue(23);
     const proxyGetPing = vi.fn().mockResolvedValue(71);
     const location = server("vless", "tcp");
@@ -35,6 +35,6 @@ describe("location ping transport selection", () => {
       measureLocationPing(location, "tcp", { tcpPingHost, proxyGetPing }),
     ).resolves.toBe(23);
     expect(tcpPingHost).toHaveBeenCalledWith("vpn.example", 443, 2500);
-    expect(proxyGetPing).not.toHaveBeenCalled();
+    expect(proxyGetPing).toHaveBeenCalledWith(location, 5000);
   });
 });

@@ -32,15 +32,18 @@ const TUN_INTERFACE: &str = "varmlen0";
 const PROXY_PORT: u16 = 2081;
 const XRAY_DIAL_MARK: u64 = 0x2024;
 static PING_CONFIG_ID: AtomicU64 = AtomicU64::new(1);
-const PROXY_PING_URL: &str = "http://www.gstatic.com/generate_204";
+const PROXY_PING_URLS: &[&str] = &[
+    "http://www.gstatic.com/generate_204",
+    "http://cp.cloudflare.com/generate_204",
+];
 const DNS_PROBE_QUERY: &[u8] = &[
     0x56, 0x4d, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, b'w', b'w', b'w',
     0x07, b'g', b's', b't', b'a', b't', b'i', b'c', 0x03, b'c', b'o', b'm', 0x00, 0x00, 0x01, 0x00,
     0x01,
 ];
 
-fn build_proxy_ping_request(client: &reqwest::Client) -> reqwest::RequestBuilder {
-    client.head(PROXY_PING_URL)
+fn build_proxy_ping_request(client: &reqwest::Client, url: &str) -> reqwest::RequestBuilder {
+    client.head(url)
 }
 
 fn build_proxy_dns_probe_request(client: &reqwest::Client, url: &str) -> reqwest::RequestBuilder {
@@ -71,24 +74,42 @@ fn validate_dns_probe_response(body: &[u8]) -> Result<(), DaemonError> {
     Ok(())
 }
 
-async fn probe_http_through_proxy(client: &reqwest::Client) -> Result<u32, DaemonError> {
+async fn probe_http_url_through_proxy(
+    client: &reqwest::Client,
+    url: &str,
+) -> Result<u32, DaemonError> {
     let started = Instant::now();
-    let response = build_proxy_ping_request(client)
+    let response = build_proxy_ping_request(client, url)
         .send()
         .await
         .map_err(|error| {
             DaemonError::new(
                 DaemonErrorCode::PingFailed,
-                format!("HTTP ping failed: {error}"),
+                format!("HTTP ping {url} failed: {error}"),
             )
         })?;
     if response.status().as_u16() != 204 {
         return Err(DaemonError::new(
             DaemonErrorCode::PingFailed,
-            format!("HTTP ping returned status {}", response.status()),
+            format!("HTTP ping {url} returned status {}", response.status()),
         ));
     }
     Ok(started.elapsed().as_millis().min(u32::MAX as u128) as u32)
+}
+
+async fn probe_http_through_proxy(client: &reqwest::Client) -> Result<u32, DaemonError> {
+    first_success(
+        PROXY_PING_URLS
+            .iter()
+            .map(|url| probe_http_url_through_proxy(client, url)),
+    )
+    .await
+    .ok_or_else(|| {
+        DaemonError::new(
+            DaemonErrorCode::PingFailed,
+            "every HTTP connectivity probe failed through the proxy",
+        )
+    })
 }
 
 async fn probe_dns_url_through_proxy(
@@ -1529,7 +1550,7 @@ mod tests {
     use super::{
         build_proxy_dns_probe_request, build_proxy_ping_request, first_success,
         validate_dns_probe_response, validate_ping_xray_document, validate_xray_document,
-        validation_config_ports, validation_config_with_ports, DNS_PROBE_QUERY, PROXY_PING_URL,
+        validation_config_ports, validation_config_with_ports, DNS_PROBE_QUERY, PROXY_PING_URLS,
     };
     use crate::protocol::DaemonErrorCode;
 
@@ -1735,14 +1756,12 @@ mod tests {
     #[test]
     fn proxy_ping_matches_xray_health_check_request() {
         let client = reqwest::Client::new();
-        let request = build_proxy_ping_request(&client).build().unwrap();
-
-        assert_eq!(request.method(), reqwest::Method::HEAD);
-        assert_eq!(request.url().as_str(), PROXY_PING_URL);
-        assert_eq!(
-            request.url().as_str(),
-            "http://www.gstatic.com/generate_204"
-        );
+        assert_eq!(PROXY_PING_URLS.len(), 2);
+        for url in PROXY_PING_URLS {
+            let request = build_proxy_ping_request(&client, url).build().unwrap();
+            assert_eq!(request.method(), reqwest::Method::HEAD);
+            assert_eq!(request.url().as_str(), *url);
+        }
     }
 
     #[test]
