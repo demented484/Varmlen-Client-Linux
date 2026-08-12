@@ -2,6 +2,8 @@
 
 ## 0.3.1
 
+- Measure Hysteria2, WireGuard, mKCP and QUIC locations through their real
+  proxy path instead of failing an inapplicable TCP-connect probe.
 - Replace the obsolete Xray 26.3.27 package fallback with 26.7.28 and migrate
   the old default selection on upgrade. Manually installed core versions stay
   available for switching.

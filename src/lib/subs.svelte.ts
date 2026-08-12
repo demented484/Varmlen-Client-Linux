@@ -24,6 +24,7 @@ import {
 import { transportSummary } from "$lib/server-label";
 import { nextRefreshBatch } from "$lib/subscription-refresh";
 import { runPingsInParallel } from "$lib/ping-scheduler";
+import { measureLocationPing } from "$lib/location-ping";
 export { transportSummary } from "$lib/server-label";
 
 /** Ping result for a server entry. `null` = unknown / not yet measured,
@@ -663,15 +664,15 @@ class SubsStore {
     this.pings = pruned;
   }
 
-  /** Probe one server with the user's chosen method (TCP or via-proxy real
-   *  delay). Updates `pings[id]` in place; never throws. */
+  /** Probe one server with the user's chosen method. UDP-only transports use
+   *  their end-to-end proxy RTT because their endpoint has no TCP latency. */
   async pingServer(srv: ServerEntry, method: PingMethod = settings.pingMethod): Promise<void> {
     this.pings = { ...this.pings, [srv.id]: "pinging" };
     try {
-      const rtt =
-        method === "proxy"
-          ? await proxyGetPing(srv.raw, 5000)
-          : await tcpPingHost(srv.raw.host, srv.raw.port, 2500);
+      const rtt = await measureLocationPing(srv.raw, method, {
+        tcpPingHost,
+        proxyGetPing,
+      });
       this.pings = { ...this.pings, [srv.id]: rtt };
     } catch {
       this.pings = { ...this.pings, [srv.id]: "timeout" };
