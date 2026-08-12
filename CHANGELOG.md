@@ -2,6 +2,12 @@
 
 ## 0.3.1
 
+- Replace the obsolete Xray 26.3.27 package fallback with 26.7.28 and migrate
+  the old default selection on upgrade. Manually installed core versions stay
+  available for switching.
+- Preserve public literal-IP DNS servers from full JSON profiles, including
+  ordinary UDP DNS such as `8.8.8.8`, and force them through the selected
+  proxy instead of silently replacing them with Cloudflare DoH.
 - Preserve a full JSON location's safe public DNS-over-HTTPS resolver instead
   of replacing it with Cloudflare, fixing Hysteria2 profiles whose tunnel can
   reach the provider resolver but not `1.1.1.1`.

@@ -11,10 +11,11 @@ describe("Linux bundled Xray fallback", () => {
     const fetchScript = read("../../scripts/fetch-xray.sh");
     const settings = read("../routes/settings/+page.svelte");
 
-    expect(fetchScript).toContain('VERSION="26.3.27"');
+    expect(fetchScript).toContain('VERSION="26.7.28"');
     expect(fetchScript).toContain('"$VERSION:$asset"');
     expect(core).toContain('PathBuf::from("/usr/libexec/varmlen/xray")');
     expect(core).toContain("let had_usable_active = binary_path(app, kind).is_ok()");
+    expect(core).toContain("LEGACY_BUNDLED_XRAY_VERSION");
     expect(core).toContain("if !dest.is_file()");
     expect(core).toContain("seed_bundled_core(&app)");
     expect(core).toContain("bundled: bundled.as_deref() == Some(tag.as_str())");

@@ -9,7 +9,7 @@
 # tauri beforeBuildCommand invokes it there).
 set -euo pipefail
 
-VERSION="26.3.27"
+VERSION="26.7.28"
 DEST="src-tauri/cores/xray"
 MARKER="${DEST}.asset"
 

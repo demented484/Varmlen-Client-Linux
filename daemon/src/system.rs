@@ -171,6 +171,9 @@ async fn probe_proxy_port(
     dns_probe_urls: &[String],
 ) -> Result<u32, DaemonError> {
     let client = proxy_probe_client(port, timeout_duration)?;
+    if dns_probe_urls.is_empty() {
+        return probe_http_through_proxy(&client).await;
+    }
     let (http_rtt, ()) = tokio::try_join!(
         probe_http_through_proxy(&client),
         probe_dns_through_proxy(&client, dns_probe_urls),

@@ -64,16 +64,11 @@ impl ProxyPingRequest {
 }
 
 fn effective_dns_probe_urls(urls: &[String]) -> Vec<String> {
-    if urls.is_empty() {
-        vec!["https://1.1.1.1/dns-query".into()]
-    } else {
-        urls.to_vec()
-    }
+    urls.to_vec()
 }
 
 fn dns_probe_urls_are_valid(urls: &[String]) -> bool {
-    !urls.is_empty()
-        && urls.len() <= MAX_DNS_PROBE_URLS
+    urls.len() <= MAX_DNS_PROBE_URLS
         && urls.iter().all(|raw| {
             raw.len() <= MAX_DNS_PROBE_URL_BYTES
                 && reqwest::Url::parse(raw).is_ok_and(|url| {
@@ -371,6 +366,11 @@ mod tests {
             timeout_ms: 5_000,
         };
         assert_eq!(validate_proxy_ping_request(&proxy), Ok(()));
+
+        let mut plain_dns_proxy = proxy.clone();
+        plain_dns_proxy.dns_probe_urls.clear();
+        assert_eq!(plain_dns_proxy.effective_dns_probe_urls(), Vec::<String>::new());
+        assert_eq!(validate_proxy_ping_request(&plain_dns_proxy), Ok(()));
 
         let mut invalid_dns = proxy.clone();
         invalid_dns.dns_probe_urls = vec!["http://127.0.0.1/dns-query".into()];

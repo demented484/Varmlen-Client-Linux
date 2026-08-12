@@ -15,6 +15,12 @@ use futures_util::StreamExt;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 
+/// The package used to ship this core as its offline fallback. It predates
+/// fixes for Hysteria client reuse and native-TUN UDP FullCone, so package
+/// upgrades migrate only this old default to the new bundled core. Every other
+/// manually selected version remains untouched and can still be activated.
+const LEGACY_BUNDLED_XRAY_VERSION: &str = "26.3.27";
+
 /// Which core a request targets. xray is now the sole core: its native tun does
 /// TUN capture, its routing does the per-app/site split + DNS, and its outbound
 /// does the vless/reality/xhttp transport. The enum is kept (single variant) so
@@ -171,6 +177,8 @@ fn core_version_of(bin: &PathBuf) -> Option<String> {
 pub fn seed_bundled_core(app: &AppHandle) {
     let kind = CoreKind::Xray;
     let had_usable_active = binary_path(app, kind).is_ok();
+    let replace_legacy_default = active_tag(app, kind).as_deref()
+        == Some(LEGACY_BUNDLED_XRAY_VERSION);
     let Some(src) = bundled_core_path(app, kind) else {
         return;
     };
@@ -195,7 +203,7 @@ pub fn seed_bundled_core(app: &AppHandle) {
             let _ = std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755));
         }
     }
-    if !had_usable_active {
+    if !had_usable_active || replace_legacy_default {
         let _ = write_active(app, kind, &tag);
     }
 }
