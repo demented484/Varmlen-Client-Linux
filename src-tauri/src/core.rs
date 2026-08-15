@@ -15,11 +15,18 @@ use futures_util::StreamExt;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 
-/// The package used to ship this core as its offline fallback. It predates
-/// fixes for Hysteria client reuse and native-TUN UDP FullCone, so package
-/// upgrades migrate only this old default to the new bundled core. Every other
-/// manually selected version remains untouched and can still be activated.
+/// The stable Xray version this package bundles as its offline fallback. When
+/// an installation still runs an old packaged default, the package upgrade
+/// re-activates the freshly bundled copy instead of a possibly stale cached
+/// one. Every other manually selected version remains untouched and can still
+/// be activated.
 const LEGACY_BUNDLED_XRAY_VERSION: &str = "26.3.27";
+
+/// The first 0.3.1 package shipped this prerelease dataplane as its bundled
+/// default. The emergency stable rollback moves installations still running
+/// it back to the bundled stable core; other manually selected versions
+/// remain untouched and can still be activated.
+const SHIPPED_PRERELEASE_XRAY_VERSION: &str = "26.7.28";
 
 /// Which core a request targets. xray is now the sole core: its native tun does
 /// TUN capture, its routing does the per-app/site split + DNS, and its outbound
@@ -177,8 +184,10 @@ fn core_version_of(bin: &PathBuf) -> Option<String> {
 pub fn seed_bundled_core(app: &AppHandle) {
     let kind = CoreKind::Xray;
     let had_usable_active = binary_path(app, kind).is_ok();
-    let replace_legacy_default = active_tag(app, kind).as_deref()
-        == Some(LEGACY_BUNDLED_XRAY_VERSION);
+    let replace_default = matches!(
+        active_tag(app, kind).as_deref(),
+        Some(LEGACY_BUNDLED_XRAY_VERSION) | Some(SHIPPED_PRERELEASE_XRAY_VERSION)
+    );
     let Some(src) = bundled_core_path(app, kind) else {
         return;
     };
@@ -203,7 +212,7 @@ pub fn seed_bundled_core(app: &AppHandle) {
             let _ = std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755));
         }
     }
-    if !had_usable_active || replace_legacy_default {
+    if !had_usable_active || replace_default {
         let _ = write_active(app, kind, &tag);
     }
 }

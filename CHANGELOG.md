@@ -10,9 +10,13 @@
   compatibility mapping used by established Xray clients.
 - Measure Hysteria2, WireGuard, mKCP and QUIC locations through their real
   proxy path instead of failing an inapplicable TCP-connect probe.
-- Replace the obsolete Xray 26.3.27 package fallback with 26.7.28 and migrate
-  the old default selection on upgrade. Manually installed core versions stay
-  available for switching.
+- Keep the package fallback on stable Xray 26.3.27. The first 0.3.1 assets
+  briefly bundled prerelease 26.7.28 and were replaced; package upgrades move
+  installations still on that default back to the bundled stable core while
+  manually installed versions stay available for switching. Known trade-off:
+  26.3.27 predates the Hysteria client-reuse and native-TUN UDP FullCone
+  dataplane fixes, so QUIC-heavy apps on HY2 locations may remain partially
+  offline.
 - Preserve public literal-IP DNS servers from full JSON profiles, including
   ordinary UDP DNS such as `8.8.8.8`, and force them through the selected
   proxy instead of silently replacing them with Cloudflare DoH.
